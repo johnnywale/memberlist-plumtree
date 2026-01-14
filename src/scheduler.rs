@@ -75,20 +75,39 @@ impl IHaveQueue {
 
     /// Pop a batch of IHave announcements from the queue.
     ///
-    /// Returns up to `max_batch` items.
+    /// Returns up to `max_batch` unique items (deduplicated by message ID).
+    /// If the same message ID was queued multiple times, only the entry
+    /// with the highest round number is kept.
     pub fn pop_batch(&self, max_batch: usize) -> SmallVec<[PendingIHave; 16]> {
-        let mut batch = SmallVec::new();
+        use std::collections::HashMap;
 
-        for _ in 0..max_batch {
+        // Pre-allocate with expected capacity to reduce allocations
+        let mut seen: HashMap<MessageId, PendingIHave> = HashMap::with_capacity(max_batch);
+
+        // Pop up to 2x the batch size to find unique entries
+        for _ in 0..(max_batch * 2) {
             if let Some(item) = self.queue.pop() {
                 self.len.fetch_sub(1, Ordering::Relaxed);
-                batch.push(item);
+
+                // Keep the entry with the highest round for each message ID
+                seen.entry(item.message_id)
+                    .and_modify(|existing| {
+                        if item.round > existing.round {
+                            *existing = item.clone();
+                        }
+                    })
+                    .or_insert(item);
+
+                // Stop if we have enough unique entries
+                if seen.len() >= max_batch {
+                    break;
+                }
             } else {
                 break;
             }
         }
 
-        batch
+        seen.into_values().collect()
     }
 
     /// Get the approximate length of the queue.
@@ -188,9 +207,9 @@ impl IHaveScheduler {
 /// When an IHave is received, we wait for the actual message.
 /// If not received within timeout, we send a Graft with exponential backoff.
 #[derive(Debug)]
-pub struct GraftTimer {
+pub struct GraftTimer<I> {
     /// Pending message IDs waiting for content.
-    pending: parking_lot::Mutex<std::collections::HashMap<MessageId, GraftEntry>>,
+    pending: parking_lot::Mutex<std::collections::HashMap<MessageId, GraftEntry<I>>>,
     /// Base timeout for expecting message after IHave.
     base_timeout: Duration,
     /// Maximum timeout after backoff.
@@ -200,7 +219,7 @@ pub struct GraftTimer {
 }
 
 #[derive(Debug, Clone)]
-struct GraftEntry {
+struct GraftEntry<I> {
     /// When this entry was created.
     /// Reserved for future use in timeout diagnostics.
     #[allow(dead_code)]
@@ -208,9 +227,9 @@ struct GraftEntry {
     /// When the next retry should occur.
     next_retry: std::time::Instant,
     /// Node that sent the IHave.
-    from: Vec<u8>, // Generic node ID as bytes
-    /// Alternative peers to try (as serialized bytes).
-    alternative_peers: Vec<Vec<u8>>,
+    from: I,
+    /// Alternative peers to try.
+    alternative_peers: Vec<I>,
     /// Round from the IHave.
     round: u32,
     /// Number of retry attempts made.
@@ -219,18 +238,18 @@ struct GraftEntry {
 
 /// Result of checking for expired Graft timers.
 #[derive(Debug, Clone)]
-pub struct ExpiredGraft {
+pub struct ExpiredGraft<I> {
     /// Message ID that needs to be requested.
     pub message_id: MessageId,
     /// Peer to request from.
-    pub peer: Vec<u8>,
+    pub peer: I,
     /// Round number.
     pub round: u32,
     /// Which retry attempt this is (0 = first attempt).
     pub retry_count: u32,
 }
 
-impl GraftTimer {
+impl<I: Clone> GraftTimer<I> {
     /// Create a new Graft timer with default backoff settings.
     pub fn new(timeout: Duration) -> Self {
         Self {
@@ -252,7 +271,7 @@ impl GraftTimer {
     }
 
     /// Record that we're expecting a message (received IHave).
-    pub fn expect_message(&self, message_id: MessageId, from: Vec<u8>, round: u32) {
+    pub fn expect_message(&self, message_id: MessageId, from: I, round: u32) {
         let now = std::time::Instant::now();
         let mut pending = self.pending.lock();
         pending.entry(message_id).or_insert_with(|| GraftEntry {
@@ -269,8 +288,8 @@ impl GraftTimer {
     pub fn expect_message_with_alternatives(
         &self,
         message_id: MessageId,
-        from: Vec<u8>,
-        alternatives: Vec<Vec<u8>>,
+        from: I,
+        alternatives: Vec<I>,
         round: u32,
     ) {
         let now = std::time::Instant::now();
@@ -303,7 +322,7 @@ impl GraftTimer {
     ///
     /// Returns list of expired grafts with peer to try and retry info.
     /// Entries that exceed max_retries are removed.
-    pub fn get_expired(&self) -> Vec<ExpiredGraft> {
+    pub fn get_expired(&self) -> Vec<ExpiredGraft<I>> {
         let now = std::time::Instant::now();
         let mut pending = self.pending.lock();
 
@@ -353,16 +372,6 @@ impl GraftTimer {
         }
 
         expired
-    }
-
-    /// Get expired entries (legacy API for compatibility).
-    ///
-    /// Returns list of (message_id, from_node, round) for expired timers.
-    pub fn get_expired_simple(&self) -> Vec<(MessageId, Vec<u8>, u32)> {
-        self.get_expired()
-            .into_iter()
-            .map(|e| (e.message_id, e.peer, e.round))
-            .collect()
     }
 
     /// Clear all pending entries.
@@ -444,7 +453,7 @@ mod tests {
 
     #[test]
     fn test_graft_timer() {
-        let timer = GraftTimer::new(Duration::from_millis(50));
+        let timer: GraftTimer<Vec<u8>> = GraftTimer::new(Duration::from_millis(50));
 
         let id = MessageId::new();
         timer.expect_message(id, vec![1, 2, 3], 0);
@@ -464,7 +473,7 @@ mod tests {
 
     #[test]
     fn test_graft_timer_message_received() {
-        let timer = GraftTimer::new(Duration::from_millis(50));
+        let timer: GraftTimer<Vec<u8>> = GraftTimer::new(Duration::from_millis(50));
 
         let id = MessageId::new();
         timer.expect_message(id, vec![1, 2, 3], 0);
@@ -478,7 +487,7 @@ mod tests {
 
     #[test]
     fn test_graft_timer_backoff() {
-        let timer =
+        let timer: GraftTimer<Vec<u8>> =
             GraftTimer::with_backoff(Duration::from_millis(20), Duration::from_millis(160), 3);
 
         let id = MessageId::new();
@@ -512,7 +521,7 @@ mod tests {
 
     #[test]
     fn test_graft_timer_alternatives() {
-        let timer =
+        let timer: GraftTimer<Vec<u8>> =
             GraftTimer::with_backoff(Duration::from_millis(20), Duration::from_millis(200), 4);
 
         let id = MessageId::new();

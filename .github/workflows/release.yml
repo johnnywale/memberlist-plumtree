@@ -31,15 +31,20 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-release-
 
-      - name: Verify version matches tag
+      - name: Update Cargo.toml version to match tag
         run: |
-          CARGO_VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
           TAG_VERSION=${GITHUB_REF#refs/tags/v}
-          if [ "$CARGO_VERSION" != "$TAG_VERSION" ]; then
-            echo "Version mismatch: Cargo.toml has $CARGO_VERSION but tag is $TAG_VERSION"
+          echo "Updating Cargo.toml to version $TAG_VERSION"
+          sed -i "s/^version = \".*\"/version = \"$TAG_VERSION\"/" Cargo.toml
+          
+          # Verify the change
+          CARGO_VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [ "$CARGO_VERSION" = "$TAG_VERSION" ]; then
+            echo "✓ Version successfully updated to $TAG_VERSION"
+          else
+            echo "✗ Failed to update version. Cargo.toml has $CARGO_VERSION but expected $TAG_VERSION"
             exit 1
           fi
-          echo "Version $CARGO_VERSION matches tag"
 
       - name: Run tests before publish
         run: cargo test --all-features

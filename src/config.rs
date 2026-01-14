@@ -137,10 +137,108 @@ impl Default for PlumtreeConfig {
     }
 }
 
+/// Configuration validation error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigError {
+    /// The field that failed validation.
+    pub field: &'static str,
+    /// Description of the error.
+    pub message: String,
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "config error in '{}': {}", self.field, self.message)
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
 impl PlumtreeConfig {
     /// Create a new configuration with default values.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Validate the configuration.
+    ///
+    /// Returns `Ok(())` if all configuration values are valid, or `Err` with
+    /// details about the first invalid configuration found.
+    ///
+    /// This is called automatically in `Plumtree::new()`.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.eager_fanout == 0 {
+            return Err(ConfigError {
+                field: "eager_fanout",
+                message: "must be at least 1 for tree formation".to_string(),
+            });
+        }
+
+        if self.lazy_fanout == 0 {
+            return Err(ConfigError {
+                field: "lazy_fanout",
+                message: "must be at least 1 for protocol reliability".to_string(),
+            });
+        }
+
+        if self.ihave_interval.is_zero() {
+            return Err(ConfigError {
+                field: "ihave_interval",
+                message: "must be non-zero to avoid CPU spinning".to_string(),
+            });
+        }
+
+        if self.message_cache_ttl.is_zero() {
+            return Err(ConfigError {
+                field: "message_cache_ttl",
+                message: "must be non-zero for message caching".to_string(),
+            });
+        }
+
+        if self.graft_timeout.is_zero() {
+            return Err(ConfigError {
+                field: "graft_timeout",
+                message: "must be non-zero for tree repair".to_string(),
+            });
+        }
+
+        if self.max_message_size == 0 {
+            return Err(ConfigError {
+                field: "max_message_size",
+                message: "must be non-zero to allow messages".to_string(),
+            });
+        }
+
+        if self.graft_rate_limit_per_second <= 0.0 {
+            return Err(ConfigError {
+                field: "graft_rate_limit_per_second",
+                message: "must be positive".to_string(),
+            });
+        }
+
+        if self.graft_rate_limit_burst == 0 {
+            return Err(ConfigError {
+                field: "graft_rate_limit_burst",
+                message: "must be at least 1".to_string(),
+            });
+        }
+
+        // Ensure message_cache_ttl is long enough for Graft to complete.
+        // Messages must survive: ihave_interval + graft_timeout * max_retries
+        // Otherwise, messages get evicted before tree repair can fetch them.
+        let min_ttl = self.ihave_interval + self.graft_timeout * self.graft_max_retries;
+        if self.message_cache_ttl < min_ttl {
+            return Err(ConfigError {
+                field: "message_cache_ttl",
+                message: format!(
+                    "must be at least {:?} (ihave_interval + graft_timeout * max_retries) \
+                     to allow tree repair to complete",
+                    min_ttl
+                ),
+            });
+        }
+
+        Ok(())
     }
 
     /// Configuration optimized for LAN environments.
@@ -338,5 +436,39 @@ mod tests {
         assert_eq!(config.eager_fanout, 5);
         assert_eq!(config.lazy_fanout, 10);
         assert_eq!(config.ihave_interval, Duration::from_millis(200));
+    }
+
+    #[test]
+    fn test_validate_default_config() {
+        let config = PlumtreeConfig::default();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_zero_eager_fanout() {
+        let config = PlumtreeConfig::default().with_eager_fanout(0);
+        let err = config.validate().unwrap_err();
+        assert_eq!(err.field, "eager_fanout");
+    }
+
+    #[test]
+    fn test_validate_zero_lazy_fanout() {
+        let config = PlumtreeConfig::default().with_lazy_fanout(0);
+        let err = config.validate().unwrap_err();
+        assert_eq!(err.field, "lazy_fanout");
+    }
+
+    #[test]
+    fn test_validate_zero_ihave_interval() {
+        let config = PlumtreeConfig::default().with_ihave_interval(Duration::ZERO);
+        let err = config.validate().unwrap_err();
+        assert_eq!(err.field, "ihave_interval");
+    }
+
+    #[test]
+    fn test_validate_presets() {
+        assert!(PlumtreeConfig::lan().validate().is_ok());
+        assert!(PlumtreeConfig::wan().validate().is_ok());
+        assert!(PlumtreeConfig::large_cluster().validate().is_ok());
     }
 }

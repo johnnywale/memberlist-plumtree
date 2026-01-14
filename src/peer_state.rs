@@ -104,6 +104,8 @@ impl<I: Clone + Eq + Hash> PeerState<I> {
     /// Promote a peer from lazy to eager set.
     ///
     /// Called when we receive a Graft or need to establish tree connection.
+    /// Note: This does not enforce fanout limits. Use `try_promote_to_eager`
+    /// if you want to enforce a maximum eager set size.
     pub fn promote_to_eager(&self, peer: &I) -> bool
     where
         I: Clone,
@@ -112,6 +114,40 @@ impl<I: Clone + Eq + Hash> PeerState<I> {
 
         // Already eager? No-op
         if inner.eager.contains(peer) {
+            return false;
+        }
+
+        // Remove from lazy if present
+        inner.lazy.remove(peer);
+
+        // Add to eager
+        inner.eager.insert(peer.clone());
+        inner.cache_dirty = true;
+
+        true
+    }
+
+    /// Try to promote a peer from lazy to eager set, respecting the fanout limit.
+    ///
+    /// Returns `true` if the peer was promoted, `false` if:
+    /// - The peer is already eager
+    /// - The eager set is at or above `max_eager` capacity
+    ///
+    /// This prevents unbounded growth of the eager set which would degrade
+    /// Plumtree into a flooding protocol.
+    pub fn try_promote_to_eager(&self, peer: &I, max_eager: usize) -> bool
+    where
+        I: Clone,
+    {
+        let mut inner = self.inner.write();
+
+        // Already eager? No-op
+        if inner.eager.contains(peer) {
+            return false;
+        }
+
+        // Check if we're at capacity
+        if inner.eager.len() >= max_eager {
             return false;
         }
 

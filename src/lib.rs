@@ -58,7 +58,7 @@ mod scheduler;
 mod metrics;
 
 // Re-export config types
-pub use config::PlumtreeConfig;
+pub use config::{ConfigError, PlumtreeConfig};
 
 // Re-export error types
 pub use error::{Error, Result};
@@ -80,8 +80,10 @@ pub use plumtree::{
 pub use runner::{create_plumtree_with_channels, PlumtreeRunner, PlumtreeRunnerBuilder};
 
 // Re-export integration types
+#[allow(deprecated)]
 pub use integration::{
-    decode_plumtree_message, encode_plumtree_message, is_plumtree_message, PlumtreeEventHandler,
+    decode_plumtree_envelope, decode_plumtree_message, encode_plumtree_envelope,
+    encode_plumtree_message, is_plumtree_message, DecodeResult, IdCodec, PlumtreeEventHandler,
     PlumtreeMemberlist, PlumtreeNodeDelegate,
 };
 

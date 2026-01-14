@@ -3,7 +3,7 @@
 //! This module provides the glue between Plumtree and memberlist,
 //! handling message routing and membership synchronization.
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use memberlist_core::{
     delegate::{
         AliveDelegate, ConflictDelegate, Delegate, EventDelegate, MergeDelegate, NodeDelegate,
@@ -22,10 +22,76 @@ use crate::{
     plumtree::{Plumtree, PlumtreeDelegate, PlumtreeHandle},
 };
 
-/// Magic byte prefix for Plumtree messages.
+/// Magic header for Plumtree messages: "PLT" (3 bytes).
 ///
 /// Used to distinguish Plumtree protocol messages from user messages.
-const PLUMTREE_MAGIC: u8 = 0x50;
+/// A longer header reduces collision probability with user data.
+const PLUMTREE_MAGIC: &[u8] = b"PLT";
+
+/// Current protocol version.
+const PLUMTREE_VERSION: u8 = 0x01;
+
+/// Minimum envelope size: magic (3) + version (1) + sender_len (2) + tag (1) = 7 bytes.
+const MIN_ENVELOPE_SIZE: usize = 7;
+
+/// Maximum sender ID length (256 bytes should be plenty for any node ID).
+const MAX_SENDER_ID_LEN: usize = 256;
+
+/// Trait for encoding and decoding node IDs to/from bytes.
+///
+/// This trait must be implemented for your node ID type to use the
+/// Plumtree-memberlist integration. It enables sender identification
+/// in broadcast messages, which is critical for Plumtree's tree
+/// optimization (Prune/Graft).
+///
+/// # Example
+///
+/// ```ignore
+/// use memberlist_plumtree::IdCodec;
+///
+/// #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// struct MyNodeId(u64);
+///
+/// impl IdCodec for MyNodeId {
+///     fn encode_id(&self) -> Bytes {
+///         Bytes::copy_from_slice(&self.0.to_be_bytes())
+///     }
+///
+///     fn decode_id(bytes: &[u8]) -> Option<Self> {
+///         if bytes.len() == 8 {
+///             let arr: [u8; 8] = bytes.try_into().ok()?;
+///             Some(MyNodeId(u64::from_be_bytes(arr)))
+///         } else {
+///             None
+///         }
+///     }
+/// }
+/// ```
+pub trait IdCodec: Sized {
+    /// Encode the ID to bytes for wire transmission.
+    fn encode_id(&self) -> Bytes;
+
+    /// Decode an ID from bytes. Returns `None` if the bytes are invalid.
+    fn decode_id(bytes: &[u8]) -> Option<Self>;
+}
+
+/// Result of decoding a Plumtree envelope.
+#[derive(Debug)]
+pub enum DecodeResult<I> {
+    /// Successfully decoded a Plumtree message with sender.
+    Ok {
+        /// The sender's node ID.
+        sender: I,
+        /// The decoded message.
+        message: PlumtreeMessage,
+    },
+    /// Data is not a Plumtree message (no magic header match).
+    NotPlumtree,
+    /// Protocol version is incompatible.
+    IncompatibleVersion(u8),
+    /// Message is malformed (bad length, invalid sender, etc.).
+    Malformed,
+}
 
 /// Combined Plumtree + Memberlist system.
 ///
@@ -50,6 +116,8 @@ pub struct PlumtreeMemberlist<I, PD>
 where
     I: Id,
 {
+    /// Local node ID (used for encoding outgoing messages).
+    local_id: I,
     /// Plumtree broadcast layer.
     plumtree: Plumtree<I, PlumtreeEventHandler<I, PD>>,
     /// Handle for message I/O.
@@ -68,8 +136,8 @@ where
 
 impl<I, PD> PlumtreeMemberlist<I, PD>
 where
-    I: Id + Clone + Eq + Hash + Debug + Send + Sync + 'static,
-    PD: PlumtreeDelegate,
+    I: Id + IdCodec + Clone + Eq + Hash + Debug + Send + Sync + 'static,
+    PD: PlumtreeDelegate<I>,
 {
     /// Create a new PlumtreeMemberlist instance.
     ///
@@ -90,9 +158,10 @@ where
         let event_handler = PlumtreeEventHandler::new(delegate, peers.clone());
 
         // Create the Plumtree instance
-        let (plumtree, handle) = Plumtree::new(local_id, config, event_handler);
+        let (plumtree, handle) = Plumtree::new(local_id.clone(), config, event_handler);
 
         Self {
+            local_id,
             plumtree,
             handle,
             incoming_tx,
@@ -198,14 +267,19 @@ where
     /// Encodes outgoing Plumtree messages and sends them to the outgoing channel.
     async fn run_outgoing_processor(&self) {
         while let Some(outgoing) = self.handle.next_outgoing().await {
-            // Encode the message for broadcast
-            let encoded = encode_plumtree_message(&outgoing.message);
+            // Encode the message with our local ID as sender
+            let encoded = encode_plumtree_envelope(&self.local_id, &outgoing.message);
 
             if self.outgoing_tx.send(encoded).await.is_err() {
                 // Channel closed
                 break;
             }
         }
+    }
+
+    /// Get the local node ID.
+    pub fn local_id(&self) -> &I {
+        &self.local_id
     }
 
     /// Process incoming messages from the incoming channel.
@@ -289,7 +363,7 @@ impl<I, A, D> PlumtreeNodeDelegate<I, A, D> {
 
 impl<I, A, D> NodeDelegate for PlumtreeNodeDelegate<I, A, D>
 where
-    I: Id + Clone + Send + Sync + 'static,
+    I: Id + IdCodec + Clone + Send + Sync + 'static,
     A: CheapClone + Send + Sync + 'static,
     D: NodeDelegate,
 {
@@ -298,21 +372,61 @@ where
     }
 
     async fn notify_message(&self, msg: Cow<'_, [u8]>) {
-        // Check if this is a Plumtree message
-        if msg.len() > 1 && msg[0] == PLUMTREE_MAGIC {
-            // Decode Plumtree message
-            if let Some(plumtree_msg) = PlumtreeMessage::decode_from_slice(&msg[1..]) {
-                tracing::trace!("received plumtree message: {:?}", plumtree_msg.tag());
-                // Note: memberlist broadcast doesn't provide sender info
-                // For full Plumtree functionality, use point-to-point messages
-                // or include sender in the message payload
-                tracing::debug!("plumtree message received via broadcast (sender unknown)");
-            } else {
-                tracing::warn!("failed to decode plumtree message");
+        // Try to decode as a Plumtree envelope
+        match decode_plumtree_envelope::<I>(&msg) {
+            DecodeResult::Ok { sender, message } => {
+                tracing::trace!(
+                    "received plumtree message from {:?}: {:?}",
+                    sender,
+                    message.tag()
+                );
+
+                // Forward to the Plumtree processor with sender info
+                if let Err(e) = self.plumtree_tx.try_send((sender, message)) {
+                    // Log based on message type - control messages are more critical
+                    match e {
+                        async_channel::TrySendError::Full((_, ref msg)) => {
+                            if msg.is_prune() || msg.is_graft() {
+                                tracing::error!(
+                                    "plumtree channel full, dropped control message: {:?}",
+                                    msg.tag()
+                                );
+                            } else {
+                                tracing::warn!(
+                                    "plumtree channel full, dropped message: {:?}",
+                                    msg.tag()
+                                );
+                            }
+                        }
+                        async_channel::TrySendError::Closed(_) => {
+                            tracing::debug!("plumtree channel closed");
+                        }
+                    }
+                }
             }
-        } else {
-            // Forward non-Plumtree messages to inner delegate
-            self.inner.notify_message(msg).await;
+            DecodeResult::NotPlumtree => {
+                // Not a Plumtree message - forward to inner delegate
+                self.inner.notify_message(msg).await;
+            }
+            DecodeResult::IncompatibleVersion(version) => {
+                tracing::warn!(
+                    "received plumtree message with incompatible version: {}, expected: {}",
+                    version,
+                    PLUMTREE_VERSION
+                );
+                // Don't forward to inner delegate - this was clearly meant to be
+                // a Plumtree message but from an incompatible version
+            }
+            DecodeResult::Malformed => {
+                // Message started with magic but is malformed.
+                // This could be a corrupted Plumtree message or a user message
+                // that happens to start with "PLT". Forward to inner delegate
+                // to be safe.
+                tracing::debug!(
+                    "malformed plumtree envelope, forwarding to inner delegate"
+                );
+                self.inner.notify_message(msg).await;
+            }
         }
     }
 
@@ -357,7 +471,7 @@ where
 
 impl<I, A, D> PingDelegate for PlumtreeNodeDelegate<I, A, D>
 where
-    I: Id + Clone + Send + Sync + 'static,
+    I: Id + IdCodec + Clone + Send + Sync + 'static,
     A: CheapClone + Send + Sync + 'static,
     D: PingDelegate<Id = I, Address = A>,
 {
@@ -384,7 +498,7 @@ where
 
 impl<I, A, D> EventDelegate for PlumtreeNodeDelegate<I, A, D>
 where
-    I: Id + Clone + Send + Sync + 'static,
+    I: Id + IdCodec + Clone + Send + Sync + 'static,
     A: CheapClone + Send + Sync + 'static,
     D: EventDelegate<Id = I, Address = A>,
 {
@@ -406,7 +520,7 @@ where
 
 impl<I, A, D> ConflictDelegate for PlumtreeNodeDelegate<I, A, D>
 where
-    I: Id + Clone + Send + Sync + 'static,
+    I: Id + IdCodec + Clone + Send + Sync + 'static,
     A: CheapClone + Send + Sync + 'static,
     D: ConflictDelegate<Id = I, Address = A>,
 {
@@ -424,7 +538,7 @@ where
 
 impl<I, A, D> AliveDelegate for PlumtreeNodeDelegate<I, A, D>
 where
-    I: Id + Clone + Send + Sync + 'static,
+    I: Id + IdCodec + Clone + Send + Sync + 'static,
     A: CheapClone + Send + Sync + 'static,
     D: AliveDelegate<Id = I, Address = A>,
 {
@@ -442,7 +556,7 @@ where
 
 impl<I, A, D> MergeDelegate for PlumtreeNodeDelegate<I, A, D>
 where
-    I: Id + Clone + Send + Sync + 'static,
+    I: Id + IdCodec + Clone + Send + Sync + 'static,
     A: CheapClone + Send + Sync + 'static,
     D: MergeDelegate<Id = I, Address = A>,
 {
@@ -460,7 +574,7 @@ where
 
 impl<I, A, D> Delegate for PlumtreeNodeDelegate<I, A, D>
 where
-    I: Id + Clone + Send + Sync + 'static,
+    I: Id + IdCodec + Clone + Send + Sync + 'static,
     A: CheapClone + Send + Sync + 'static,
     D: Delegate<Id = I, Address = A>,
 {
@@ -490,57 +604,208 @@ impl<I, PD> PlumtreeEventHandler<I, PD> {
     }
 }
 
-impl<I, PD> PlumtreeDelegate for PlumtreeEventHandler<I, PD>
+impl<I, PD> PlumtreeDelegate<I> for PlumtreeEventHandler<I, PD>
 where
     I: Clone + Eq + Hash + Send + Sync + 'static,
-    PD: PlumtreeDelegate,
+    PD: PlumtreeDelegate<I>,
 {
     fn on_deliver(&self, message_id: MessageId, payload: Bytes) {
         self.inner.on_deliver(message_id, payload);
     }
 
-    fn on_eager_promotion(&self, peer: &[u8]) {
+    fn on_eager_promotion(&self, peer: &I) {
         self.inner.on_eager_promotion(peer);
     }
 
-    fn on_lazy_demotion(&self, peer: &[u8]) {
+    fn on_lazy_demotion(&self, peer: &I) {
         self.inner.on_lazy_demotion(peer);
     }
 
-    fn on_graft_sent(&self, peer: &[u8], message_id: &MessageId) {
+    fn on_graft_sent(&self, peer: &I, message_id: &MessageId) {
         self.inner.on_graft_sent(peer, message_id);
     }
 
-    fn on_prune_sent(&self, peer: &[u8]) {
+    fn on_prune_sent(&self, peer: &I) {
         self.inner.on_prune_sent(peer);
     }
 }
 
-/// Encode a Plumtree message for transmission via memberlist.
+/// Encode a Plumtree envelope for transmission via memberlist.
 ///
-/// Format: [MAGIC][message]
+/// Format: [MAGIC (3)][VERSION (1)][SENDER_LEN (2)][SENDER][MESSAGE]
+///
+/// This is the primary encoding function that includes sender identity,
+/// enabling proper Plumtree protocol operation (Prune/Graft).
+pub fn encode_plumtree_envelope<I: IdCodec>(sender: &I, msg: &PlumtreeMessage) -> Bytes {
+    let sender_bytes = sender.encode_id();
+    let message_bytes = msg.encode_to_bytes();
+
+    let total_len = PLUMTREE_MAGIC.len() + 1 + 2 + sender_bytes.len() + message_bytes.len();
+    let mut buf = BytesMut::with_capacity(total_len);
+
+    // Magic header
+    buf.put_slice(PLUMTREE_MAGIC);
+    // Version
+    buf.put_u8(PLUMTREE_VERSION);
+    // Sender length and data
+    buf.put_u16(sender_bytes.len() as u16);
+    buf.put_slice(&sender_bytes);
+    // Message
+    buf.put_slice(&message_bytes);
+
+    buf.freeze()
+}
+
+/// Decode a Plumtree envelope from received bytes.
+///
+/// Returns a `DecodeResult` indicating success, not-plumtree, version mismatch, or malformed.
+pub fn decode_plumtree_envelope<I: IdCodec>(data: &[u8]) -> DecodeResult<I> {
+    // Check if we have enough bytes for magic header
+    if data.len() < PLUMTREE_MAGIC.len() {
+        return DecodeResult::NotPlumtree;
+    }
+
+    // Check magic header first - if not present, it's not a Plumtree message
+    if &data[0..3] != PLUMTREE_MAGIC {
+        return DecodeResult::NotPlumtree;
+    }
+
+    // At this point, magic is present - so any further issues are Malformed
+    // Check minimum size for header
+    if data.len() < MIN_ENVELOPE_SIZE {
+        return DecodeResult::Malformed;
+    }
+
+    // Check version
+    let version = data[3];
+    if version != PLUMTREE_VERSION {
+        return DecodeResult::IncompatibleVersion(version);
+    }
+
+    // Parse sender length
+    let mut cursor = &data[4..];
+    if cursor.remaining() < 2 {
+        return DecodeResult::Malformed;
+    }
+    let sender_len = cursor.get_u16() as usize;
+
+    // Validate sender length (DoS protection)
+    if sender_len > MAX_SENDER_ID_LEN {
+        return DecodeResult::Malformed;
+    }
+
+    // Check remaining data has sender + at least 1 byte for message
+    if cursor.remaining() < sender_len + 1 {
+        return DecodeResult::Malformed;
+    }
+
+    // Decode sender
+    let sender_bytes = &cursor[..sender_len];
+    let sender = match I::decode_id(sender_bytes) {
+        Some(s) => s,
+        None => return DecodeResult::Malformed,
+    };
+    cursor.advance(sender_len);
+
+    // Decode message
+    let message = match PlumtreeMessage::decode(&mut cursor) {
+        Some(m) => m,
+        None => return DecodeResult::Malformed,
+    };
+
+    DecodeResult::Ok { sender, message }
+}
+
+/// Encode a Plumtree message for transmission (legacy format without sender).
+///
+/// **Deprecated**: Use `encode_plumtree_envelope` instead for full protocol support.
+/// This function is kept for backward compatibility and testing.
+///
+/// Format: [MAGIC (3)][VERSION (1)][message]
+#[deprecated(
+    since = "0.2.0",
+    note = "Use encode_plumtree_envelope for full protocol support with sender identity"
+)]
 pub fn encode_plumtree_message(msg: &PlumtreeMessage) -> Bytes {
     let encoded = msg.encode_to_bytes();
-    let mut buf = BytesMut::with_capacity(1 + encoded.len());
-    buf.put_u8(PLUMTREE_MAGIC);
+    let mut buf = BytesMut::with_capacity(PLUMTREE_MAGIC.len() + 1 + encoded.len());
+    buf.put_slice(PLUMTREE_MAGIC);
+    buf.put_u8(PLUMTREE_VERSION);
     buf.extend_from_slice(&encoded);
     buf.freeze()
 }
 
-/// Try to decode a Plumtree message from received bytes (without sender).
+/// Try to decode a Plumtree message from received bytes (legacy format without sender).
 ///
-/// Use this for simple testing or when sender is tracked separately.
+/// **Deprecated**: Use `decode_plumtree_envelope` instead.
+/// This function is kept for backward compatibility and testing.
+#[deprecated(
+    since = "0.2.0",
+    note = "Use decode_plumtree_envelope for full protocol support with sender identity"
+)]
 pub fn decode_plumtree_message(data: &[u8]) -> Option<PlumtreeMessage> {
-    if data.len() > 1 && data[0] == PLUMTREE_MAGIC {
-        PlumtreeMessage::decode_from_slice(&data[1..])
+    if data.len() > 4 && &data[0..3] == PLUMTREE_MAGIC && data[3] == PLUMTREE_VERSION {
+        PlumtreeMessage::decode_from_slice(&data[4..])
     } else {
         None
     }
 }
 
-/// Check if data is a Plumtree message.
+/// Check if data is a Plumtree message (checks magic header).
 pub fn is_plumtree_message(data: &[u8]) -> bool {
-    !data.is_empty() && data[0] == PLUMTREE_MAGIC
+    data.len() >= PLUMTREE_MAGIC.len() && &data[0..3] == PLUMTREE_MAGIC
+}
+
+// IdCodec implementations for common types
+
+impl IdCodec for u64 {
+    fn encode_id(&self) -> Bytes {
+        Bytes::copy_from_slice(&self.to_be_bytes())
+    }
+
+    fn decode_id(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() == 8 {
+            let arr: [u8; 8] = bytes.try_into().ok()?;
+            Some(u64::from_be_bytes(arr))
+        } else {
+            None
+        }
+    }
+}
+
+impl IdCodec for u32 {
+    fn encode_id(&self) -> Bytes {
+        Bytes::copy_from_slice(&self.to_be_bytes())
+    }
+
+    fn decode_id(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() == 4 {
+            let arr: [u8; 4] = bytes.try_into().ok()?;
+            Some(u32::from_be_bytes(arr))
+        } else {
+            None
+        }
+    }
+}
+
+impl IdCodec for String {
+    fn encode_id(&self) -> Bytes {
+        Bytes::copy_from_slice(self.as_bytes())
+    }
+
+    fn decode_id(bytes: &[u8]) -> Option<Self> {
+        std::str::from_utf8(bytes).ok().map(|s| s.to_string())
+    }
+}
+
+impl IdCodec for Bytes {
+    fn encode_id(&self) -> Bytes {
+        self.clone()
+    }
+
+    fn decode_id(bytes: &[u8]) -> Option<Self> {
+        Some(Bytes::copy_from_slice(bytes))
+    }
 }
 
 #[cfg(test)]
@@ -549,25 +814,133 @@ mod tests {
     use crate::NoopDelegate;
 
     #[test]
-    fn test_encode_decode() {
+    fn test_encode_decode_envelope() {
+        let sender = 42u64;
         let msg = PlumtreeMessage::Gossip {
             id: MessageId::new(),
             round: 5,
             payload: Bytes::from_static(b"hello"),
         };
 
-        let encoded = encode_plumtree_message(&msg);
+        let encoded = encode_plumtree_envelope(&sender, &msg);
         assert!(is_plumtree_message(&encoded));
 
-        let decoded = decode_plumtree_message(&encoded).unwrap();
-        assert_eq!(msg, decoded);
+        match decode_plumtree_envelope::<u64>(&encoded) {
+            DecodeResult::Ok {
+                sender: decoded_sender,
+                message: decoded_msg,
+            } => {
+                assert_eq!(decoded_sender, sender);
+                assert_eq!(decoded_msg, msg);
+            }
+            other => panic!("expected Ok, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_encode_decode_all_message_types() {
+        let sender = 123u64;
+
+        // Test Gossip
+        let gossip = PlumtreeMessage::Gossip {
+            id: MessageId::new(),
+            round: 1,
+            payload: Bytes::from_static(b"test"),
+        };
+        let encoded = encode_plumtree_envelope(&sender, &gossip);
+        if let DecodeResult::Ok { message, .. } = decode_plumtree_envelope::<u64>(&encoded) {
+            assert_eq!(message, gossip);
+        } else {
+            panic!("failed to decode Gossip");
+        }
+
+        // Test IHave
+        let ihave = PlumtreeMessage::IHave {
+            message_ids: smallvec::smallvec![MessageId::new(), MessageId::new()],
+            round: 2,
+        };
+        let encoded = encode_plumtree_envelope(&sender, &ihave);
+        if let DecodeResult::Ok { message, .. } = decode_plumtree_envelope::<u64>(&encoded) {
+            assert_eq!(message, ihave);
+        } else {
+            panic!("failed to decode IHave");
+        }
+
+        // Test Graft
+        let graft = PlumtreeMessage::Graft {
+            message_id: MessageId::new(),
+            round: 3,
+        };
+        let encoded = encode_plumtree_envelope(&sender, &graft);
+        if let DecodeResult::Ok { message, .. } = decode_plumtree_envelope::<u64>(&encoded) {
+            assert_eq!(message, graft);
+        } else {
+            panic!("failed to decode Graft");
+        }
+
+        // Test Prune
+        let prune = PlumtreeMessage::Prune;
+        let encoded = encode_plumtree_envelope(&sender, &prune);
+        if let DecodeResult::Ok { message, .. } = decode_plumtree_envelope::<u64>(&encoded) {
+            assert_eq!(message, prune);
+        } else {
+            panic!("failed to decode Prune");
+        }
     }
 
     #[test]
     fn test_non_plumtree_message() {
         let data = b"regular user message";
         assert!(!is_plumtree_message(data));
-        assert!(decode_plumtree_message(data).is_none());
+        assert!(matches!(
+            decode_plumtree_envelope::<u64>(data),
+            DecodeResult::NotPlumtree
+        ));
+    }
+
+    #[test]
+    fn test_incompatible_version() {
+        // Create a message with wrong version
+        let mut data = BytesMut::new();
+        data.put_slice(PLUMTREE_MAGIC);
+        data.put_u8(0xFF); // Wrong version
+        data.put_u16(8); // sender len
+        data.put_u64(42); // sender
+        data.put_u8(1); // message tag
+
+        assert!(matches!(
+            decode_plumtree_envelope::<u64>(&data),
+            DecodeResult::IncompatibleVersion(0xFF)
+        ));
+    }
+
+    #[test]
+    fn test_malformed_sender_too_long() {
+        // Create a message with sender_len > MAX_SENDER_ID_LEN
+        let mut data = BytesMut::new();
+        data.put_slice(PLUMTREE_MAGIC);
+        data.put_u8(PLUMTREE_VERSION);
+        data.put_u16(1000); // Too long
+
+        assert!(matches!(
+            decode_plumtree_envelope::<u64>(&data),
+            DecodeResult::Malformed
+        ));
+    }
+
+    #[test]
+    fn test_malformed_truncated() {
+        // Create a truncated message
+        let mut data = BytesMut::new();
+        data.put_slice(PLUMTREE_MAGIC);
+        data.put_u8(PLUMTREE_VERSION);
+        data.put_u16(8); // sender len = 8
+        data.put_slice(&[1, 2, 3]); // Only 3 bytes, not 8
+
+        assert!(matches!(
+            decode_plumtree_envelope::<u64>(&data),
+            DecodeResult::Malformed
+        ));
     }
 
     #[test]
@@ -576,6 +949,7 @@ mod tests {
             PlumtreeMemberlist::new(1u64, PlumtreeConfig::default(), NoopDelegate);
 
         assert_eq!(*pm.plumtree().local_id(), 1u64);
+        assert_eq!(*pm.local_id(), 1u64);
         assert!(!pm.is_shutdown());
     }
 
@@ -609,5 +983,21 @@ mod tests {
 
         pm.remove_peer(&2u64);
         assert_eq!(pm.peer_stats().total(), 1);
+    }
+
+    #[test]
+    fn test_id_codec_u64() {
+        let id = 0x123456789ABCDEFu64;
+        let encoded = id.encode_id();
+        let decoded = u64::decode_id(&encoded).unwrap();
+        assert_eq!(id, decoded);
+    }
+
+    #[test]
+    fn test_id_codec_string() {
+        let id = "node-1".to_string();
+        let encoded = id.encode_id();
+        let decoded = String::decode_id(&encoded).unwrap();
+        assert_eq!(id, decoded);
     }
 }
