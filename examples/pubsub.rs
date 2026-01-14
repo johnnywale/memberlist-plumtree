@@ -277,7 +277,7 @@ impl PubSubDelegate {
     }
 }
 
-impl PlumtreeDelegate for PubSubDelegate {
+impl PlumtreeDelegate<NodeId> for PubSubDelegate {
     fn on_deliver(&self, _message_id: MessageId, payload: Bytes) {
         // Decode the pub/sub message
         let Some(msg) = PubSubMessage::decode(&payload) else {
@@ -309,19 +309,19 @@ impl PlumtreeDelegate for PubSubDelegate {
         );
     }
 
-    fn on_eager_promotion(&self, _peer: &[u8]) {
+    fn on_eager_promotion(&self, _peer: &NodeId) {
         // Peer promoted to eager (tree edge established)
     }
 
-    fn on_lazy_demotion(&self, _peer: &[u8]) {
+    fn on_lazy_demotion(&self, _peer: &NodeId) {
         // Peer demoted to lazy (tree edge removed)
     }
 
-    fn on_graft_sent(&self, _peer: &[u8], _message_id: &MessageId) {
+    fn on_graft_sent(&self, _peer: &NodeId, _message_id: &MessageId) {
         // Graft request sent (tree repair)
     }
 
-    fn on_prune_sent(&self, _peer: &[u8]) {
+    fn on_prune_sent(&self, _peer: &NodeId) {
         // Prune sent (tree optimization)
     }
 }

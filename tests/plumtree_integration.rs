@@ -38,16 +38,16 @@ impl TestDelegate {
     }
 }
 
-impl PlumtreeDelegate for TestDelegate {
+/// Simple node ID type for testing.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct NodeId(u64);
+
+impl PlumtreeDelegate<NodeId> for TestDelegate {
     fn on_deliver(&self, message_id: MessageId, payload: Bytes) {
         self.0.delivered.lock().push((message_id, payload.clone()));
         self.0.delivered_ids.lock().insert(message_id);
     }
 }
-
-/// Simple node ID type for testing.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct NodeId(u64);
 
 /// Test that a single node can broadcast and receive its own message
 /// through the cache (message is stored but not delivered to self).

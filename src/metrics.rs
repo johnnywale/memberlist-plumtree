@@ -32,6 +32,14 @@ pub fn init_metrics() {
         "Total number of Graft messages sent"
     );
     describe_counter!(
+        "plumtree_graft_retries_total",
+        "Total number of Graft retry attempts"
+    );
+    describe_counter!(
+        "plumtree_graft_timeouts_total",
+        "Total number of Graft requests that timed out after all retries"
+    );
+    describe_counter!(
         "plumtree_prune_sent_total",
         "Total number of Prune messages sent"
     );
@@ -42,6 +50,10 @@ pub fn init_metrics() {
     describe_counter!(
         "plumtree_peer_demotions_total",
         "Total number of peers demoted to lazy"
+    );
+    describe_counter!(
+        "plumtree_rate_limited_total",
+        "Total number of rate-limited Graft requests"
     );
 
     // Gauges
@@ -82,6 +94,21 @@ pub fn record_ihave_sent() {
 /// Record a Graft message sent.
 pub fn record_graft_sent() {
     counter!("plumtree_graft_sent_total").increment(1);
+}
+
+/// Record a Graft retry attempt.
+pub fn record_graft_retry() {
+    counter!("plumtree_graft_retries_total").increment(1);
+}
+
+/// Record a Graft timeout (all retries exhausted).
+pub fn record_graft_timeout() {
+    counter!("plumtree_graft_timeouts_total").increment(1);
+}
+
+/// Record a rate-limited Graft request.
+pub fn record_rate_limited() {
+    counter!("plumtree_rate_limited_total").increment(1);
 }
 
 /// Record a Prune message sent.

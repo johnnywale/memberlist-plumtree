@@ -122,7 +122,7 @@ struct DelegateStats {
     prunes_sent: usize,
 }
 
-impl PlumtreeDelegate for ChatDelegate {
+impl PlumtreeDelegate<NodeId> for ChatDelegate {
     fn on_deliver(&self, message_id: MessageId, payload: Bytes) {
         self.delivery_count.fetch_add(1, Ordering::Relaxed);
         if let Some(chat_msg) = ChatMessage::decode(&payload) {
@@ -138,19 +138,19 @@ impl PlumtreeDelegate for ChatDelegate {
         }
     }
 
-    fn on_eager_promotion(&self, _peer: &[u8]) {
+    fn on_eager_promotion(&self, _peer: &NodeId) {
         self.eager_promotions.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn on_lazy_demotion(&self, _peer: &[u8]) {
+    fn on_lazy_demotion(&self, _peer: &NodeId) {
         self.lazy_demotions.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn on_graft_sent(&self, _peer: &[u8], _message_id: &MessageId) {
+    fn on_graft_sent(&self, _peer: &NodeId, _message_id: &MessageId) {
         self.grafts_sent.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn on_prune_sent(&self, _peer: &[u8]) {
+    fn on_prune_sent(&self, _peer: &NodeId) {
         self.prunes_sent.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -410,7 +410,7 @@ fn demonstrate_graft_timer() {
     println!("  Expired immediately: {}", expired.len());
 
     // Use the simple API
-    let expired_simple = timer.get_expired_simple();
+    let expired_simple = timer.get_expired();
     println!("  Expired (simple API): {}", expired_simple.len());
 
     // Clear all pending
