@@ -196,45 +196,105 @@ impl<I: Clone + Eq + Hash> PeerState<I> {
     /// Get random eager peers for message forwarding.
     ///
     /// Excludes the specified peer (usually the message sender).
+    /// Uses read lock when possible to reduce contention on hot path.
+    /// Uses reservoir sampling for O(count) allocations instead of O(N).
     pub fn random_eager_except(&self, exclude: &I, count: usize) -> Vec<I>
     where
         I: Clone,
     {
-        let mut inner = self.inner.write();
+        if count == 0 {
+            return Vec::new();
+        }
 
-        // Refresh cache if dirty
+        // First try with read lock - only upgrade to write if cache is dirty
+        {
+            let inner = self.inner.read();
+            if !inner.cache_dirty {
+                return Self::reservoir_sample_except(&inner.eager_vec, exclude, count);
+            }
+        }
+
+        // Slow path: need to refresh cache with write lock
+        let mut inner = self.inner.write();
         if inner.cache_dirty {
             inner.eager_vec = inner.eager.iter().cloned().collect();
             inner.lazy_vec = inner.lazy.iter().cloned().collect();
             inner.cache_dirty = false;
         }
 
-        // Filter and select
-        let mut candidates: Vec<&I> = inner.eager_vec.iter().filter(|p| *p != exclude).collect();
-        candidates.shuffle(&mut rand::rng());
-        candidates.into_iter().take(count).cloned().collect()
+        Self::reservoir_sample_except(&inner.eager_vec, exclude, count)
+    }
+
+    /// Reservoir sampling to select `count` random items, excluding one.
+    /// O(N) scan but only O(count) allocations.
+    fn reservoir_sample_except(items: &[I], exclude: &I, count: usize) -> Vec<I>
+    where
+        I: Clone,
+    {
+        use rand::Rng;
+
+        // If count >= items.len() - 1 (excluding exclude), just return all except exclude
+        // Also handle count == usize::MAX gracefully
+        let effective_count = count.min(items.len());
+        if effective_count == 0 {
+            return Vec::new();
+        }
+
+        let mut rng = rand::rng();
+        let mut reservoir: Vec<I> = Vec::with_capacity(effective_count);
+        let mut seen = 0usize;
+
+        for item in items {
+            if item == exclude {
+                continue;
+            }
+
+            if reservoir.len() < effective_count {
+                // Fill the reservoir first
+                reservoir.push(item.clone());
+            } else {
+                // Reservoir sampling: replace with probability count/seen
+                let j = rng.random_range(0..=seen);
+                if j < effective_count {
+                    reservoir[j] = item.clone();
+                }
+            }
+            seen += 1;
+        }
+
+        reservoir
     }
 
     /// Get random lazy peers for IHave announcements.
     ///
     /// Excludes the specified peer (usually the message sender).
+    /// Uses read lock when possible to reduce contention on hot path.
+    /// Uses reservoir sampling for O(count) allocations instead of O(N).
     pub fn random_lazy_except(&self, exclude: &I, count: usize) -> Vec<I>
     where
         I: Clone,
     {
-        let mut inner = self.inner.write();
+        if count == 0 {
+            return Vec::new();
+        }
 
-        // Refresh cache if dirty
+        // First try with read lock - only upgrade to write if cache is dirty
+        {
+            let inner = self.inner.read();
+            if !inner.cache_dirty {
+                return Self::reservoir_sample_except(&inner.lazy_vec, exclude, count);
+            }
+        }
+
+        // Slow path: need to refresh cache with write lock
+        let mut inner = self.inner.write();
         if inner.cache_dirty {
             inner.eager_vec = inner.eager.iter().cloned().collect();
             inner.lazy_vec = inner.lazy.iter().cloned().collect();
             inner.cache_dirty = false;
         }
 
-        // Filter and select
-        let mut candidates: Vec<&I> = inner.lazy_vec.iter().filter(|p| *p != exclude).collect();
-        candidates.shuffle(&mut rand::rng());
-        candidates.into_iter().take(count).cloned().collect()
+        Self::reservoir_sample_except(&inner.lazy_vec, exclude, count)
     }
 
     /// Get the number of eager peers.

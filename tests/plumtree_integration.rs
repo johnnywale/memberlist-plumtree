@@ -38,7 +38,7 @@ impl TestDelegate {
     }
 }
 
-impl PlumtreeDelegate for TestDelegate {
+impl PlumtreeDelegate<NodeId> for TestDelegate {
     fn on_deliver(&self, message_id: MessageId, payload: Bytes) {
         self.0.delivered.lock().push((message_id, payload.clone()));
         self.0.delivered_ids.lock().insert(message_id);

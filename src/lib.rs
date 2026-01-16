@@ -53,6 +53,7 @@ mod plumtree;
 mod rate_limiter;
 mod runner;
 mod scheduler;
+mod transport;
 
 #[cfg(feature = "metrics")]
 mod metrics;
@@ -77,11 +78,16 @@ pub use plumtree::{
 };
 
 // Re-export runner types
-pub use runner::{create_plumtree_with_channels, PlumtreeRunner, PlumtreeRunnerBuilder};
+pub use runner::{create_plumtree_with_channels, PlumtreeRunnerWithTransport};
+
+// Re-export deprecated runner for backwards compatibility
+#[allow(deprecated)]
+pub use runner::{PlumtreeRunner, PlumtreeRunnerBuilder};
 
 // Re-export integration types
 pub use integration::{
-    decode_plumtree_message, encode_plumtree_message, is_plumtree_message, PlumtreeEventHandler,
+    decode_plumtree_envelope, decode_plumtree_message, encode_plumtree_envelope,
+    encode_plumtree_message, is_plumtree_message, IdCodec, PlumtreeEventHandler,
     PlumtreeMemberlist, PlumtreeNodeDelegate,
 };
 
@@ -90,6 +96,12 @@ pub use scheduler::{ExpiredGraft, GraftTimer, IHaveQueue, IHaveScheduler, Pendin
 
 // Re-export rate limiter types
 pub use rate_limiter::{GlobalRateLimiter, RateLimiter};
+
+// Re-export transport types
+pub use transport::{ChannelTransport, ChannelTransportError, NoopTransport, Transport};
+
+// Re-export scheduler failure types
+pub use scheduler::FailedGraft;
 
 /// Re-export memberlist-core types for convenience
 pub mod memberlist {

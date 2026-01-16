@@ -69,6 +69,11 @@ pub struct PlumtreeConfig {
     ///
     /// Batching IHaves reduces packet overhead but increases latency.
     ///
+    /// **Large Cluster Recommendation**: In clusters with 1000+ nodes,
+    /// set this to 32-64 to reduce IHave storm overhead. The total IHave
+    /// traffic scales with `nodes × lazy_fanout × messages`, so larger
+    /// batches significantly reduce packet count.
+    ///
     /// Default: 16
     pub ihave_batch_size: usize,
 
@@ -248,6 +253,14 @@ impl PlumtreeConfig {
     /// Set the optimization threshold (builder pattern).
     pub const fn with_optimization_threshold(mut self, threshold: u32) -> Self {
         self.optimization_threshold = threshold;
+        self
+    }
+
+    /// Set the IHave batch size (builder pattern).
+    ///
+    /// For large clusters (1000+ nodes), use 32-64 to reduce IHave storm overhead.
+    pub const fn with_ihave_batch_size(mut self, size: usize) -> Self {
+        self.ihave_batch_size = size;
         self
     }
 

@@ -2,7 +2,7 @@
 //!
 //! Provides counters and gauges for monitoring protocol performance.
 
-use metrics::{counter, describe_counter, describe_gauge, gauge};
+use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 
 /// Initialize metric descriptions.
 pub fn init_metrics() {
@@ -42,6 +42,20 @@ pub fn init_metrics() {
     describe_counter!(
         "plumtree_peer_demotions_total",
         "Total number of peers demoted to lazy"
+    );
+    describe_counter!(
+        "plumtree_graft_success_total",
+        "Total number of successful Graft requests (message received after Graft)"
+    );
+    describe_counter!(
+        "plumtree_graft_failed_total",
+        "Total number of failed Graft requests (timeout before message received)"
+    );
+
+    // Histograms
+    describe_histogram!(
+        "plumtree_graft_latency_seconds",
+        "Latency from Graft request to message delivery in seconds"
     );
 
     // Gauges
@@ -117,4 +131,19 @@ pub fn set_cache_size(count: usize) {
 /// Update IHave queue size gauge.
 pub fn set_ihave_queue_size(count: usize) {
     gauge!("plumtree_ihave_queue_size").set(count as f64);
+}
+
+/// Record a successful Graft (message received after Graft request).
+pub fn record_graft_success() {
+    counter!("plumtree_graft_success_total").increment(1);
+}
+
+/// Record a failed Graft (timeout before message received).
+pub fn record_graft_failed() {
+    counter!("plumtree_graft_failed_total").increment(1);
+}
+
+/// Record Graft latency in seconds.
+pub fn record_graft_latency(latency_secs: f64) {
+    histogram!("plumtree_graft_latency_seconds").record(latency_secs);
 }

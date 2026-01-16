@@ -2,8 +2,20 @@
 //!
 //! This module provides the glue between Plumtree and memberlist,
 //! handling message routing and membership synchronization.
+//!
+//! # Sender Identity
+//!
+//! Since memberlist's broadcast mechanism doesn't provide sender information,
+//! Plumtree wraps messages in a `NetworkEnvelope` that includes the sender's
+//! node ID. This is critical for proper protocol operation because:
+//!
+//! - **IHave**: Sender must be known to promote to Eager and send Graft
+//! - **Graft**: Requester must be known to send data directly to them
+//! - **Prune**: Sender must be known to demote to Lazy
+//!
+//! The envelope is transparent to users - encoding/decoding happens automatically.
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use memberlist_core::{
     delegate::{
         AliveDelegate, ConflictDelegate, Delegate, EventDelegate, MergeDelegate, NodeDelegate,
@@ -22,29 +34,266 @@ use crate::{
     plumtree::{Plumtree, PlumtreeDelegate, PlumtreeHandle},
 };
 
+/// Trait for encoding and decoding node IDs for network transmission.
+///
+/// This trait must be implemented for any node ID type used with
+/// `PlumtreeMemberlist` to enable sender identity tracking.
+///
+/// # Example
+///
+/// ```rust
+/// use memberlist_plumtree::IdCodec;
+/// use bytes::{Buf, BufMut};
+///
+/// #[derive(Clone, Debug, PartialEq)]
+/// struct MyNodeId(u64);
+///
+/// impl IdCodec for MyNodeId {
+///     fn encode_id(&self, buf: &mut impl BufMut) {
+///         buf.put_u64(self.0);
+///     }
+///
+///     fn decode_id(buf: &mut impl Buf) -> Option<Self> {
+///         if buf.remaining() >= 8 {
+///             Some(MyNodeId(buf.get_u64()))
+///         } else {
+///             None
+///         }
+///     }
+///
+///     fn encoded_id_len(&self) -> usize {
+///         8
+///     }
+/// }
+/// ```
+pub trait IdCodec: Sized {
+    /// Encode this ID into the buffer.
+    fn encode_id(&self, buf: &mut impl BufMut);
+
+    /// Decode an ID from the buffer.
+    fn decode_id(buf: &mut impl Buf) -> Option<Self>;
+
+    /// Get the encoded length of this ID in bytes.
+    fn encoded_id_len(&self) -> usize;
+}
+
+// Implement IdCodec for common integer types
+impl IdCodec for u8 {
+    fn encode_id(&self, buf: &mut impl BufMut) {
+        buf.put_u8(*self);
+    }
+
+    fn decode_id(buf: &mut impl Buf) -> Option<Self> {
+        if buf.remaining() >= 1 {
+            Some(buf.get_u8())
+        } else {
+            None
+        }
+    }
+
+    fn encoded_id_len(&self) -> usize {
+        1
+    }
+}
+
+impl IdCodec for u16 {
+    fn encode_id(&self, buf: &mut impl BufMut) {
+        buf.put_u16(*self);
+    }
+
+    fn decode_id(buf: &mut impl Buf) -> Option<Self> {
+        if buf.remaining() >= 2 {
+            Some(buf.get_u16())
+        } else {
+            None
+        }
+    }
+
+    fn encoded_id_len(&self) -> usize {
+        2
+    }
+}
+
+impl IdCodec for u32 {
+    fn encode_id(&self, buf: &mut impl BufMut) {
+        buf.put_u32(*self);
+    }
+
+    fn decode_id(buf: &mut impl Buf) -> Option<Self> {
+        if buf.remaining() >= 4 {
+            Some(buf.get_u32())
+        } else {
+            None
+        }
+    }
+
+    fn encoded_id_len(&self) -> usize {
+        4
+    }
+}
+
+impl IdCodec for u64 {
+    fn encode_id(&self, buf: &mut impl BufMut) {
+        buf.put_u64(*self);
+    }
+
+    fn decode_id(buf: &mut impl Buf) -> Option<Self> {
+        if buf.remaining() >= 8 {
+            Some(buf.get_u64())
+        } else {
+            None
+        }
+    }
+
+    fn encoded_id_len(&self) -> usize {
+        8
+    }
+}
+
+impl IdCodec for u128 {
+    fn encode_id(&self, buf: &mut impl BufMut) {
+        buf.put_u128(*self);
+    }
+
+    fn decode_id(buf: &mut impl Buf) -> Option<Self> {
+        if buf.remaining() >= 16 {
+            Some(buf.get_u128())
+        } else {
+            None
+        }
+    }
+
+    fn encoded_id_len(&self) -> usize {
+        16
+    }
+}
+
+// Implement IdCodec for String (variable-length)
+impl IdCodec for String {
+    fn encode_id(&self, buf: &mut impl BufMut) {
+        let bytes = self.as_bytes();
+        buf.put_u16(bytes.len() as u16);
+        buf.put_slice(bytes);
+    }
+
+    fn decode_id(buf: &mut impl Buf) -> Option<Self> {
+        if buf.remaining() < 2 {
+            return None;
+        }
+        let len = buf.get_u16() as usize;
+        if buf.remaining() < len {
+            return None;
+        }
+        let bytes = buf.copy_to_bytes(len);
+        String::from_utf8(bytes.to_vec()).ok()
+    }
+
+    fn encoded_id_len(&self) -> usize {
+        2 + self.len()
+    }
+}
+
 /// Magic byte prefix for Plumtree messages.
 ///
 /// Used to distinguish Plumtree protocol messages from user messages.
 const PLUMTREE_MAGIC: u8 = 0x50;
+
+/// Outgoing broadcast envelope (unencooded).
+///
+/// Used internally to defer serialization until the message is actually
+/// sent over the network, reducing unnecessary allocations.
+#[derive(Debug, Clone)]
+pub(crate) struct BroadcastEnvelope<I> {
+    /// Sender's node ID (included in envelope for protocol operation).
+    sender: I,
+    /// The Plumtree protocol message.
+    message: PlumtreeMessage,
+}
+
+impl<I: IdCodec> BroadcastEnvelope<I> {
+    /// Encode this envelope for network transmission.
+    fn encode(&self) -> Bytes {
+        encode_plumtree_envelope(&self.sender, &self.message)
+    }
+}
+
+/// Outgoing unicast envelope (unencooded).
+///
+/// Used internally to defer serialization until the message is actually
+/// sent over the network, reducing unnecessary allocations.
+#[derive(Debug, Clone)]
+pub(crate) struct UnicastEnvelope<I> {
+    /// Sender's node ID (included in envelope for protocol operation).
+    sender: I,
+    /// Target peer to send to.
+    target: I,
+    /// The Plumtree protocol message.
+    message: PlumtreeMessage,
+}
+
+impl<I: IdCodec> UnicastEnvelope<I> {
+    /// Encode this envelope for network transmission.
+    fn encode(&self) -> Bytes {
+        encode_plumtree_envelope(&self.sender, &self.message)
+    }
+}
 
 /// Combined Plumtree + Memberlist system.
 ///
 /// Wraps a memberlist instance and provides efficient O(n) broadcast
 /// via the Plumtree protocol while using memberlist for membership.
 ///
-/// # Example
+/// # Recommended Usage
+///
+/// Use [`run_with_transport`](Self::run_with_transport) which handles unicast
+/// delivery automatically and prevents common mistakes:
 ///
 /// ```ignore
-/// use memberlist_plumtree::{PlumtreeMemberlist, PlumtreeConfig, NoopDelegate};
+/// use memberlist_plumtree::{PlumtreeMemberlist, PlumtreeConfig, NoopDelegate, Transport};
 ///
-/// // Create with existing memberlist
-/// let plumtree_memberlist = PlumtreeMemberlistBuilder::new()
-///     .with_config(PlumtreeConfig::lan())
-///     .with_delegate(NoopDelegate)
-///     .build(memberlist);
+/// // Implement Transport for your memberlist
+/// struct MyTransport { memberlist: Memberlist }
+/// impl Transport<NodeId> for MyTransport {
+///     type Error = MyError;
+///     async fn send_to(&self, target: &NodeId, data: Bytes) -> Result<(), Self::Error> {
+///         self.memberlist.send_reliable(target, data).await
+///     }
+/// }
 ///
-/// // Broadcast a message
-/// plumtree_memberlist.broadcast(b"hello cluster").await?;
+/// let pm = PlumtreeMemberlist::new(local_id, PlumtreeConfig::lan(), NoopDelegate);
+/// let transport = MyTransport { memberlist };
+///
+/// // Run with automatic unicast handling (recommended!)
+/// tokio::spawn(async move {
+///     pm.run_with_transport(transport).await;
+/// });
+///
+/// // Only need to handle broadcast messages for gossip
+/// let broadcast_rx = pm.outgoing_receiver();
+/// tokio::spawn(async move {
+///     while let Ok(msg) = broadcast_rx.recv().await {
+///         memberlist.broadcast(msg).await;
+///     }
+/// });
+/// ```
+///
+/// # Manual Unicast Handling (Advanced)
+///
+/// If you need more control, you can use [`run`](Self::run) and manually handle
+/// unicast messages from [`unicast_receiver`](Self::unicast_receiver). However,
+/// **failing to process unicast messages will break the protocol**.
+///
+/// ```ignore
+/// // Only use this if you have a specific reason!
+/// tokio::spawn(pm.run());
+///
+/// // You MUST handle unicast messages yourself
+/// let unicast_rx = pm.unicast_receiver();
+/// tokio::spawn(async move {
+///     while let Ok((target, msg)) = unicast_rx.recv().await {
+///         memberlist.send_to(&target, msg).await; // REQUIRED!
+///     }
+/// });
 /// ```
 pub struct PlumtreeMemberlist<I, PD>
 where
@@ -58,18 +307,24 @@ where
     incoming_tx: async_channel::Sender<(I, PlumtreeMessage)>,
     /// Channel for receiving incoming Plumtree messages from memberlist.
     incoming_rx: async_channel::Receiver<(I, PlumtreeMessage)>,
-    /// Channel for outgoing encoded messages to memberlist broadcast.
-    outgoing_rx: async_channel::Receiver<Bytes>,
-    /// Sender for outgoing messages (clone for runner).
-    outgoing_tx: async_channel::Sender<Bytes>,
+    /// Channel for outgoing broadcast messages (unencooded, serialization deferred).
+    #[allow(dead_code)]
+    outgoing_rx: async_channel::Receiver<BroadcastEnvelope<I>>,
+    /// Sender for outgoing broadcast messages.
+    outgoing_tx: async_channel::Sender<BroadcastEnvelope<I>>,
+    /// Channel for outgoing unicast messages (unencooded, serialization deferred).
+    /// These MUST be sent directly to the target peer, NOT broadcast!
+    unicast_rx: async_channel::Receiver<UnicastEnvelope<I>>,
+    /// Sender for outgoing unicast messages.
+    unicast_tx: async_channel::Sender<UnicastEnvelope<I>>,
     /// Peer state reference for external sync.
     peers: Arc<PeerState<I>>,
 }
 
 impl<I, PD> PlumtreeMemberlist<I, PD>
 where
-    I: Id + Clone + Eq + Hash + Debug + Send + Sync + 'static,
-    PD: PlumtreeDelegate,
+    I: Id + IdCodec + Clone + Eq + Hash + Debug + Send + Sync + 'static,
+    PD: PlumtreeDelegate<I>,
 {
     /// Create a new PlumtreeMemberlist instance.
     ///
@@ -82,6 +337,7 @@ where
         // Create channels for communication
         let (incoming_tx, incoming_rx) = async_channel::bounded(1024);
         let (outgoing_tx, outgoing_rx) = async_channel::bounded(1024);
+        let (unicast_tx, unicast_rx) = async_channel::bounded(1024);
 
         // Create shared peer state
         let peers = Arc::new(PeerState::new());
@@ -99,6 +355,8 @@ where
             incoming_rx,
             outgoing_rx,
             outgoing_tx,
+            unicast_rx,
+            unicast_tx,
             peers,
         }
     }
@@ -110,16 +368,59 @@ where
         self.incoming_tx.clone()
     }
 
-    /// Get the receiver for outgoing encoded messages.
+    /// Get the receiver for outgoing broadcast envelopes.
+    ///
+    /// These messages have no specific target and should be disseminated
+    /// via memberlist's gossip/broadcast mechanism.
+    ///
+    /// **Note**: Messages are unencooded. Call `.encode()` on the envelope
+    /// to get bytes for transmission.
     ///
     /// Pass this to `PlumtreeNodeDelegate` for memberlist broadcast.
-    pub fn outgoing_receiver(&self) -> async_channel::Receiver<Bytes> {
+    #[allow(dead_code)]
+    pub(crate) fn outgoing_receiver_raw(
+        &self,
+    ) -> async_channel::Receiver<BroadcastEnvelope<I>> {
         self.outgoing_rx.clone()
     }
 
-    /// Get the outgoing message sender for the runner.
-    pub fn outgoing_sender(&self) -> async_channel::Sender<Bytes> {
+    /// Get the receiver for outgoing unicast envelopes.
+    ///
+    /// **CRITICAL**: These messages MUST be sent directly to the specified
+    /// target peer using memberlist's direct send API (e.g., `send_reliable`,
+    /// `send_to`, or similar). DO NOT broadcast these messages!
+    ///
+    /// **Note**: Messages are unencooded. Call `.encode()` on the envelope
+    /// to get bytes, and use `.target` to get the destination peer.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let unicast_rx = pm.unicast_receiver_raw();
+    /// while let Ok(envelope) = unicast_rx.recv().await {
+    ///     let target = envelope.target.clone();
+    ///     let encoded = envelope.encode();
+    ///     // Use memberlist's direct send, NOT broadcast!
+    ///     memberlist.send_reliable(&target, encoded).await;
+    /// }
+    /// ```
+    #[allow(dead_code)]
+    pub(crate) fn unicast_receiver_raw(
+        &self,
+    ) -> async_channel::Receiver<UnicastEnvelope<I>> {
+        self.unicast_rx.clone()
+    }
+
+    /// Get the outgoing broadcast envelope sender.
+    #[allow(dead_code)]
+    pub(crate) fn outgoing_sender_raw(&self) -> async_channel::Sender<BroadcastEnvelope<I>> {
         self.outgoing_tx.clone()
+    }
+
+    /// Get the outgoing unicast envelope sender.
+    #[allow(dead_code)]
+    pub(crate) fn unicast_sender_raw(&self) -> async_channel::Sender<UnicastEnvelope<I>> {
+        self.unicast_tx.clone()
     }
 
     /// Broadcast a message to all nodes in the cluster.
@@ -180,30 +481,118 @@ where
         &self.peers
     }
 
-    /// Run the Plumtree background tasks.
+    /// Run the Plumtree background tasks (manual unicast handling).
     ///
-    /// This runs the IHave scheduler and Graft timer.
-    /// Should be spawned as a background task.
+    /// This runs the IHave scheduler, Graft timer, and outgoing processor.
+    /// Unicast messages are sent to `unicast_receiver()` channel.
+    ///
+    /// **WARNING**: You MUST process messages from `unicast_receiver()` and send them
+    /// directly to the target peer. Failing to do so will break the protocol.
+    ///
+    /// For safer usage, prefer [`run_with_transport`](Self::run_with_transport) which
+    /// handles unicast delivery automatically.
     pub async fn run(&self) {
-        futures::future::join3(
+        futures::future::join4(
             self.plumtree.run_ihave_scheduler(),
             self.plumtree.run_graft_timer(),
+            self.plumtree.run_seen_cleanup(),
             self.run_outgoing_processor(),
         )
         .await;
     }
 
+    /// Run the Plumtree background tasks with automatic unicast handling.
+    ///
+    /// This is the **recommended** way to run PlumtreeMemberlist. It handles
+    /// unicast message delivery automatically using the provided transport,
+    /// preventing protocol failures from forgotten unicast handling.
+    ///
+    /// # Arguments
+    ///
+    /// * `transport` - Implementation of [`Transport`](crate::Transport) for unicast delivery
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use memberlist_plumtree::{PlumtreeMemberlist, Transport};
+    ///
+    /// struct MyTransport { memberlist: Memberlist }
+    ///
+    /// impl Transport<NodeId> for MyTransport {
+    ///     type Error = MyError;
+    ///     async fn send_to(&self, target: &NodeId, data: Bytes) -> Result<(), Self::Error> {
+    ///         self.memberlist.send_reliable(target, data).await
+    ///     }
+    /// }
+    ///
+    /// // No need to handle unicast_receiver() - it's done automatically!
+    /// let transport = MyTransport { memberlist };
+    /// pm.run_with_transport(transport).await;
+    /// ```
+    pub async fn run_with_transport<T>(&self, transport: T)
+    where
+        T: crate::Transport<I>,
+    {
+        futures::future::join5(
+            self.plumtree.run_ihave_scheduler(),
+            self.plumtree.run_graft_timer(),
+            self.plumtree.run_seen_cleanup(),
+            self.run_outgoing_processor(),
+            self.run_unicast_sender(transport),
+        )
+        .await;
+    }
+
+    /// Internal task that sends unicast messages via the provided transport.
+    ///
+    /// Serialization is deferred to this point to minimize allocations.
+    async fn run_unicast_sender<T>(&self, transport: T)
+    where
+        T: crate::Transport<I>,
+    {
+        while let Ok(envelope) = self.unicast_rx.recv().await {
+            // Encode at the last moment before network transmission
+            let encoded = envelope.encode();
+            if let Err(e) = transport.send_to(&envelope.target, encoded).await {
+                tracing::warn!("failed to send unicast message to {:?}: {}", envelope.target, e);
+            }
+        }
+    }
+
     /// Run the outgoing message processor.
     ///
-    /// Encodes outgoing Plumtree messages and sends them to the outgoing channel.
+    /// Routes outgoing messages to the appropriate channel:
+    /// - Unicast messages (with target) -> unicast_tx
+    /// - Broadcast messages (no target) -> outgoing_tx
+    ///
+    /// Messages are passed as unencooded envelopes. Serialization is deferred
+    /// until the message is actually sent over the network to minimize
+    /// unnecessary allocations.
     async fn run_outgoing_processor(&self) {
-        while let Some(outgoing) = self.handle.next_outgoing().await {
-            // Encode the message for broadcast
-            let encoded = encode_plumtree_message(&outgoing.message);
+        let local_id = self.plumtree.local_id().clone();
 
-            if self.outgoing_tx.send(encoded).await.is_err() {
-                // Channel closed
-                break;
+        while let Some(outgoing) = self.handle.next_outgoing().await {
+            if let Some(target) = outgoing.target {
+                // Unicast: create envelope with target (encoding deferred)
+                let envelope = UnicastEnvelope {
+                    sender: local_id.clone(),
+                    target,
+                    message: outgoing.message,
+                };
+                if self.unicast_tx.send(envelope).await.is_err() {
+                    // Channel closed
+                    break;
+                }
+            } else {
+                // Broadcast: create envelope (encoding deferred)
+                let envelope = BroadcastEnvelope {
+                    sender: local_id.clone(),
+                    message: outgoing.message,
+                };
+                if self.outgoing_tx.send(envelope).await.is_err() {
+                    // Channel closed
+                    break;
+                }
             }
         }
     }
@@ -223,6 +612,7 @@ where
     pub fn shutdown(&self) {
         self.plumtree.shutdown();
         self.outgoing_tx.close();
+        self.unicast_tx.close();
     }
 
     /// Check if shutdown has been requested.
@@ -240,8 +630,9 @@ pub struct PlumtreeNodeDelegate<I, A, D> {
     inner: D,
     /// Channel to send received Plumtree messages to PlumtreeMemberlist.
     plumtree_tx: async_channel::Sender<(I, PlumtreeMessage)>,
-    /// Outgoing Plumtree messages to broadcast via memberlist.
-    outgoing_rx: async_channel::Receiver<Bytes>,
+    /// Outgoing Plumtree messages to broadcast via memberlist (unencooded).
+    /// Serialization is deferred until messages are sent over the network.
+    outgoing_rx: async_channel::Receiver<BroadcastEnvelope<I>>,
     /// Marker.
     _marker: PhantomData<A>,
 }
@@ -253,11 +644,12 @@ impl<I, A, D> PlumtreeNodeDelegate<I, A, D> {
     ///
     /// * `inner` - The user's delegate implementation
     /// * `plumtree_tx` - Sender for forwarding received Plumtree messages
-    /// * `outgoing_rx` - Receiver for outgoing Plumtree messages to broadcast
-    pub fn new(
+    /// * `outgoing_rx` - Receiver for outgoing Plumtree messages to broadcast (unencooded)
+    #[allow(dead_code)]
+    pub(crate) fn new(
         inner: D,
         plumtree_tx: async_channel::Sender<(I, PlumtreeMessage)>,
-        outgoing_rx: async_channel::Receiver<Bytes>,
+        outgoing_rx: async_channel::Receiver<BroadcastEnvelope<I>>,
     ) -> Self {
         Self {
             inner,
@@ -279,17 +671,19 @@ impl<I, A, D> PlumtreeNodeDelegate<I, A, D> {
         self.plumtree_tx.clone()
     }
 
-    /// Get a clone of the outgoing message receiver.
+    /// Get a clone of the outgoing envelope receiver.
     ///
     /// This can be used to receive outgoing Plumtree messages from external sources.
-    pub fn outgoing_receiver(&self) -> async_channel::Receiver<Bytes> {
+    /// Messages are unencooded - call `.encode()` on the envelope to get bytes.
+    #[allow(dead_code)]
+    pub(crate) fn outgoing_receiver(&self) -> async_channel::Receiver<BroadcastEnvelope<I>> {
         self.outgoing_rx.clone()
     }
 }
 
 impl<I, A, D> NodeDelegate for PlumtreeNodeDelegate<I, A, D>
 where
-    I: Id + Clone + Send + Sync + 'static,
+    I: Id + IdCodec + Clone + Send + Sync + 'static,
     A: CheapClone + Send + Sync + 'static,
     D: NodeDelegate,
 {
@@ -300,15 +694,19 @@ where
     async fn notify_message(&self, msg: Cow<'_, [u8]>) {
         // Check if this is a Plumtree message
         if msg.len() > 1 && msg[0] == PLUMTREE_MAGIC {
-            // Decode Plumtree message
-            if let Some(plumtree_msg) = PlumtreeMessage::decode_from_slice(&msg[1..]) {
-                tracing::trace!("received plumtree message: {:?}", plumtree_msg.tag());
-                // Note: memberlist broadcast doesn't provide sender info
-                // For full Plumtree functionality, use point-to-point messages
-                // or include sender in the message payload
-                tracing::debug!("plumtree message received via broadcast (sender unknown)");
+            // Decode Plumtree envelope (sender_id + message)
+            if let Some((sender, plumtree_msg)) = decode_plumtree_envelope::<I>(&msg) {
+                tracing::trace!(
+                    "received plumtree {:?} from {:?}",
+                    plumtree_msg.tag(),
+                    sender
+                );
+                // Forward to Plumtree for proper handling with sender identity
+                if self.plumtree_tx.send((sender, plumtree_msg)).await.is_err() {
+                    tracing::warn!("plumtree channel closed, cannot forward message");
+                }
             } else {
-                tracing::warn!("failed to decode plumtree message");
+                tracing::warn!("failed to decode plumtree envelope");
             }
         } else {
             // Forward non-Plumtree messages to inner delegate
@@ -324,23 +722,34 @@ where
     where
         F: Fn(Bytes) -> (usize, Bytes) + Send + Sync + 'static,
     {
-        // Collect Plumtree outgoing messages
-        let mut plumtree_msgs = Vec::new();
-        let mut used = 0;
+        // Use proportional limiting to prevent Plumtree from starving user messages.
+        // Reserve at least 30% of bandwidth for user messages to ensure they always
+        // have a chance to be sent, even under heavy Plumtree control traffic.
+        const PLUMTREE_MAX_RATIO: usize = 70;
+        let plumtree_limit = (limit * PLUMTREE_MAX_RATIO) / 100;
+        let user_reserved = limit - plumtree_limit;
 
-        while let Ok(msg) = self.outgoing_rx.try_recv() {
-            let (len, msg) = encoded_len(msg);
-            if used + len <= limit {
-                used += len;
+        // Collect Plumtree outgoing messages up to proportional limit
+        // Serialization is deferred to here - encode just before network transmission
+        let mut plumtree_msgs = Vec::new();
+        let mut plumtree_used = 0;
+
+        while let Ok(envelope) = self.outgoing_rx.try_recv() {
+            // Encode at the last moment before network transmission
+            let encoded = envelope.encode();
+            let (len, msg) = encoded_len(encoded);
+            if plumtree_used + len <= plumtree_limit {
+                plumtree_used += len;
                 plumtree_msgs.push(msg);
             } else {
+                // Plumtree hit its proportional limit, stop collecting
                 break;
             }
         }
 
-        // Get user messages with remaining space
-        let remaining = limit.saturating_sub(used);
-        let user_msgs = self.inner.broadcast_messages(remaining, encoded_len).await;
+        // User gets reserved space plus any unused Plumtree quota
+        let user_limit = user_reserved + (plumtree_limit - plumtree_used);
+        let user_msgs = self.inner.broadcast_messages(user_limit, encoded_len).await;
 
         // Combine both iterators
         plumtree_msgs.into_iter().chain(user_msgs)
@@ -357,7 +766,7 @@ where
 
 impl<I, A, D> PingDelegate for PlumtreeNodeDelegate<I, A, D>
 where
-    I: Id + Clone + Send + Sync + 'static,
+    I: Id + IdCodec + Clone + Send + Sync + 'static,
     A: CheapClone + Send + Sync + 'static,
     D: PingDelegate<Id = I, Address = A>,
 {
@@ -384,7 +793,7 @@ where
 
 impl<I, A, D> EventDelegate for PlumtreeNodeDelegate<I, A, D>
 where
-    I: Id + Clone + Send + Sync + 'static,
+    I: Id + IdCodec + Clone + Send + Sync + 'static,
     A: CheapClone + Send + Sync + 'static,
     D: EventDelegate<Id = I, Address = A>,
 {
@@ -406,7 +815,7 @@ where
 
 impl<I, A, D> ConflictDelegate for PlumtreeNodeDelegate<I, A, D>
 where
-    I: Id + Clone + Send + Sync + 'static,
+    I: Id + IdCodec + Clone + Send + Sync + 'static,
     A: CheapClone + Send + Sync + 'static,
     D: ConflictDelegate<Id = I, Address = A>,
 {
@@ -424,7 +833,7 @@ where
 
 impl<I, A, D> AliveDelegate for PlumtreeNodeDelegate<I, A, D>
 where
-    I: Id + Clone + Send + Sync + 'static,
+    I: Id + IdCodec + Clone + Send + Sync + 'static,
     A: CheapClone + Send + Sync + 'static,
     D: AliveDelegate<Id = I, Address = A>,
 {
@@ -442,7 +851,7 @@ where
 
 impl<I, A, D> MergeDelegate for PlumtreeNodeDelegate<I, A, D>
 where
-    I: Id + Clone + Send + Sync + 'static,
+    I: Id + IdCodec + Clone + Send + Sync + 'static,
     A: CheapClone + Send + Sync + 'static,
     D: MergeDelegate<Id = I, Address = A>,
 {
@@ -460,7 +869,7 @@ where
 
 impl<I, A, D> Delegate for PlumtreeNodeDelegate<I, A, D>
 where
-    I: Id + Clone + Send + Sync + 'static,
+    I: Id + IdCodec + Clone + Send + Sync + 'static,
     A: CheapClone + Send + Sync + 'static,
     D: Delegate<Id = I, Address = A>,
 {
@@ -490,35 +899,42 @@ impl<I, PD> PlumtreeEventHandler<I, PD> {
     }
 }
 
-impl<I, PD> PlumtreeDelegate for PlumtreeEventHandler<I, PD>
+impl<I, PD> PlumtreeDelegate<I> for PlumtreeEventHandler<I, PD>
 where
     I: Clone + Eq + Hash + Send + Sync + 'static,
-    PD: PlumtreeDelegate,
+    PD: PlumtreeDelegate<I>,
 {
     fn on_deliver(&self, message_id: MessageId, payload: Bytes) {
         self.inner.on_deliver(message_id, payload);
     }
 
-    fn on_eager_promotion(&self, peer: &[u8]) {
+    fn on_eager_promotion(&self, peer: &I) {
         self.inner.on_eager_promotion(peer);
     }
 
-    fn on_lazy_demotion(&self, peer: &[u8]) {
+    fn on_lazy_demotion(&self, peer: &I) {
         self.inner.on_lazy_demotion(peer);
     }
 
-    fn on_graft_sent(&self, peer: &[u8], message_id: &MessageId) {
+    fn on_graft_sent(&self, peer: &I, message_id: &MessageId) {
         self.inner.on_graft_sent(peer, message_id);
     }
 
-    fn on_prune_sent(&self, peer: &[u8]) {
+    fn on_prune_sent(&self, peer: &I) {
         self.inner.on_prune_sent(peer);
+    }
+
+    fn on_graft_failed(&self, message_id: &MessageId, peer: &I) {
+        self.inner.on_graft_failed(message_id, peer);
     }
 }
 
 /// Encode a Plumtree message for transmission via memberlist.
 ///
-/// Format: [MAGIC][message]
+/// Format: `[MAGIC][message]`
+///
+/// **Note**: This function does NOT include sender identity. For proper protocol
+/// operation, use [`encode_plumtree_envelope`] which includes the sender ID.
 pub fn encode_plumtree_message(msg: &PlumtreeMessage) -> Bytes {
     let encoded = msg.encode_to_bytes();
     let mut buf = BytesMut::with_capacity(1 + encoded.len());
@@ -527,9 +943,48 @@ pub fn encode_plumtree_message(msg: &PlumtreeMessage) -> Bytes {
     buf.freeze()
 }
 
+/// Encode a Plumtree message with sender identity for transmission.
+///
+/// Format: `[MAGIC][sender_id][message]`
+///
+/// This is the **recommended** encoding function as it includes the sender's
+/// node ID, which is critical for proper Plumtree protocol operation.
+pub fn encode_plumtree_envelope<I: IdCodec>(sender: &I, msg: &PlumtreeMessage) -> Bytes {
+    let msg_encoded = msg.encode_to_bytes();
+    let id_len = sender.encoded_id_len();
+    let mut buf = BytesMut::with_capacity(1 + id_len + msg_encoded.len());
+    buf.put_u8(PLUMTREE_MAGIC);
+    sender.encode_id(&mut buf);
+    buf.extend_from_slice(&msg_encoded);
+    buf.freeze()
+}
+
+/// Decode a Plumtree envelope extracting sender ID and message.
+///
+/// Format: `[MAGIC][sender_id][message]`
+///
+/// Returns `Some((sender, message))` on success, `None` on decode failure.
+pub fn decode_plumtree_envelope<I: IdCodec>(data: &[u8]) -> Option<(I, PlumtreeMessage)> {
+    if data.is_empty() || data[0] != PLUMTREE_MAGIC {
+        return None;
+    }
+
+    let mut cursor = std::io::Cursor::new(&data[1..]);
+
+    // Decode sender ID
+    let sender = I::decode_id(&mut cursor)?;
+
+    // Decode message from remaining bytes
+    let msg = PlumtreeMessage::decode(&mut cursor)?;
+
+    Some((sender, msg))
+}
+
 /// Try to decode a Plumtree message from received bytes (without sender).
 ///
 /// Use this for simple testing or when sender is tracked separately.
+/// For production use, prefer [`decode_plumtree_envelope`] which extracts
+/// the sender identity needed for proper protocol operation.
 pub fn decode_plumtree_message(data: &[u8]) -> Option<PlumtreeMessage> {
     if data.len() > 1 && data[0] == PLUMTREE_MAGIC {
         PlumtreeMessage::decode_from_slice(&data[1..])
@@ -568,6 +1023,71 @@ mod tests {
         let data = b"regular user message";
         assert!(!is_plumtree_message(data));
         assert!(decode_plumtree_message(data).is_none());
+    }
+
+    #[test]
+    fn test_envelope_encode_decode() {
+        let sender: u64 = 42;
+        let msg = PlumtreeMessage::Gossip {
+            id: MessageId::new(),
+            round: 5,
+            payload: Bytes::from_static(b"hello"),
+        };
+
+        // Encode with sender ID
+        let encoded = encode_plumtree_envelope(&sender, &msg);
+        assert!(is_plumtree_message(&encoded));
+
+        // Decode and verify sender + message
+        let (decoded_sender, decoded_msg): (u64, PlumtreeMessage) =
+            decode_plumtree_envelope(&encoded).unwrap();
+        assert_eq!(decoded_sender, sender);
+        assert_eq!(decoded_msg, msg);
+    }
+
+    #[test]
+    fn test_envelope_with_string_id() {
+        let sender = "node-1".to_string();
+        let msg = PlumtreeMessage::IHave {
+            message_ids: smallvec::smallvec![MessageId::new()],
+            round: 3,
+        };
+
+        let encoded = encode_plumtree_envelope(&sender, &msg);
+        let (decoded_sender, decoded_msg): (String, PlumtreeMessage) =
+            decode_plumtree_envelope(&encoded).unwrap();
+
+        assert_eq!(decoded_sender, sender);
+        assert_eq!(decoded_msg, msg);
+    }
+
+    #[test]
+    fn test_envelope_graft_message() {
+        let sender: u64 = 123;
+        let msg = PlumtreeMessage::Graft {
+            message_id: MessageId::new(),
+            round: 7,
+        };
+
+        let encoded = encode_plumtree_envelope(&sender, &msg);
+        let (decoded_sender, decoded_msg): (u64, PlumtreeMessage) =
+            decode_plumtree_envelope(&encoded).unwrap();
+
+        assert_eq!(decoded_sender, sender);
+        assert_eq!(decoded_msg, msg);
+    }
+
+    #[test]
+    fn test_envelope_prune_message() {
+        let sender: u64 = 999;
+        let msg = PlumtreeMessage::Prune;
+
+        let encoded = encode_plumtree_envelope(&sender, &msg);
+        let (decoded_sender, decoded_msg): (u64, PlumtreeMessage) =
+            decode_plumtree_envelope(&encoded).unwrap();
+
+        assert_eq!(decoded_sender, sender);
+        assert_eq!(decoded_msg, msg);
     }
 
     #[test]

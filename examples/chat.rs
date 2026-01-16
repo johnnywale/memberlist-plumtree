@@ -122,7 +122,7 @@ struct DelegateStats {
     prunes_sent: usize,
 }
 
-impl PlumtreeDelegate for ChatDelegate {
+impl PlumtreeDelegate<NodeId> for ChatDelegate {
     fn on_deliver(&self, message_id: MessageId, payload: Bytes) {
         self.delivery_count.fetch_add(1, Ordering::Relaxed);
         if let Some(chat_msg) = ChatMessage::decode(&payload) {
@@ -138,19 +138,19 @@ impl PlumtreeDelegate for ChatDelegate {
         }
     }
 
-    fn on_eager_promotion(&self, _peer: &[u8]) {
+    fn on_eager_promotion(&self, _peer: &NodeId) {
         self.eager_promotions.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn on_lazy_demotion(&self, _peer: &[u8]) {
+    fn on_lazy_demotion(&self, _peer: &NodeId) {
         self.lazy_demotions.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn on_graft_sent(&self, _peer: &[u8], _message_id: &MessageId) {
+    fn on_graft_sent(&self, _peer: &NodeId, _message_id: &MessageId) {
         self.grafts_sent.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn on_prune_sent(&self, _peer: &[u8]) {
+    fn on_prune_sent(&self, _peer: &NodeId) {
         self.prunes_sent.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -379,7 +379,8 @@ fn demonstrate_graft_timer() {
     println!("\n=== GraftTimer Demo ===");
 
     // Create timer with custom backoff settings
-    let timer = GraftTimer::with_backoff(
+    // GraftTimer is generic over peer ID type - using u64 here
+    let timer: GraftTimer<u64> = GraftTimer::with_backoff(
         Duration::from_millis(100), // base timeout
         Duration::from_millis(800), // max timeout
         5,                          // max retries
@@ -390,15 +391,15 @@ fn demonstrate_graft_timer() {
     println!("  Max retries: {}", timer.max_retries());
     println!("  Pending count: {}", timer.pending_count());
 
-    // Expect some messages
+    // Expect some messages from peers (using u64 peer IDs)
     let msg1 = MessageId::new();
     let msg2 = MessageId::new();
 
-    timer.expect_message(msg1, vec![1, 2, 3], 0);
+    timer.expect_message(msg1, 1u64, 0);
     timer.expect_message_with_alternatives(
         msg2,
-        vec![4, 5, 6],
-        vec![vec![7, 8, 9], vec![10, 11, 12]],
+        2u64,                // primary peer
+        vec![3u64, 4u64],    // alternative peers
         1,
     );
 
@@ -408,10 +409,6 @@ fn demonstrate_graft_timer() {
     // Get expired (none yet since timeout hasn't elapsed)
     let expired = timer.get_expired();
     println!("  Expired immediately: {}", expired.len());
-
-    // Use the simple API
-    let expired_simple = timer.get_expired_simple();
-    println!("  Expired (simple API): {}", expired_simple.len());
 
     // Clear all pending
     timer.clear();

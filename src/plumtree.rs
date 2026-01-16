@@ -27,32 +27,264 @@ use crate::{
     scheduler::{GraftTimer, IHaveScheduler, PendingIHave},
 };
 
+/// Number of shards for the seen map.
+/// 16 shards provides good concurrency while keeping memory overhead low.
+const SEEN_MAP_SHARDS: usize = 16;
+
+/// Sharded map for tracking seen messages.
+///
+/// Uses multiple shards to reduce lock contention:
+/// - Each operation only locks one shard (based on message ID hash)
+/// - Cleanup iterates through shards one at a time, yielding between shards
+///
+/// This prevents the cleanup task from blocking all message processing.
+struct ShardedSeenMap<I> {
+    shards: Vec<RwLock<HashMap<MessageId, SeenEntry<I>>>>,
+}
+
+impl<I> ShardedSeenMap<I> {
+    /// Create a new sharded seen map with the default number of shards.
+    fn new() -> Self {
+        let shards = (0..SEEN_MAP_SHARDS)
+            .map(|_| RwLock::new(HashMap::new()))
+            .collect();
+        Self { shards }
+    }
+
+    /// Get the shard index for a message ID.
+    fn shard_index(&self, id: &MessageId) -> usize {
+        // Use timestamp and random bytes for distribution
+        let hash = id.timestamp() as usize ^ (id.random() as usize);
+        hash % self.shards.len()
+    }
+
+    /// Get read access to the shard containing the given message ID.
+    async fn read_shard(
+        &self,
+        id: &MessageId,
+    ) -> async_lock::RwLockReadGuard<'_, HashMap<MessageId, SeenEntry<I>>> {
+        let idx = self.shard_index(id);
+        self.shards[idx].read().await
+    }
+
+    /// Get write access to the shard containing the given message ID.
+    async fn write_shard(
+        &self,
+        id: &MessageId,
+    ) -> async_lock::RwLockWriteGuard<'_, HashMap<MessageId, SeenEntry<I>>> {
+        let idx = self.shard_index(id);
+        self.shards[idx].write().await
+    }
+}
+
+impl<I: Clone> ShardedSeenMap<I> {
+    /// Check if a message has been seen and get its entry.
+    #[allow(dead_code)]
+    async fn get(&self, id: &MessageId) -> Option<SeenEntry<I>> {
+        let shard = self.read_shard(id).await;
+        shard.get(id).cloned()
+    }
+
+    /// Check if a message has been seen.
+    async fn contains(&self, id: &MessageId) -> bool {
+        let shard = self.read_shard(id).await;
+        shard.contains_key(id)
+    }
+
+    /// Insert a seen entry for a message.
+    /// Returns true if this is a new entry, false if it already existed.
+    async fn insert(&self, id: MessageId, entry: SeenEntry<I>) -> bool {
+        let mut shard = self.write_shard(&id).await;
+        if shard.contains_key(&id) {
+            false
+        } else {
+            shard.insert(id, entry);
+            true
+        }
+    }
+
+    /// Update an existing entry or insert a new one.
+    #[allow(dead_code)]
+    async fn get_or_insert_with<F>(&self, id: MessageId, f: F) -> (SeenEntry<I>, bool)
+    where
+        F: FnOnce() -> SeenEntry<I>,
+    {
+        let mut shard = self.write_shard(&id).await;
+        if let Some(entry) = shard.get(&id) {
+            (entry.clone(), false)
+        } else {
+            let entry = f();
+            shard.insert(id, entry.clone());
+            (entry, true)
+        }
+    }
+
+    /// Increment receive count for an existing entry.
+    /// Returns the new count, or None if the entry doesn't exist.
+    #[allow(dead_code)]
+    async fn increment_receive_count(&self, id: &MessageId) -> Option<u32> {
+        let mut shard = self.write_shard(id).await;
+        if let Some(entry) = shard.get_mut(id) {
+            entry.receive_count += 1;
+            Some(entry.receive_count)
+        } else {
+            None
+        }
+    }
+
+    /// Check if message is seen; if so, increment count. Otherwise insert new entry.
+    /// Returns (is_duplicate, receive_count).
+    async fn check_and_mark_seen(&self, id: MessageId, entry_fn: impl FnOnce() -> SeenEntry<I>) -> (bool, u32) {
+        let mut shard = self.write_shard(&id).await;
+        if let Some(entry) = shard.get_mut(&id) {
+            entry.receive_count += 1;
+            (true, entry.receive_count)
+        } else {
+            let entry = entry_fn();
+            let count = entry.receive_count;
+            shard.insert(id, entry);
+            (false, count)
+        }
+    }
+
+    /// Clean up expired entries from one shard.
+    /// Returns the number of entries removed.
+    async fn cleanup_shard(&self, shard_idx: usize, now: std::time::Instant, ttl: std::time::Duration) -> usize {
+        let mut shard = self.shards[shard_idx].write().await;
+        let before = shard.len();
+        shard.retain(|_, entry| now.duration_since(entry.seen_at) < ttl);
+        before.saturating_sub(shard.len())
+    }
+
+    /// Get the total number of entries across all shards.
+    #[allow(dead_code)]
+    async fn len(&self) -> usize {
+        let mut total = 0;
+        for shard in &self.shards {
+            total += shard.read().await.len();
+        }
+        total
+    }
+
+    /// Get the number of shards.
+    fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+}
+
 /// Delegate trait for receiving Plumtree events.
 ///
 /// Implement this trait to handle delivered messages and other events.
-#[auto_impl::auto_impl(Box, Arc)]
-pub trait PlumtreeDelegate: Send + Sync + 'static {
+///
+/// # Type Parameters
+///
+/// - `I`: The peer identifier type (same as used with `Plumtree<I, D>`)
+///
+/// # Important Notes
+///
+/// - **Non-blocking**: All methods should return quickly. If your implementation
+///   needs to perform heavy computation or blocking I/O (e.g., writing to a database),
+///   spawn the work in a separate task to avoid blocking the Plumtree message loop.
+/// - **Thread-safe**: Methods may be called concurrently from multiple threads.
+///
+/// # Example (Non-blocking delivery)
+///
+/// ```ignore
+/// impl PlumtreeDelegate<NodeId> for MyApp {
+///     fn on_deliver(&self, message_id: MessageId, payload: Bytes) {
+///         let tx = self.delivery_tx.clone();
+///         tokio::spawn(async move {
+///             // Heavy processing in background
+///             tx.send((message_id, payload)).await.ok();
+///         });
+///     }
+///
+///     fn on_graft_failed(&self, message_id: &MessageId, peer: &NodeId) {
+///         tracing::warn!("Graft failed for {:?} from peer {:?}", message_id, peer);
+///     }
+/// }
+/// ```
+pub trait PlumtreeDelegate<I = ()>: Send + Sync + 'static {
     /// Called when a message is delivered (first time received).
+    ///
+    /// **Warning**: This is called synchronously in the message processing path.
+    /// Long-running operations here will block message forwarding and tree repair.
+    /// For heavy processing, spawn a background task instead.
     fn on_deliver(&self, message_id: MessageId, payload: Bytes);
 
     /// Called when a peer is promoted to eager.
-    fn on_eager_promotion(&self, _peer: &[u8]) {}
+    fn on_eager_promotion(&self, _peer: &I) {}
 
     /// Called when a peer is demoted to lazy.
-    fn on_lazy_demotion(&self, _peer: &[u8]) {}
+    fn on_lazy_demotion(&self, _peer: &I) {}
 
     /// Called when a Graft is sent (tree repair).
-    fn on_graft_sent(&self, _peer: &[u8], _message_id: &MessageId) {}
+    fn on_graft_sent(&self, _peer: &I, _message_id: &MessageId) {}
 
     /// Called when a Prune is sent (tree optimization).
-    fn on_prune_sent(&self, _peer: &[u8]) {}
+    fn on_prune_sent(&self, _peer: &I) {}
+
+    /// Called when Graft retries for a message are exhausted (zombie peer detection).
+    ///
+    /// This indicates that the message could not be retrieved from any peer after
+    /// maximum retry attempts. The peer that originally sent the IHave may be dead
+    /// or unreachable.
+    ///
+    /// Implementations may want to:
+    /// - Log a warning about the potentially dead peer
+    /// - Track failed peers for health monitoring
+    /// - Trigger peer removal if failures persist
+    fn on_graft_failed(&self, _message_id: &MessageId, _peer: &I) {}
+}
+
+// Manual implementations for Arc<T> and Box<T> since auto_impl doesn't handle generic traits well
+impl<I, T: PlumtreeDelegate<I> + ?Sized> PlumtreeDelegate<I> for Arc<T> {
+    fn on_deliver(&self, message_id: MessageId, payload: Bytes) {
+        (**self).on_deliver(message_id, payload)
+    }
+    fn on_eager_promotion(&self, peer: &I) {
+        (**self).on_eager_promotion(peer)
+    }
+    fn on_lazy_demotion(&self, peer: &I) {
+        (**self).on_lazy_demotion(peer)
+    }
+    fn on_graft_sent(&self, peer: &I, message_id: &MessageId) {
+        (**self).on_graft_sent(peer, message_id)
+    }
+    fn on_prune_sent(&self, peer: &I) {
+        (**self).on_prune_sent(peer)
+    }
+    fn on_graft_failed(&self, message_id: &MessageId, peer: &I) {
+        (**self).on_graft_failed(message_id, peer)
+    }
+}
+
+impl<I, T: PlumtreeDelegate<I> + ?Sized> PlumtreeDelegate<I> for Box<T> {
+    fn on_deliver(&self, message_id: MessageId, payload: Bytes) {
+        (**self).on_deliver(message_id, payload)
+    }
+    fn on_eager_promotion(&self, peer: &I) {
+        (**self).on_eager_promotion(peer)
+    }
+    fn on_lazy_demotion(&self, peer: &I) {
+        (**self).on_lazy_demotion(peer)
+    }
+    fn on_graft_sent(&self, peer: &I, message_id: &MessageId) {
+        (**self).on_graft_sent(peer, message_id)
+    }
+    fn on_prune_sent(&self, peer: &I) {
+        (**self).on_prune_sent(peer)
+    }
+    fn on_graft_failed(&self, message_id: &MessageId, peer: &I) {
+        (**self).on_graft_failed(message_id, peer)
+    }
 }
 
 /// No-op delegate for when no handler is needed.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoopDelegate;
 
-impl PlumtreeDelegate for NoopDelegate {
+impl<I> PlumtreeDelegate<I> for NoopDelegate {
     fn on_deliver(&self, _message_id: MessageId, _payload: Bytes) {}
 }
 
@@ -81,7 +313,7 @@ struct PlumtreeInner<I, D> {
     scheduler: Arc<IHaveScheduler>,
 
     /// Graft timer for tracking pending messages.
-    graft_timer: Arc<GraftTimer>,
+    graft_timer: Arc<GraftTimer<I>>,
 
     /// Rate limiter for Graft requests (per-peer).
     graft_rate_limiter: RateLimiter<I>,
@@ -107,32 +339,67 @@ struct PlumtreeInner<I, D> {
     /// Channel for incoming messages.
     incoming_tx: Sender<IncomingMessage<I>>,
 
-    /// Track messages seen for deduplication.
-    seen: RwLock<HashMap<MessageId, SeenEntry>>,
-
-    /// Track parent peer for each message (who we received it from first).
-    /// Used for tree repair when a better path is found.
-    message_parents: RwLock<HashMap<MessageId, I>>,
+    /// Track messages seen for deduplication and parent tracking.
+    ///
+    /// Uses sharded locking to reduce contention:
+    /// - Each message operation only locks one shard (based on message ID hash)
+    /// - Cleanup iterates through shards one at a time, yielding between shards
+    /// - This prevents the cleanup task from blocking all message processing
+    seen: ShardedSeenMap<I>,
 }
 
-/// Entry for tracking seen messages.
+/// Entry for tracking seen messages and their delivery parent.
 #[derive(Debug, Clone)]
-struct SeenEntry {
+struct SeenEntry<I> {
     /// Round when first seen.
     /// Reserved for future use in protocol diagnostics.
     #[allow(dead_code)]
     round: u32,
     /// Number of times received.
     receive_count: u32,
+    /// When this entry was first seen (for TTL-based cleanup).
+    seen_at: std::time::Instant,
+    /// Parent peer who delivered this message first.
+    /// Reserved for future use in tree repair when a better path is found.
+    #[allow(dead_code)]
+    parent: Option<I>,
 }
 
 /// Outgoing message to be sent.
 #[derive(Debug)]
 pub struct OutgoingMessage<I> {
-    /// Target peer.
-    pub target: I,
+    /// Target peer for unicast messages, None for broadcast.
+    pub target: Option<I>,
     /// Message to send.
     pub message: PlumtreeMessage,
+}
+
+impl<I> OutgoingMessage<I> {
+    /// Create a unicast message to a specific peer.
+    pub fn unicast(target: I, message: PlumtreeMessage) -> Self {
+        Self {
+            target: Some(target),
+            message,
+        }
+    }
+
+    /// Create a broadcast message (for initial broadcast only).
+    pub fn broadcast(message: PlumtreeMessage) -> Self {
+        Self {
+            target: None,
+            message,
+        }
+    }
+
+    /// Check if this is a unicast message.
+    pub fn is_unicast(&self) -> bool {
+        self.target.is_some()
+    }
+
+    /// Check if this is a broadcast message.
+    pub fn is_broadcast(&self) -> bool {
+        self.target.is_none()
+    }
 }
 
 /// Incoming message received from a peer.
@@ -147,7 +414,7 @@ pub struct IncomingMessage<I> {
 impl<I, D> Plumtree<I, D>
 where
     I: Clone + Eq + Hash + Debug + Send + Sync + 'static,
-    D: PlumtreeDelegate,
+    D: PlumtreeDelegate<I>,
 {
     /// Create a new Plumtree instance.
     ///
@@ -186,8 +453,7 @@ where
             shutdown: AtomicBool::new(false),
             outgoing_tx,
             incoming_tx,
-            seen: RwLock::new(HashMap::new()),
-            message_parents: RwLock::new(HashMap::new()),
+            seen: ShardedSeenMap::new(),
         });
 
         let plumtree = Self {
@@ -258,17 +524,16 @@ where
         // Cache the message
         self.inner.cache.insert(msg_id, payload.clone());
 
-        // Mark as seen
-        {
-            let mut seen = self.inner.seen.write().await;
-            seen.insert(
-                msg_id,
-                SeenEntry {
-                    round,
-                    receive_count: 1,
-                },
-            );
-        }
+        // Mark as seen (no parent since we originated this message)
+        self.inner.seen.insert(
+            msg_id,
+            SeenEntry {
+                round,
+                receive_count: 1,
+                seen_at: std::time::Instant::now(),
+                parent: None, // We originated this message
+            },
+        ).await;
 
         // Send to eager peers
         let eager_peers = self.inner.peers.eager_peers();
@@ -278,13 +543,11 @@ where
                 round,
                 payload: payload.clone(),
             };
+            // Send unicast to specific eager peer
             let _ = self
                 .inner
                 .outgoing_tx
-                .send(OutgoingMessage {
-                    target: peer,
-                    message: msg,
-                })
+                .send(OutgoingMessage::unicast(peer, msg))
                 .await;
         }
 
@@ -327,57 +590,41 @@ where
         // Cancel any pending Graft timer for this message
         self.inner.graft_timer.message_received(&msg_id);
 
-        // Check if already seen
-        let is_duplicate = {
-            let mut seen = self.inner.seen.write().await;
-            if let Some(entry) = seen.get_mut(&msg_id) {
-                entry.receive_count += 1;
-                true
-            } else {
-                seen.insert(
-                    msg_id,
-                    SeenEntry {
-                        round,
-                        receive_count: 1,
-                    },
-                );
-                false
+        // Check if already seen and track parent atomically (single shard lock)
+        let (is_duplicate, receive_count) = self.inner.seen.check_and_mark_seen(
+            msg_id,
+            || SeenEntry {
+                round,
+                receive_count: 1,
+                seen_at: std::time::Instant::now(),
+                parent: Some(from.clone()), // Track who delivered this message
             }
-        };
+        ).await;
 
         if is_duplicate {
             // Optimization: prune redundant path after threshold
-            let receive_count = {
-                let seen = self.inner.seen.read().await;
-                seen.get(&msg_id).map(|e| e.receive_count).unwrap_or(0)
-            };
-
             if receive_count > self.inner.config.optimization_threshold {
-                // Send Prune to the duplicate sender
-                let _ = self
-                    .inner
-                    .outgoing_tx
-                    .send(OutgoingMessage {
-                        target: from.clone(),
-                        message: PlumtreeMessage::Prune,
-                    })
-                    .await;
+                // Only send Prune if the peer is in the eager set
+                // Pruning a peer that is already lazy is redundant traffic
+                if self.inner.peers.is_eager(&from) {
+                    // Send Prune unicast to the duplicate sender
+                    let _ = self
+                        .inner
+                        .outgoing_tx
+                        .send(OutgoingMessage::unicast(from.clone(), PlumtreeMessage::Prune))
+                        .await;
+                    self.inner.delegate.on_prune_sent(&from);
 
-                // Demote to lazy
-                if self.inner.peers.demote_to_lazy(&from) {
-                    self.inner.delegate.on_lazy_demotion(&[]);
+                    // Demote to lazy
+                    if self.inner.peers.demote_to_lazy(&from) {
+                        self.inner.delegate.on_lazy_demotion(&from);
+                    }
                 }
             }
             return Ok(());
         }
 
-        // First time seeing this message
-
-        // Track the parent (sender) for this message
-        {
-            let mut parents = self.inner.message_parents.write().await;
-            parents.insert(msg_id, from.clone());
-        }
+        // First time seeing this message (parent already tracked above)
 
         // Cache for potential Graft requests
         self.inner.cache.insert(msg_id, payload.clone());
@@ -385,7 +632,7 @@ where
         // Deliver to application
         self.inner.delegate.on_deliver(msg_id, payload.clone());
 
-        // Forward to eager peers (except sender)
+        // Forward to eager peers (except sender) via unicast
         let eager_peers = self.inner.peers.random_eager_except(&from, usize::MAX);
         for peer in eager_peers {
             let msg = PlumtreeMessage::Gossip {
@@ -393,13 +640,11 @@ where
                 round: round + 1,
                 payload: payload.clone(),
             };
+            // Send unicast to specific eager peer
             let _ = self
                 .inner
                 .outgoing_tx
-                .send(OutgoingMessage {
-                    target: peer,
-                    message: msg,
-                })
+                .send(OutgoingMessage::unicast(peer, msg))
                 .await;
         }
 
@@ -417,66 +662,52 @@ where
         round: u32,
     ) -> Result<()> {
         for msg_id in message_ids {
-            // Check if we already have this message
-            let have_message = {
-                let seen = self.inner.seen.read().await;
-                seen.contains_key(&msg_id)
-            };
+            // Check if we already have this message (only locks one shard)
+            let have_message = self.inner.seen.contains(&msg_id).await;
 
             if !have_message {
                 // We don't have this message - start Graft timer
-                // Encode from ID as bytes (simplified - in real impl would use proper serialization)
-                let from_bytes = format!("{:?}", from).into_bytes();
-
                 // Get alternative peers to try if the primary fails
-                let alternatives: Vec<Vec<u8>> = self
-                    .inner
-                    .peers
-                    .random_eager_except(&from, 2)
-                    .iter()
-                    .map(|p| format!("{:?}", p).into_bytes())
-                    .collect();
+                let alternatives: Vec<I> = self.inner.peers.random_eager_except(&from, 2);
 
                 self.inner.graft_timer.expect_message_with_alternatives(
                     msg_id,
-                    from_bytes,
+                    from.clone(),
                     alternatives,
                     round,
                 );
 
-                // Check if we had a previous parent for this message (via IHave from different peer)
-                // If so, demote the old parent since we're establishing a new eager connection
-                let old_parent = {
-                    let parents = self.inner.message_parents.read().await;
-                    parents.get(&msg_id).cloned()
-                };
-
-                if let Some(old) = old_parent {
-                    if old != from && self.inner.peers.demote_to_lazy(&old) {
-                        self.inner.delegate.on_lazy_demotion(&[]);
-                        self.inner.delegate.on_prune_sent(&[]);
-                    }
-                }
+                // Note: We do NOT demote any existing parent here. This avoids a race condition
+                // where we might demote a peer that is about to (or just did) deliver the message.
+                //
+                // Example race without this fix:
+                // 1. IHave(msg) arrives from C, we check seen -> not seen
+                // 2. Meanwhile Gossip(msg) from B arrives and sets message_parents[msg] = B
+                // 3. We demote B even though B just delivered successfully!
+                //
+                // Instead, tree optimization happens naturally via handle_gossip:
+                // - If we receive duplicate Gossip, we send Prune to the redundant sender
+                // - This is the correct place to demote, as it's based on actual delivery
 
                 // Promote sender to eager to get this and future messages
                 if self.inner.peers.promote_to_eager(&from) {
-                    self.inner.delegate.on_eager_promotion(&[]);
+                    self.inner.delegate.on_eager_promotion(&from);
                 }
 
                 // Send Graft to get the missing message
                 let _ = self
                     .inner
                     .outgoing_tx
-                    .send(OutgoingMessage {
-                        target: from.clone(),
-                        message: PlumtreeMessage::Graft {
+                    .send(OutgoingMessage::unicast(
+                        from.clone(),
+                        PlumtreeMessage::Graft {
                             message_id: msg_id,
                             round,
                         },
-                    })
+                    ))
                     .await;
 
-                self.inner.delegate.on_graft_sent(&[], &msg_id);
+                self.inner.delegate.on_graft_sent(&from, &msg_id);
             }
         }
 
@@ -493,10 +724,10 @@ where
 
         // Promote requester to eager
         if self.inner.peers.promote_to_eager(&from) {
-            self.inner.delegate.on_eager_promotion(&[]);
+            self.inner.delegate.on_eager_promotion(&from);
         }
 
-        // Send the requested message if we have it
+        // Send the requested message unicast to the requester
         if let Some(payload) = self.inner.cache.get(&msg_id) {
             let msg = PlumtreeMessage::Gossip {
                 id: msg_id,
@@ -506,10 +737,7 @@ where
             let _ = self
                 .inner
                 .outgoing_tx
-                .send(OutgoingMessage {
-                    target: from,
-                    message: msg,
-                })
+                .send(OutgoingMessage::unicast(from, msg))
                 .await;
         }
 
@@ -519,7 +747,7 @@ where
     /// Handle a Prune message (demote to lazy).
     async fn handle_prune(&self, from: I) -> Result<()> {
         if self.inner.peers.demote_to_lazy(&from) {
-            self.inner.delegate.on_lazy_demotion(&[]);
+            self.inner.delegate.on_lazy_demotion(&from);
         }
         Ok(())
     }
@@ -527,51 +755,65 @@ where
     /// Run the IHave scheduler background task.
     ///
     /// This should be spawned as a background task.
+    /// Uses a "linger" strategy: flushes immediately if batch is full,
+    /// otherwise waits for the configured interval.
     pub async fn run_ihave_scheduler(&self) {
-        let mut interval = Delay::new(self.inner.config.ihave_interval);
+        let ihave_interval = self.inner.config.ihave_interval;
+        // Check for early flush more frequently (every 10ms)
+        let check_interval = std::time::Duration::from_millis(10);
+        let mut last_flush = std::time::Instant::now();
 
         loop {
             if self.inner.shutdown.load(Ordering::Acquire) {
                 break;
             }
 
-            // Wait for interval
-            (&mut interval).await;
-            interval.reset(self.inner.config.ihave_interval);
+            // Check if we should flush early (queue reached batch size)
+            let should_flush = self.inner.scheduler.queue().should_flush();
+            let interval_elapsed = last_flush.elapsed() >= ihave_interval;
 
-            // Get batch of IHaves to send
-            let batch: SmallVec<[PendingIHave; 16]> = self.inner.scheduler.pop_batch();
-
-            if batch.is_empty() {
-                continue;
+            if should_flush || interval_elapsed {
+                // Flush: either queue is full or interval elapsed
+                self.flush_ihave_batch().await;
+                last_flush = std::time::Instant::now();
+            } else {
+                // Wait for a short check period before checking again
+                Delay::new(check_interval).await;
             }
+        }
+    }
 
-            // Collect message IDs
-            let message_ids: SmallVec<[MessageId; 8]> =
-                batch.iter().map(|p| p.message_id).collect();
-            let round = batch.iter().map(|p| p.round).max().unwrap_or(0);
+    /// Flush pending IHave messages to lazy peers.
+    async fn flush_ihave_batch(&self) {
+        // Get batch of IHaves to send
+        let batch: SmallVec<[PendingIHave; 16]> = self.inner.scheduler.pop_batch();
 
-            // Get lazy peers to send to
-            let lazy_peers = self
+        if batch.is_empty() {
+            return;
+        }
+
+        // Collect message IDs
+        let message_ids: SmallVec<[MessageId; 8]> = batch.iter().map(|p| p.message_id).collect();
+        let round = batch.iter().map(|p| p.round).max().unwrap_or(0);
+
+        // Get lazy peers to send to
+        let lazy_peers = self
+            .inner
+            .peers
+            .random_lazy_except(&self.inner.local_id, self.inner.config.lazy_fanout);
+
+        // Send IHave to each lazy peer
+        for peer in lazy_peers {
+            let msg = PlumtreeMessage::IHave {
+                message_ids: message_ids.clone(),
+                round,
+            };
+            // Send IHave unicast to specific lazy peer
+            let _ = self
                 .inner
-                .peers
-                .random_lazy_except(&self.inner.local_id, self.inner.config.lazy_fanout);
-
-            // Send IHave to each lazy peer
-            for peer in lazy_peers {
-                let msg = PlumtreeMessage::IHave {
-                    message_ids: message_ids.clone(),
-                    round,
-                };
-                let _ = self
-                    .inner
-                    .outgoing_tx
-                    .send(OutgoingMessage {
-                        target: peer,
-                        message: msg,
-                    })
-                    .await;
-            }
+                .outgoing_tx
+                .send(OutgoingMessage::unicast(peer, msg))
+                .await;
         }
     }
 
@@ -591,41 +833,99 @@ where
             (&mut interval).await;
             interval.reset(check_interval);
 
-            // Check for expired Graft timers
-            let expired = self.inner.graft_timer.get_expired();
+            // Check for expired Graft timers and failures
+            let (expired, failed) = self.inner.graft_timer.get_expired_with_failures();
+
+            // Handle failed grafts (zombie peer detection)
+            for failed_graft in failed {
+                tracing::warn!(
+                    "Graft failed for message {:?} after {} retries from peer {:?}",
+                    failed_graft.message_id,
+                    failed_graft.total_retries,
+                    failed_graft.original_peer
+                );
+                self.inner
+                    .delegate
+                    .on_graft_failed(&failed_graft.message_id, &failed_graft.original_peer);
+            }
 
             for expired_graft in expired {
-                // Try to get the message from an alternative peer
-                // The GraftTimer already handles round-robin through alternatives
-                let eager_peers = self.inner.peers.eager_peers();
-                if let Some(peer) = eager_peers.first() {
-                    tracing::debug!(
-                        "Graft retry {} for message {:?} (attempt {})",
-                        if expired_graft.retry_count == 0 {
-                            "initial"
-                        } else {
-                            "backoff"
+                // Send Graft to the peer determined by the timer (primary or alternative)
+                tracing::debug!(
+                    "Graft {} for message {:?} to peer {:?} (attempt {})",
+                    if expired_graft.retry_count == 0 {
+                        "initial"
+                    } else {
+                        "retry"
+                    },
+                    expired_graft.message_id,
+                    expired_graft.peer,
+                    expired_graft.retry_count
+                );
+
+                let _ = self
+                    .inner
+                    .outgoing_tx
+                    .send(OutgoingMessage::unicast(
+                        expired_graft.peer.clone(),
+                        PlumtreeMessage::Graft {
+                            message_id: expired_graft.message_id,
+                            round: expired_graft.round,
                         },
-                        expired_graft.message_id,
-                        expired_graft.retry_count
-                    );
+                    ))
+                    .await;
 
-                    let _ = self
-                        .inner
-                        .outgoing_tx
-                        .send(OutgoingMessage {
-                            target: peer.clone(),
-                            message: PlumtreeMessage::Graft {
-                                message_id: expired_graft.message_id,
-                                round: expired_graft.round,
-                            },
-                        })
-                        .await;
+                self.inner
+                    .delegate
+                    .on_graft_sent(&expired_graft.peer, &expired_graft.message_id);
+            }
+        }
+    }
 
-                    self.inner
-                        .delegate
-                        .on_graft_sent(&[], &expired_graft.message_id);
+    /// Run the seen map cleanup background task.
+    ///
+    /// This removes old entries from the deduplication map to prevent
+    /// unbounded memory growth. Entries older than message_cache_ttl are removed.
+    ///
+    /// This should be spawned as a background task.
+    pub async fn run_seen_cleanup(&self) {
+        // Run cleanup every half the TTL period
+        let cleanup_interval = self.inner.config.message_cache_ttl / 2;
+        let ttl = self.inner.config.message_cache_ttl;
+        let mut interval = Delay::new(cleanup_interval);
+
+        loop {
+            if self.inner.shutdown.load(Ordering::Acquire) {
+                break;
+            }
+
+            // Wait for interval
+            (&mut interval).await;
+            interval.reset(cleanup_interval);
+
+            // Clean up expired entries from seen map, one shard at a time
+            // This prevents cleanup from blocking all message processing
+            let now = std::time::Instant::now();
+            let mut total_removed = 0;
+            let shard_count = self.inner.seen.shard_count();
+
+            for shard_idx in 0..shard_count {
+                // Check for shutdown between shards
+                if self.inner.shutdown.load(Ordering::Acquire) {
+                    break;
                 }
+
+                // Clean up one shard (only locks that shard)
+                let removed = self.inner.seen.cleanup_shard(shard_idx, now, ttl).await;
+                total_removed += removed;
+
+                // Brief yield to allow other tasks to make progress
+                // This prevents cleanup from monopolizing the executor
+                Delay::new(std::time::Duration::from_micros(1)).await;
+            }
+
+            if total_removed > 0 {
+                tracing::debug!("cleaned up {} expired entries from seen map ({} shards)", total_removed, shard_count);
             }
         }
     }
@@ -737,7 +1037,7 @@ mod tests {
         }
     }
 
-    impl PlumtreeDelegate for TestDelegate {
+    impl PlumtreeDelegate<TestNodeId> for TestDelegate {
         fn on_deliver(&self, message_id: MessageId, payload: Bytes) {
             self.delivered.lock().push((message_id, payload));
         }
