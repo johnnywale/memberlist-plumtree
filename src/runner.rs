@@ -49,7 +49,7 @@ pub struct PlumtreeRunnerWithTransport<I, D, T> {
 
 impl<I, D, T> PlumtreeRunnerWithTransport<I, D, T>
 where
-    I: Clone + Eq + Hash + Debug + Send + Sync + 'static,
+    I: Clone + Eq + Hash + Ord + Debug + Send + Sync + 'static,
     D: PlumtreeDelegate<I>,
     T: Transport<I>,
 {
@@ -146,7 +146,7 @@ pub struct PlumtreeRunner<I, D> {
 #[allow(deprecated)]
 impl<I, D> PlumtreeRunner<I, D>
 where
-    I: Clone + Eq + Hash + Debug + Send + Sync + 'static,
+    I: Clone + Eq + Hash + Ord + Debug + Send + Sync + 'static,
     D: PlumtreeDelegate<I>,
 {
     /// Create a new runner for the given Plumtree instance.
@@ -244,7 +244,7 @@ pub struct PlumtreeRunnerBuilder<I, D> {
 #[allow(deprecated)]
 impl<I, D> Default for PlumtreeRunnerBuilder<I, D>
 where
-    I: Clone + Eq + Hash + Debug + Send + Sync + 'static,
+    I: Clone + Eq + Hash + Ord + Debug + Send + Sync + 'static,
     D: PlumtreeDelegate<I>,
 {
     fn default() -> Self {
@@ -255,7 +255,7 @@ where
 #[allow(deprecated)]
 impl<I, D> PlumtreeRunnerBuilder<I, D>
 where
-    I: Clone + Eq + Hash + Debug + Send + Sync + 'static,
+    I: Clone + Eq + Hash + Ord + Debug + Send + Sync + 'static,
     D: PlumtreeDelegate<I>,
 {
     /// Create a new builder.
@@ -310,7 +310,7 @@ pub fn create_plumtree_with_channels<I, D>(
     async_channel::Receiver<Bytes>,
 )
 where
-    I: Clone + Eq + Hash + Debug + Send + Sync + 'static,
+    I: Clone + Eq + Hash + Ord + Debug + Send + Sync + 'static,
     D: PlumtreeDelegate<I>,
 {
     let (plumtree, handle) = Plumtree::new(local_id, config, delegate);

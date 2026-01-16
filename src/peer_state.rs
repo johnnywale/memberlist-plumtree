@@ -23,11 +23,11 @@ struct PeerStateInner<I> {
     /// Peers in the lazy set - receive IHave announcements.
     lazy: HashSet<I>,
     /// Cached vector of eager peers for fast random selection.
+    /// Always kept in sync with `eager` set during mutations.
     eager_vec: Vec<I>,
     /// Cached vector of lazy peers for fast random selection.
+    /// Always kept in sync with `lazy` set during mutations.
     lazy_vec: Vec<I>,
-    /// Flag indicating if caches are dirty.
-    cache_dirty: bool,
 }
 
 impl<I: Clone + Eq + Hash> PeerState<I> {
@@ -39,7 +39,6 @@ impl<I: Clone + Eq + Hash> PeerState<I> {
                 lazy: HashSet::new(),
                 eager_vec: Vec::new(),
                 lazy_vec: Vec::new(),
-                cache_dirty: false,
             }),
         }
     }
@@ -68,7 +67,6 @@ impl<I: Clone + Eq + Hash> PeerState<I> {
                 lazy,
                 eager_vec,
                 lazy_vec,
-                cache_dirty: false,
             }),
         }
     }
@@ -85,8 +83,9 @@ impl<I: Clone + Eq + Hash> PeerState<I> {
             return;
         }
 
-        inner.lazy.insert(peer);
-        inner.cache_dirty = true;
+        // Update set and cache immediately to avoid write lock in hot path
+        inner.lazy.insert(peer.clone());
+        inner.lazy_vec.push(peer);
     }
 
     /// Remove a peer from all sets.
@@ -96,8 +95,12 @@ impl<I: Clone + Eq + Hash> PeerState<I> {
         let removed_eager = inner.eager.remove(peer);
         let removed_lazy = inner.lazy.remove(peer);
 
-        if removed_eager || removed_lazy {
-            inner.cache_dirty = true;
+        // Update caches immediately to avoid write lock in hot path
+        if removed_eager {
+            inner.eager_vec.retain(|p| p != peer);
+        }
+        if removed_lazy {
+            inner.lazy_vec.retain(|p| p != peer);
         }
     }
 
@@ -115,12 +118,14 @@ impl<I: Clone + Eq + Hash> PeerState<I> {
             return false;
         }
 
-        // Remove from lazy if present
-        inner.lazy.remove(peer);
+        // Remove from lazy if present (update both set and cache)
+        if inner.lazy.remove(peer) {
+            inner.lazy_vec.retain(|p| p != peer);
+        }
 
-        // Add to eager
+        // Add to eager (update both set and cache)
         inner.eager.insert(peer.clone());
-        inner.cache_dirty = true;
+        inner.eager_vec.push(peer.clone());
 
         true
     }
@@ -139,10 +144,11 @@ impl<I: Clone + Eq + Hash> PeerState<I> {
             return false;
         }
 
-        // Move from eager to lazy
+        // Move from eager to lazy (update both sets and caches)
         inner.eager.remove(peer);
+        inner.eager_vec.retain(|p| p != peer);
         inner.lazy.insert(peer.clone());
-        inner.cache_dirty = true;
+        inner.lazy_vec.push(peer.clone());
 
         true
     }
@@ -196,7 +202,7 @@ impl<I: Clone + Eq + Hash> PeerState<I> {
     /// Get random eager peers for message forwarding.
     ///
     /// Excludes the specified peer (usually the message sender).
-    /// Uses read lock when possible to reduce contention on hot path.
+    /// Uses only read lock - caches are kept up to date during mutations.
     /// Uses reservoir sampling for O(count) allocations instead of O(N).
     pub fn random_eager_except(&self, exclude: &I, count: usize) -> Vec<I>
     where
@@ -206,22 +212,8 @@ impl<I: Clone + Eq + Hash> PeerState<I> {
             return Vec::new();
         }
 
-        // First try with read lock - only upgrade to write if cache is dirty
-        {
-            let inner = self.inner.read();
-            if !inner.cache_dirty {
-                return Self::reservoir_sample_except(&inner.eager_vec, exclude, count);
-            }
-        }
-
-        // Slow path: need to refresh cache with write lock
-        let mut inner = self.inner.write();
-        if inner.cache_dirty {
-            inner.eager_vec = inner.eager.iter().cloned().collect();
-            inner.lazy_vec = inner.lazy.iter().cloned().collect();
-            inner.cache_dirty = false;
-        }
-
+        // Read-only path - cache is always up to date
+        let inner = self.inner.read();
         Self::reservoir_sample_except(&inner.eager_vec, exclude, count)
     }
 
@@ -268,7 +260,7 @@ impl<I: Clone + Eq + Hash> PeerState<I> {
     /// Get random lazy peers for IHave announcements.
     ///
     /// Excludes the specified peer (usually the message sender).
-    /// Uses read lock when possible to reduce contention on hot path.
+    /// Uses only read lock - caches are kept up to date during mutations.
     /// Uses reservoir sampling for O(count) allocations instead of O(N).
     pub fn random_lazy_except(&self, exclude: &I, count: usize) -> Vec<I>
     where
@@ -278,22 +270,8 @@ impl<I: Clone + Eq + Hash> PeerState<I> {
             return Vec::new();
         }
 
-        // First try with read lock - only upgrade to write if cache is dirty
-        {
-            let inner = self.inner.read();
-            if !inner.cache_dirty {
-                return Self::reservoir_sample_except(&inner.lazy_vec, exclude, count);
-            }
-        }
-
-        // Slow path: need to refresh cache with write lock
-        let mut inner = self.inner.write();
-        if inner.cache_dirty {
-            inner.eager_vec = inner.eager.iter().cloned().collect();
-            inner.lazy_vec = inner.lazy.iter().cloned().collect();
-            inner.cache_dirty = false;
-        }
-
+        // Read-only path - cache is always up to date
+        let inner = self.inner.read();
         Self::reservoir_sample_except(&inner.lazy_vec, exclude, count)
     }
 
@@ -320,7 +298,6 @@ impl<I: Clone + Eq + Hash> PeerState<I> {
         inner.lazy.clear();
         inner.eager_vec.clear();
         inner.lazy_vec.clear();
-        inner.cache_dirty = false;
     }
 
     /// Get statistics about peer state.
@@ -350,7 +327,10 @@ impl<I: Clone + Eq + Hash> PeerState<I> {
 
             for peer in to_promote {
                 inner.lazy.remove(&peer);
-                inner.eager.insert(peer);
+                inner.eager.insert(peer.clone());
+                // Update caches
+                inner.lazy_vec.retain(|p| *p != peer);
+                inner.eager_vec.push(peer);
             }
         } else if current_eager > target_eager {
             // Need to demote some eager peers to lazy
@@ -359,11 +339,12 @@ impl<I: Clone + Eq + Hash> PeerState<I> {
 
             for peer in to_demote {
                 inner.eager.remove(&peer);
-                inner.lazy.insert(peer);
+                inner.lazy.insert(peer.clone());
+                // Update caches
+                inner.eager_vec.retain(|p| *p != peer);
+                inner.lazy_vec.push(peer);
             }
         }
-
-        inner.cache_dirty = true;
     }
 }
 

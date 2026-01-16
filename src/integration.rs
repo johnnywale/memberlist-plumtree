@@ -949,14 +949,65 @@ pub fn encode_plumtree_message(msg: &PlumtreeMessage) -> Bytes {
 ///
 /// This is the **recommended** encoding function as it includes the sender's
 /// node ID, which is critical for proper Plumtree protocol operation.
+///
+/// # Zero-Copy Optimization
+///
+/// This function encodes directly into a single pre-sized buffer, avoiding
+/// intermediate allocations. The buffer size is calculated upfront using
+/// [`envelope_encoded_len`] to ensure a single allocation.
 pub fn encode_plumtree_envelope<I: IdCodec>(sender: &I, msg: &PlumtreeMessage) -> Bytes {
-    let msg_encoded = msg.encode_to_bytes();
     let id_len = sender.encoded_id_len();
-    let mut buf = BytesMut::with_capacity(1 + id_len + msg_encoded.len());
+    let msg_len = msg.encoded_len();
+    let mut buf = BytesMut::with_capacity(1 + id_len + msg_len);
     buf.put_u8(PLUMTREE_MAGIC);
     sender.encode_id(&mut buf);
-    buf.extend_from_slice(&msg_encoded);
+    // Encode message directly into buffer (zero-copy, no intermediate allocation)
+    msg.encode(&mut buf);
     buf.freeze()
+}
+
+/// Encode a Plumtree envelope directly into an existing buffer.
+///
+/// This is useful for buffer pooling scenarios where you want to reuse
+/// buffers to avoid allocation overhead.
+///
+/// Format: `[MAGIC][sender_id][message]`
+///
+/// # Arguments
+///
+/// * `sender` - The sender's node ID
+/// * `msg` - The Plumtree message to encode
+/// * `buf` - The buffer to encode into (must have sufficient capacity)
+///
+/// # Returns
+///
+/// The number of bytes written to the buffer.
+pub fn encode_plumtree_envelope_into<I: IdCodec>(
+    sender: &I,
+    msg: &PlumtreeMessage,
+    buf: &mut impl BufMut,
+) -> usize {
+    let start_len = 1 + sender.encoded_id_len() + msg.encoded_len();
+    buf.put_u8(PLUMTREE_MAGIC);
+    sender.encode_id(buf);
+    msg.encode(buf);
+    start_len
+}
+
+/// Calculate the encoded length of a Plumtree envelope.
+///
+/// Use this to pre-allocate buffers of the correct size.
+///
+/// # Arguments
+///
+/// * `sender` - The sender's node ID
+/// * `msg` - The Plumtree message
+///
+/// # Returns
+///
+/// The total number of bytes the encoded envelope will occupy.
+pub fn envelope_encoded_len<I: IdCodec>(sender: &I, msg: &PlumtreeMessage) -> usize {
+    1 + sender.encoded_id_len() + msg.encoded_len()
 }
 
 /// Decode a Plumtree envelope extracting sender ID and message.
@@ -1129,5 +1180,106 @@ mod tests {
 
         pm.remove_peer(&2u64);
         assert_eq!(pm.peer_stats().total(), 1);
+    }
+
+    #[test]
+    fn test_envelope_encoded_len() {
+        let sender: u64 = 42;
+        let msg = PlumtreeMessage::Gossip {
+            id: MessageId::new(),
+            round: 5,
+            payload: Bytes::from_static(b"hello world"),
+        };
+
+        // Verify encoded_len matches actual encoded length
+        let calculated_len = envelope_encoded_len(&sender, &msg);
+        let encoded = encode_plumtree_envelope(&sender, &msg);
+        assert_eq!(calculated_len, encoded.len());
+    }
+
+    #[test]
+    fn test_encode_envelope_into_buffer() {
+        let sender: u64 = 123;
+        let msg = PlumtreeMessage::IHave {
+            message_ids: smallvec::smallvec![MessageId::new(), MessageId::new()],
+            round: 10,
+        };
+
+        // Encode into a pre-allocated buffer
+        let expected_len = envelope_encoded_len(&sender, &msg);
+        let mut buf = BytesMut::with_capacity(expected_len);
+        let written = encode_plumtree_envelope_into(&sender, &msg, &mut buf);
+
+        assert_eq!(written, expected_len);
+        assert_eq!(buf.len(), expected_len);
+
+        // Verify it decodes correctly
+        let (decoded_sender, decoded_msg): (u64, PlumtreeMessage) =
+            decode_plumtree_envelope(&buf.freeze()).unwrap();
+        assert_eq!(decoded_sender, sender);
+        assert_eq!(decoded_msg, msg);
+    }
+
+    #[test]
+    fn test_zero_copy_encoding_produces_same_result() {
+        // Verify the optimized encoding produces identical results
+        let sender: u64 = 999;
+        let msg = PlumtreeMessage::Gossip {
+            id: MessageId::new(),
+            round: 42,
+            payload: Bytes::from_static(b"test payload"),
+        };
+
+        // Both methods should produce identical output
+        let encoded1 = encode_plumtree_envelope(&sender, &msg);
+
+        let mut buf = BytesMut::with_capacity(envelope_encoded_len(&sender, &msg));
+        encode_plumtree_envelope_into(&sender, &msg, &mut buf);
+        let encoded2 = buf.freeze();
+
+        assert_eq!(encoded1, encoded2);
+    }
+
+    #[test]
+    fn test_envelope_encoded_len_all_message_types() {
+        let sender: u64 = 1;
+
+        // Gossip
+        let gossip = PlumtreeMessage::Gossip {
+            id: MessageId::new(),
+            round: 0,
+            payload: Bytes::from_static(b"test"),
+        };
+        assert_eq!(
+            envelope_encoded_len(&sender, &gossip),
+            encode_plumtree_envelope(&sender, &gossip).len()
+        );
+
+        // IHave
+        let ihave = PlumtreeMessage::IHave {
+            message_ids: smallvec::smallvec![MessageId::new()],
+            round: 0,
+        };
+        assert_eq!(
+            envelope_encoded_len(&sender, &ihave),
+            encode_plumtree_envelope(&sender, &ihave).len()
+        );
+
+        // Graft
+        let graft = PlumtreeMessage::Graft {
+            message_id: MessageId::new(),
+            round: 0,
+        };
+        assert_eq!(
+            envelope_encoded_len(&sender, &graft),
+            encode_plumtree_envelope(&sender, &graft).len()
+        );
+
+        // Prune
+        let prune = PlumtreeMessage::Prune;
+        assert_eq!(
+            envelope_encoded_len(&sender, &prune),
+            encode_plumtree_envelope(&sender, &prune).len()
+        );
     }
 }

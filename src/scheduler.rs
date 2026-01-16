@@ -415,23 +415,29 @@ impl<I: Clone + Send + Sync + 'static> GraftTimer<I> {
     ///
     /// This records a successful graft and the latency from when the entry
     /// was created to when the message was received.
-    pub fn message_received(&self, message_id: &MessageId) {
+    ///
+    /// Returns `true` if a graft was actually pending and sent (retry_count > 0),
+    /// which indicates a successful graft that the adaptive batcher should track.
+    pub fn message_received(&self, message_id: &MessageId) -> bool {
         let mut inner = self.inner.lock();
         if let Some(entry) = inner.entries.remove(message_id) {
             // Also remove from timeout index
             Self::remove_from_timeout_index(&mut inner, entry.next_retry, message_id);
 
+            // Only count as success if we actually sent a graft (retry_count > 0)
+            let was_graft_sent = entry.retry_count > 0;
+
             // Record metrics if the feature is enabled
             #[cfg(feature = "metrics")]
-            {
-                // Only record as success if we actually sent a graft (retry_count > 0)
-                if entry.retry_count > 0 {
-                    crate::metrics::record_graft_success();
-                    let latency = entry.created.elapsed().as_secs_f64();
-                    crate::metrics::record_graft_latency(latency);
-                }
+            if was_graft_sent {
+                crate::metrics::record_graft_success();
+                let latency = entry.created.elapsed().as_secs_f64();
+                crate::metrics::record_graft_latency(latency);
             }
+
+            return was_graft_sent;
         }
+        false
     }
 
     /// Calculate backoff duration for a given retry count.

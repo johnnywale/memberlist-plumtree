@@ -26,7 +26,7 @@ use std::{
 use tokio::sync::{mpsc, RwLock};
 
 /// Simple node identifier for the chat example.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct NodeId(u32);
 
 impl fmt::Display for NodeId {

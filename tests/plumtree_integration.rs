@@ -46,7 +46,7 @@ impl PlumtreeDelegate<NodeId> for TestDelegate {
 }
 
 /// Simple node ID type for testing.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct NodeId(u64);
 
 /// Test that a single node can broadcast and receive its own message

@@ -20,6 +20,10 @@ Plumtree combines the efficiency of tree-based broadcast with the reliability of
 - **Exponential Backoff**: Configurable retry logic with exponential backoff for Graft requests
 - **Runtime Agnostic**: Works with Tokio, async-std, or other async runtimes
 - **Zero-Copy**: Efficient message handling using `bytes::Bytes`
+- **RTT-Based Topology**: Peer scoring based on latency for optimal tree construction
+- **Connection Pooling**: Efficient connection management with per-peer queues
+- **Adaptive Batching**: Dynamic IHave batch sizing based on network conditions
+- **Dynamic Cleanup Tuning**: Lock-free rate tracking with adaptive cleanup intervals
 
 ## How Plumtree Works
 
@@ -195,13 +199,14 @@ async fn main() {
     let msg_id = plumtree.broadcast(b"Hello, cluster!").await.unwrap();
     println!("Broadcast message: {}", msg_id);
 
-    // Run background tasks (IHave scheduler, Graft timer)
+    // Run background tasks (IHave scheduler, Graft timer, cleanup)
     tokio::spawn({
         let pt = plumtree.clone();
         async move {
             tokio::join!(
                 pt.run_ihave_scheduler(),
                 pt.run_graft_timer(),
+                pt.run_seen_cleanup(),
             );
         }
     });
@@ -257,6 +262,152 @@ let config = PlumtreeConfig::default()
 | `graft_rate_limit_per_second` | 10.0 | Rate limit for Graft requests per peer |
 | `graft_rate_limit_burst` | 20 | Burst capacity for Graft rate limiting |
 | `graft_max_retries` | 5 | Maximum Graft retry attempts with backoff |
+
+## Advanced Features
+
+### Peer Scoring (RTT-Based Topology)
+
+Peer scoring enables latency-aware peer selection for optimal spanning tree construction:
+
+```rust
+use memberlist_plumtree::{PeerScoring, ScoringConfig};
+
+// Peers are scored based on RTT and reliability
+let scoring = PeerScoring::new(ScoringConfig::default());
+
+// Record RTT measurement
+scoring.record_rtt(&peer_id, Duration::from_millis(15));
+
+// Record failures (affects peer ranking)
+scoring.record_failure(&peer_id);
+
+// Get best peers for eager set (sorted by score)
+let best_peers = scoring.best_peers(5);
+```
+
+### Connection Pooling
+
+Efficient connection management with per-peer message queues:
+
+```rust
+use memberlist_plumtree::{PooledTransport, PoolConfig};
+
+let config = PoolConfig::default()
+    .with_queue_size(1024)      // Per-peer queue capacity
+    .with_batch_size(32)        // Messages per batch
+    .with_flush_interval(Duration::from_millis(10));
+
+let transport = PooledTransport::new(config, inner_transport);
+
+// Messages are automatically batched and sent efficiently
+transport.send(peer_id, message).await?;
+
+// Get pool statistics
+let stats = transport.stats();
+println!("Messages sent: {}, Queue pressure: {:.2}%",
+    stats.messages_sent, stats.queue_pressure * 100.0);
+```
+
+### Adaptive IHave Batching
+
+Dynamic batch size adjustment based on network conditions:
+
+```rust
+use memberlist_plumtree::{AdaptiveBatcher, BatcherConfig};
+
+let batcher = AdaptiveBatcher::new(BatcherConfig::default());
+
+// Record network feedback
+batcher.record_message();
+batcher.record_graft_received();  // Successful graft
+batcher.record_graft_timeout();   // Failed graft
+
+// Get recommended batch size (adjusts based on latency/success rate)
+let batch_size = batcher.recommended_batch_size();
+
+// Scale for cluster size
+batcher.set_cluster_size_hint(1000);
+
+// Get statistics
+let stats = batcher.stats();
+println!("Graft success rate: {:.1}%", stats.graft_success_rate * 100.0);
+```
+
+### Dynamic Cleanup Tuning
+
+Lock-free rate tracking with adaptive cleanup intervals:
+
+```rust
+use memberlist_plumtree::{CleanupTuner, CleanupConfig};
+
+let tuner = CleanupTuner::new(CleanupConfig::default());
+
+// Record messages (fully lock-free, uses atomics only)
+tuner.record_message();
+tuner.record_messages(100);  // Batch recording for high throughput
+
+// Get tuned cleanup parameters based on current state
+let params = tuner.get_parameters(cache_utilization, cache_ttl);
+println!("Recommended interval: {:?}, batch_size: {}",
+    params.interval, params.batch_size);
+
+// Check backpressure hint
+match params.backpressure_hint() {
+    BackpressureHint::None => { /* Normal operation */ }
+    BackpressureHint::DropSome => { /* Consider dropping low-priority messages */ }
+    BackpressureHint::DropMost => { /* Drop non-critical messages */ }
+    BackpressureHint::BlockNew => { /* Temporarily block new messages */ }
+}
+
+// Get statistics with trend analysis
+let stats = tuner.stats();
+println!("Efficiency trend: {:?}, Pressure trend: {:?}",
+    stats.efficiency_trend, stats.pressure_trend);
+```
+
+### Sharded Seen Map
+
+High-performance deduplication with configurable sharding:
+
+```rust
+// Seen map is automatically managed by Plumtree
+// Configure capacity limits in PlumtreeConfig
+let config = PlumtreeConfig::default()
+    .with_seen_map_soft_cap(100_000)   // Soft limit for entries
+    .with_seen_map_hard_cap(150_000);  // Hard limit (emergency eviction)
+
+// Get seen map statistics
+let stats = plumtree.seen_map_stats();
+println!("Utilization: {:.1}%, Entries: {}",
+    stats.utilization * 100.0, stats.total_entries);
+```
+
+## Metrics
+
+When compiled with the `metrics` feature, comprehensive metrics are exposed:
+
+### Counters
+- `plumtree_messages_broadcast_total` - Total broadcasts initiated
+- `plumtree_messages_delivered_total` - Total messages delivered
+- `plumtree_messages_duplicate_total` - Duplicate messages received
+- `plumtree_gossip_sent_total` - Gossip messages sent
+- `plumtree_ihave_sent_total` - IHave messages sent
+- `plumtree_graft_sent_total` - Graft messages sent
+- `plumtree_prune_sent_total` - Prune messages sent
+- `plumtree_graft_success_total` - Successful Graft requests
+- `plumtree_graft_failed_total` - Failed Graft requests
+
+### Histograms
+- `plumtree_graft_latency_seconds` - Graft request to delivery latency
+- `plumtree_message_size_bytes` - Message payload size distribution
+- `plumtree_message_hops` - Number of hops messages travel
+- `plumtree_ihave_batch_size` - IHave batch size distribution
+
+### Gauges
+- `plumtree_eager_peers` - Current eager peer count
+- `plumtree_lazy_peers` - Current lazy peer count
+- `plumtree_cache_size` - Messages in cache
+- `plumtree_pending_grafts` - Pending Graft requests
 
 ## Delegate Callbacks
 
@@ -344,74 +495,6 @@ let cache_stats = plumtree_ml.cache_stats();
 - Easy peer management (`add_peer`, `remove_peer`)
 - Graceful shutdown handling
 
-## Advanced Usage
-
-### Rate Limiting
-
-Built-in per-peer rate limiting prevents abuse:
-
-```rust
-use memberlist_plumtree::RateLimiter;
-
-// Create rate limiter: 10 tokens, refill 5/second
-let limiter: RateLimiter<String> = RateLimiter::new(10, 5.0);
-
-// Check if request is allowed
-if limiter.check(&peer_id) {
-    // Process request
-}
-
-// Check batch of requests
-if limiter.check_n(&peer_id, 5) {
-    // Process 5 requests
-}
-```
-
-### Graft Timer with Backoff
-
-Exponential backoff for reliable message recovery:
-
-```rust
-use memberlist_plumtree::GraftTimer;
-use std::time::Duration;
-
-let timer = GraftTimer::with_backoff(
-    Duration::from_millis(100),  // base timeout
-    Duration::from_millis(800),  // max timeout
-    5,                           // max retries
-);
-
-// Track pending message
-timer.expect_message(msg_id, peer_bytes, round);
-
-// Check for expired entries that need Graft
-let expired = timer.get_expired();
-for graft in expired {
-    // Send Graft request to graft.peer for graft.message_id
-}
-```
-
-### Scheduler Access
-
-Direct access to IHave scheduling:
-
-```rust
-use memberlist_plumtree::IHaveScheduler;
-
-let scheduler = IHaveScheduler::new(
-    Duration::from_millis(100),  // interval
-    16,                          // batch size
-    1000,                        // max queue size
-);
-
-// Access the queue
-let queue = scheduler.queue();
-queue.push(msg_id, round);
-
-// Pop batch for sending
-let batch = scheduler.pop_batch();
-```
-
 ## Examples
 
 ### Chat Example
@@ -486,6 +569,29 @@ The application-layer approach is suitable for:
 | Tree repair | O(1) per missing message |
 | Memory per node | O(cache_size) |
 | Latency | O(log n) hops typical |
+
+### Optimized for Scale
+
+This implementation includes several optimizations for large-scale deployments (10,000+ nodes):
+
+- **Lock-free message rate tracking**: Atomic counters for high-throughput recording
+- **Sharded deduplication**: Reduces lock contention with configurable sharding
+- **RTT-based peer selection**: Optimizes tree topology for latency
+- **Adaptive batching**: Adjusts batch sizes based on network conditions
+- **Connection pooling**: Efficient message delivery with per-peer queues
+
+## Roadmap
+
+### Phase 3: Protocol Extensions (Planned)
+
+- **Priority-based message routing**: Support for message priorities affecting delivery order
+- **Topic-based spanning trees**: Separate spanning trees per topic for efficient pub/sub
+- **Persistence layer**: Optional WAL for message durability across restarts
+- **Compression**: Optional message compression for bandwidth reduction
+- **Encryption**: End-to-end encryption support for secure clusters
+- **Protocol versioning**: Backward-compatible protocol evolution
+- **Cluster-aware batching**: Batch size hints based on cluster topology
+- **Health-based peer selection**: Factor in peer health metrics for routing decisions
 
 ## References
 

@@ -1,4 +1,16 @@
 //! Plumtree protocol message types.
+//!
+//! # Zero-Copy Message Handling
+//!
+//! Messages use [`Bytes`] for payload storage, which provides zero-copy
+//! semantics through reference counting:
+//!
+//! - **`Bytes::clone()`** is O(1) - only increments a reference count
+//! - **Slicing** creates a new view without copying data
+//! - **Forwarding messages** reuses the same underlying buffer
+//!
+//! This means forwarding a Gossip message to multiple peers only allocates
+//! the envelope header; the payload bytes are shared across all recipients.
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use smallvec::SmallVec;
@@ -216,6 +228,16 @@ impl PlumtreeMessage {
             PlumtreeMessage::IHave { .. } => MessageTag::IHave,
             PlumtreeMessage::Graft { .. } => MessageTag::Graft,
             PlumtreeMessage::Prune => MessageTag::Prune,
+        }
+    }
+
+    /// Get a human-readable type name for tracing/logging.
+    pub const fn type_name(&self) -> &'static str {
+        match self {
+            PlumtreeMessage::Gossip { .. } => "Gossip",
+            PlumtreeMessage::IHave { .. } => "IHave",
+            PlumtreeMessage::Graft { .. } => "Graft",
+            PlumtreeMessage::Prune => "Prune",
         }
     }
 }

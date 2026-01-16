@@ -44,25 +44,45 @@
 #![deny(missing_docs)]
 #![allow(clippy::type_complexity)]
 
+mod adaptive_batcher;
+mod cleanup_tuner;
 mod config;
 mod error;
+mod health;
 mod integration;
 mod message;
+mod peer_scoring;
 mod peer_state;
 mod plumtree;
+mod pooled_transport;
 mod rate_limiter;
 mod runner;
 mod scheduler;
+pub mod testing;
 mod transport;
 
 #[cfg(feature = "metrics")]
 mod metrics;
 
+// Re-export adaptive batcher types
+pub use adaptive_batcher::{AdaptiveBatcher, BatcherConfig, BatcherStats};
+
+// Re-export cleanup tuner types
+pub use cleanup_tuner::{
+    BackpressureHint, CleanupConfig, CleanupParameters, CleanupReason, CleanupStats, CleanupTuner,
+    EfficiencyTrend, PressureTrend,
+};
+
 // Re-export config types
 pub use config::PlumtreeConfig;
 
 // Re-export error types
-pub use error::{Error, Result};
+pub use error::{Error, ErrorKind, Result};
+
+// Re-export health types
+pub use health::{
+    CacheHealth, DeliveryHealth, HealthReport, HealthReportBuilder, HealthStatus, PeerHealth,
+};
 
 // Re-export message types
 pub use message::{
@@ -72,9 +92,13 @@ pub use message::{
 // Re-export peer state types
 pub use peer_state::{PeerState, PeerStateBuilder, PeerStats};
 
+// Re-export peer scoring types
+pub use peer_scoring::{PeerScore, PeerScoring, ScoringConfig, ScoringStats};
+
 // Re-export core plumtree types
 pub use plumtree::{
     IncomingMessage, NoopDelegate, OutgoingMessage, Plumtree, PlumtreeDelegate, PlumtreeHandle,
+    SeenMapStats,
 };
 
 // Re-export runner types
@@ -87,8 +111,8 @@ pub use runner::{PlumtreeRunner, PlumtreeRunnerBuilder};
 // Re-export integration types
 pub use integration::{
     decode_plumtree_envelope, decode_plumtree_message, encode_plumtree_envelope,
-    encode_plumtree_message, is_plumtree_message, IdCodec, PlumtreeEventHandler,
-    PlumtreeMemberlist, PlumtreeNodeDelegate,
+    encode_plumtree_envelope_into, encode_plumtree_message, envelope_encoded_len,
+    is_plumtree_message, IdCodec, PlumtreeEventHandler, PlumtreeMemberlist, PlumtreeNodeDelegate,
 };
 
 // Re-export scheduler types
@@ -99,6 +123,9 @@ pub use rate_limiter::{GlobalRateLimiter, RateLimiter};
 
 // Re-export transport types
 pub use transport::{ChannelTransport, ChannelTransportError, NoopTransport, Transport};
+
+// Re-export pooled transport types
+pub use pooled_transport::{PoolConfig, PoolStats, PooledTransport, PooledTransportError};
 
 // Re-export scheduler failure types
 pub use scheduler::FailedGraft;

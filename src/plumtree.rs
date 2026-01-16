@@ -17,11 +17,16 @@ use std::{
         Arc,
     },
 };
+use tracing::{debug, debug_span, info, instrument, trace, warn, Instrument};
 
 use crate::{
+    adaptive_batcher::{AdaptiveBatcher, BatcherConfig},
+    cleanup_tuner::{CleanupConfig, CleanupTuner},
     config::PlumtreeConfig,
     error::{Error, Result},
+    health::{HealthReport, HealthReportBuilder},
     message::{MessageCache, MessageId, PlumtreeMessage},
+    peer_scoring::{PeerScoring, ScoringConfig},
     peer_state::{PeerState, SharedPeerState},
     rate_limiter::RateLimiter,
     scheduler::{GraftTimer, IHaveScheduler, PendingIHave},
@@ -31,24 +36,40 @@ use crate::{
 /// 16 shards provides good concurrency while keeping memory overhead low.
 const SEEN_MAP_SHARDS: usize = 16;
 
+/// Default max capacity per shard for the seen map.
+/// With 16 shards, this gives a total capacity of ~160,000 entries.
+const DEFAULT_MAX_CAPACITY_PER_SHARD: usize = 10_000;
+
 /// Sharded map for tracking seen messages.
 ///
 /// Uses multiple shards to reduce lock contention:
 /// - Each operation only locks one shard (based on message ID hash)
 /// - Cleanup iterates through shards one at a time, yielding between shards
+/// - Emergency eviction occurs when a shard exceeds its capacity
 ///
-/// This prevents the cleanup task from blocking all message processing.
+/// This prevents the cleanup task from blocking all message processing
+/// and ensures bounded memory usage even under high message velocity.
 struct ShardedSeenMap<I> {
     shards: Vec<RwLock<HashMap<MessageId, SeenEntry<I>>>>,
+    /// Maximum entries per shard before emergency eviction.
+    max_capacity_per_shard: usize,
 }
 
 impl<I> ShardedSeenMap<I> {
-    /// Create a new sharded seen map with the default number of shards.
+    /// Create a new sharded seen map with the default number of shards and capacity.
     fn new() -> Self {
+        Self::with_capacity(DEFAULT_MAX_CAPACITY_PER_SHARD)
+    }
+
+    /// Create a new sharded seen map with custom max capacity per shard.
+    fn with_capacity(max_capacity_per_shard: usize) -> Self {
         let shards = (0..SEEN_MAP_SHARDS)
             .map(|_| RwLock::new(HashMap::new()))
             .collect();
-        Self { shards }
+        Self {
+            shards,
+            max_capacity_per_shard,
+        }
     }
 
     /// Get the shard index for a message ID.
@@ -133,18 +154,55 @@ impl<I: Clone> ShardedSeenMap<I> {
     }
 
     /// Check if message is seen; if so, increment count. Otherwise insert new entry.
-    /// Returns (is_duplicate, receive_count).
-    async fn check_and_mark_seen(&self, id: MessageId, entry_fn: impl FnOnce() -> SeenEntry<I>) -> (bool, u32) {
-        let mut shard = self.write_shard(&id).await;
+    /// Returns (is_duplicate, receive_count, evicted_count).
+    ///
+    /// If the shard exceeds capacity, emergency eviction removes the oldest entries.
+    async fn check_and_mark_seen(&self, id: MessageId, entry_fn: impl FnOnce() -> SeenEntry<I>) -> (bool, u32, usize) {
+        let idx = self.shard_index(&id);
+        let mut shard = self.shards[idx].write().await;
+
         if let Some(entry) = shard.get_mut(&id) {
             entry.receive_count += 1;
-            (true, entry.receive_count)
+            (true, entry.receive_count, 0)
         } else {
+            // Check if we need emergency eviction before inserting
+            let evicted = if shard.len() >= self.max_capacity_per_shard {
+                Self::emergency_evict(&mut shard, self.max_capacity_per_shard / 10)
+            } else {
+                0
+            };
+
             let entry = entry_fn();
             let count = entry.receive_count;
             shard.insert(id, entry);
-            (false, count)
+            (false, count, evicted)
         }
+    }
+
+    /// Perform emergency eviction of oldest entries from a shard.
+    /// Removes at least `target_evict` entries (more if needed to make room).
+    /// Returns the number of entries evicted.
+    fn emergency_evict(shard: &mut HashMap<MessageId, SeenEntry<I>>, target_evict: usize) -> usize {
+        if shard.is_empty() || target_evict == 0 {
+            return 0;
+        }
+
+        // Find the oldest entries by seen_at timestamp
+        let mut entries: Vec<(MessageId, std::time::Instant)> = shard
+            .iter()
+            .map(|(id, entry)| (*id, entry.seen_at))
+            .collect();
+
+        // Sort by seen_at (oldest first)
+        entries.sort_by_key(|(_, seen_at)| *seen_at);
+
+        // Remove the oldest entries
+        let to_remove = target_evict.min(entries.len());
+        for (id, _) in entries.into_iter().take(to_remove) {
+            shard.remove(&id);
+        }
+
+        to_remove
     }
 
     /// Clean up expired entries from one shard.
@@ -166,9 +224,29 @@ impl<I: Clone> ShardedSeenMap<I> {
         total
     }
 
+    /// Try to get the approximate total number of entries (non-blocking).
+    /// Returns None if any shard lock cannot be acquired immediately.
+    fn try_len(&self) -> Option<usize> {
+        let mut total = 0;
+        for shard in &self.shards {
+            total += shard.try_read()?.len();
+        }
+        Some(total)
+    }
+
     /// Get the number of shards.
     fn shard_count(&self) -> usize {
         self.shards.len()
+    }
+
+    /// Get the maximum capacity per shard.
+    fn max_capacity_per_shard(&self) -> usize {
+        self.max_capacity_per_shard
+    }
+
+    /// Get the total maximum capacity across all shards.
+    fn total_capacity(&self) -> usize {
+        self.shards.len() * self.max_capacity_per_shard
     }
 }
 
@@ -318,6 +396,15 @@ struct PlumtreeInner<I, D> {
     /// Rate limiter for Graft requests (per-peer).
     graft_rate_limiter: RateLimiter<I>,
 
+    /// Peer scoring for RTT-based optimization and zombie peer detection.
+    peer_scoring: Arc<PeerScoring<I>>,
+
+    /// Dynamic cleanup tuning based on system load.
+    cleanup_tuner: Arc<CleanupTuner>,
+
+    /// Adaptive IHave batching based on network conditions.
+    adaptive_batcher: Arc<AdaptiveBatcher>,
+
     /// Event delegate.
     delegate: D,
 
@@ -363,6 +450,21 @@ struct SeenEntry<I> {
     /// Reserved for future use in tree repair when a better path is found.
     #[allow(dead_code)]
     parent: Option<I>,
+}
+
+/// Statistics about the seen map (deduplication map).
+#[derive(Debug, Clone, Copy)]
+pub struct SeenMapStats {
+    /// Current number of entries in the map.
+    pub size: usize,
+    /// Total maximum capacity across all shards.
+    pub capacity: usize,
+    /// Current utilization (size / capacity).
+    pub utilization: f64,
+    /// Number of shards.
+    pub shard_count: usize,
+    /// Maximum entries per shard.
+    pub max_per_shard: usize,
 }
 
 /// Outgoing message to be sent.
@@ -413,7 +515,7 @@ pub struct IncomingMessage<I> {
 
 impl<I, D> Plumtree<I, D>
 where
-    I: Clone + Eq + Hash + Debug + Send + Sync + 'static,
+    I: Clone + Eq + Hash + Ord + Debug + Send + Sync + 'static,
     D: PlumtreeDelegate<I>,
 {
     /// Create a new Plumtree instance.
@@ -446,6 +548,9 @@ where
             )),
             graft_timer: Arc::new(GraftTimer::new(config.graft_timeout)),
             graft_rate_limiter,
+            peer_scoring: Arc::new(PeerScoring::new(ScoringConfig::default())),
+            cleanup_tuner: Arc::new(CleanupTuner::new(CleanupConfig::default())),
+            adaptive_batcher: Arc::new(AdaptiveBatcher::new(BatcherConfig::default())),
             delegate,
             config,
             local_id,
@@ -489,6 +594,110 @@ where
         self.inner.cache.stats()
     }
 
+    /// Get seen map statistics (deduplication map).
+    ///
+    /// Returns None if the statistics cannot be computed without blocking.
+    pub fn seen_map_stats(&self) -> Option<SeenMapStats> {
+        let size = self.inner.seen.try_len()?;
+        let capacity = self.inner.seen.total_capacity();
+        let utilization = if capacity > 0 {
+            size as f64 / capacity as f64
+        } else {
+            0.0
+        };
+        Some(SeenMapStats {
+            size,
+            capacity,
+            utilization,
+            shard_count: self.inner.seen.shard_count(),
+            max_per_shard: self.inner.seen.max_capacity_per_shard(),
+        })
+    }
+
+    /// Get peer scoring statistics.
+    pub fn scoring_stats(&self) -> crate::peer_scoring::ScoringStats {
+        self.inner.peer_scoring.stats()
+    }
+
+    /// Get cleanup tuner statistics.
+    pub fn cleanup_stats(&self) -> crate::cleanup_tuner::CleanupStats {
+        self.inner.cleanup_tuner.stats()
+    }
+
+    /// Get adaptive batcher statistics.
+    pub fn batcher_stats(&self) -> crate::adaptive_batcher::BatcherStats {
+        self.inner.adaptive_batcher.stats()
+    }
+
+    /// Record an RTT sample for a peer.
+    ///
+    /// Call this when receiving a response from a peer to update their score.
+    /// Lower RTT results in higher peer scores.
+    pub fn record_peer_rtt(&self, peer: &I, rtt: std::time::Duration) {
+        self.inner.peer_scoring.record_rtt(peer, rtt);
+    }
+
+    /// Record a failure for a peer (e.g., timeout, connection error).
+    ///
+    /// This penalizes the peer's score, making them less likely to be
+    /// selected for eager promotion.
+    pub fn record_peer_failure(&self, peer: &I) {
+        self.inner.peer_scoring.record_failure(peer);
+    }
+
+    /// Get the score for a specific peer.
+    pub fn get_peer_score(&self, peer: &I) -> Option<crate::peer_scoring::PeerScore> {
+        self.inner.peer_scoring.get_score(peer)
+    }
+
+    /// Get the best peers by score for potential eager promotion.
+    pub fn best_peers_for_eager(&self, count: usize) -> Vec<I> {
+        self.inner.peer_scoring.best_peers(count)
+    }
+
+    /// Get a health report for the protocol.
+    ///
+    /// The health report provides information about peer connectivity,
+    /// message delivery status, and cache utilization.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let health = plumtree.health();
+    /// if health.status.is_unhealthy() {
+    ///     eprintln!("Warning: {}", health.message);
+    /// }
+    /// ```
+    pub fn health(&self) -> HealthReport {
+        let peer_stats = self.inner.peers.stats();
+        let cache_stats = self.inner.cache.stats();
+        let pending_grafts = self.inner.graft_timer.pending_count();
+
+        // For now, we don't track successful/failed grafts in the struct
+        // This would need additional atomic counters to track properly
+        // For the initial implementation, we'll use 0/0 which results in 0% failure rate
+        let successful_grafts = 0_u64;
+        let failed_grafts = 0_u64;
+
+        let total_peers = peer_stats.eager_count + peer_stats.lazy_count;
+
+        HealthReportBuilder::new()
+            .peers(
+                total_peers,
+                peer_stats.eager_count,
+                peer_stats.lazy_count,
+                self.inner.config.eager_fanout,
+            )
+            .grafts(pending_grafts, successful_grafts, failed_grafts)
+            .cache(
+                cache_stats.entries,
+                self.inner.config.message_cache_max_size,
+                self.inner.config.message_cache_ttl,
+            )
+            .shutdown(self.inner.shutdown.load(Ordering::Acquire))
+            .build()
+    }
+
     /// Add a peer (joins as lazy initially).
     pub fn add_peer(&self, peer: I) {
         if peer != self.inner.local_id {
@@ -507,19 +716,34 @@ where
     /// as IHave announcements for lazy peers.
     ///
     /// Returns the unique message ID assigned to this broadcast.
+    #[instrument(skip(self, payload), fields(payload_size))]
     pub async fn broadcast(&self, payload: impl Into<Bytes>) -> Result<MessageId> {
         let payload = payload.into();
+        let payload_size = payload.len();
+        tracing::Span::current().record("payload_size", payload_size);
 
         // Check size limit
-        if payload.len() > self.inner.config.max_message_size {
+        if payload_size > self.inner.config.max_message_size {
+            warn!(
+                payload_size,
+                max_size = self.inner.config.max_message_size,
+                "message too large"
+            );
             return Err(Error::MessageTooLarge {
-                size: payload.len(),
+                size: payload_size,
                 max_size: self.inner.config.max_message_size,
             });
         }
 
         let msg_id = MessageId::new();
         let round = self.inner.round.fetch_add(1, Ordering::Relaxed);
+
+        debug!(
+            message_id = %msg_id,
+            round,
+            payload_size,
+            "broadcasting new message"
+        );
 
         // Cache the message
         self.inner.cache.insert(msg_id, payload.clone());
@@ -535,24 +759,60 @@ where
             },
         ).await;
 
-        // Send to eager peers
+        // Send to eager peers with backpressure handling
         let eager_peers = self.inner.peers.eager_peers();
+        let eager_count = eager_peers.len();
+        let mut dropped_count = 0;
+
         for peer in eager_peers {
             let msg = PlumtreeMessage::Gossip {
                 id: msg_id,
                 round,
                 payload: payload.clone(),
             };
-            // Send unicast to specific eager peer
-            let _ = self
+            // Use try_send to avoid blocking under backpressure
+            if let Err(_e) = self
                 .inner
                 .outgoing_tx
-                .send(OutgoingMessage::unicast(peer, msg))
-                .await;
+                .try_send(OutgoingMessage::unicast(peer, msg))
+            {
+                dropped_count += 1;
+                trace!(
+                    message_id = %msg_id,
+                    "outgoing queue full, message to eager peer dropped"
+                );
+            }
         }
 
         // Queue IHave for lazy peers
         self.inner.scheduler.queue().push(msg_id, round);
+
+        // Check for backpressure condition
+        if dropped_count > 0 {
+            warn!(
+                message_id = %msg_id,
+                dropped = dropped_count,
+                total_eager = eager_count,
+                "backpressure: some eager push messages were dropped"
+            );
+            // Still return the message ID since it was cached and IHave was queued.
+            // The message can still reach peers via lazy push (IHave/Graft).
+            // But warn the caller about backpressure so they can throttle.
+            if dropped_count == eager_count {
+                // All messages dropped - this is severe backpressure
+                return Err(Error::QueueFull {
+                    dropped: dropped_count,
+                    capacity: self.inner.outgoing_tx.capacity().unwrap_or(1024),
+                });
+            }
+        }
+
+        trace!(
+            message_id = %msg_id,
+            eager_peers = eager_count,
+            sent = eager_count - dropped_count,
+            "broadcast complete, IHave queued for lazy peers"
+        );
 
         Ok(msg_id)
     }
@@ -565,18 +825,25 @@ where
             return Err(Error::Shutdown);
         }
 
-        match message {
-            PlumtreeMessage::Gossip { id, round, payload } => {
-                self.handle_gossip(from, id, round, payload).await
+        let msg_type = message.type_name();
+        let span = debug_span!("handle_message", msg_type, ?from);
+
+        async {
+            match message {
+                PlumtreeMessage::Gossip { id, round, payload } => {
+                    self.handle_gossip(from, id, round, payload).await
+                }
+                PlumtreeMessage::IHave { message_ids, round } => {
+                    self.handle_ihave(from, message_ids, round).await
+                }
+                PlumtreeMessage::Graft { message_id, round } => {
+                    self.handle_graft(from, message_id, round).await
+                }
+                PlumtreeMessage::Prune => self.handle_prune(from).await,
             }
-            PlumtreeMessage::IHave { message_ids, round } => {
-                self.handle_ihave(from, message_ids, round).await
-            }
-            PlumtreeMessage::Graft { message_id, round } => {
-                self.handle_graft(from, message_id, round).await
-            }
-            PlumtreeMessage::Prune => self.handle_prune(from).await,
         }
+        .instrument(span)
+        .await
     }
 
     /// Handle a Gossip message (eager push).
@@ -587,11 +854,28 @@ where
         round: u32,
         payload: Bytes,
     ) -> Result<()> {
+        let payload_size = payload.len();
+        trace!(
+            message_id = %msg_id,
+            round,
+            payload_size,
+            "received gossip"
+        );
+
+        // Record message for cleanup tuner's message rate tracking
+        self.inner.cleanup_tuner.record_message();
+        // Record message for adaptive batcher's throughput tracking
+        self.inner.adaptive_batcher.record_message();
+
         // Cancel any pending Graft timer for this message
-        self.inner.graft_timer.message_received(&msg_id);
+        // Returns true if a graft was actually sent and satisfied
+        if self.inner.graft_timer.message_received(&msg_id) {
+            // Record graft success for adaptive batcher to adjust batch sizes
+            self.inner.adaptive_batcher.record_graft_received();
+        }
 
         // Check if already seen and track parent atomically (single shard lock)
-        let (is_duplicate, receive_count) = self.inner.seen.check_and_mark_seen(
+        let (is_duplicate, receive_count, evicted) = self.inner.seen.check_and_mark_seen(
             msg_id,
             || SeenEntry {
                 round,
@@ -601,12 +885,33 @@ where
             }
         ).await;
 
+        if evicted > 0 {
+            debug!(
+                message_id = %msg_id,
+                evicted,
+                "emergency eviction in seen map due to capacity"
+            );
+            #[cfg(feature = "metrics")]
+            crate::metrics::record_seen_map_evictions(evicted);
+        }
+
         if is_duplicate {
+            trace!(
+                message_id = %msg_id,
+                receive_count,
+                "duplicate gossip received"
+            );
             // Optimization: prune redundant path after threshold
             if receive_count > self.inner.config.optimization_threshold {
                 // Only send Prune if the peer is in the eager set
                 // Pruning a peer that is already lazy is redundant traffic
                 if self.inner.peers.is_eager(&from) {
+                    debug!(
+                        message_id = %msg_id,
+                        receive_count,
+                        threshold = self.inner.config.optimization_threshold,
+                        "pruning redundant path"
+                    );
                     // Send Prune unicast to the duplicate sender
                     let _ = self
                         .inner
@@ -625,6 +930,12 @@ where
         }
 
         // First time seeing this message (parent already tracked above)
+        debug!(
+            message_id = %msg_id,
+            round,
+            payload_size,
+            "delivering new message"
+        );
 
         // Cache for potential Graft requests
         self.inner.cache.insert(msg_id, payload.clone());
@@ -634,22 +945,44 @@ where
 
         // Forward to eager peers (except sender) via unicast
         let eager_peers = self.inner.peers.random_eager_except(&from, usize::MAX);
+        let forward_count = eager_peers.len();
+        let mut dropped = 0;
+
         for peer in eager_peers {
             let msg = PlumtreeMessage::Gossip {
                 id: msg_id,
                 round: round + 1,
                 payload: payload.clone(),
             };
-            // Send unicast to specific eager peer
-            let _ = self
+            // Use try_send to avoid blocking under backpressure
+            if self
                 .inner
                 .outgoing_tx
-                .send(OutgoingMessage::unicast(peer, msg))
-                .await;
+                .try_send(OutgoingMessage::unicast(peer, msg))
+                .is_err()
+            {
+                dropped += 1;
+            }
         }
 
         // Queue IHave for lazy peers (except sender)
         self.inner.scheduler.queue().push(msg_id, round + 1);
+
+        if dropped > 0 {
+            debug!(
+                message_id = %msg_id,
+                dropped,
+                total = forward_count,
+                "backpressure: some gossip forwards dropped"
+            );
+        }
+
+        trace!(
+            message_id = %msg_id,
+            forward_count,
+            sent = forward_count - dropped,
+            "forwarded gossip to eager peers"
+        );
 
         Ok(())
     }
@@ -661,11 +994,18 @@ where
         message_ids: SmallVec<[MessageId; 8]>,
         round: u32,
     ) -> Result<()> {
+        let count = message_ids.len();
+        trace!(count, round, "received IHave batch");
+
+        let mut missing_count = 0;
         for msg_id in message_ids {
             // Check if we already have this message (only locks one shard)
             let have_message = self.inner.seen.contains(&msg_id).await;
 
             if !have_message {
+                missing_count += 1;
+                trace!(message_id = %msg_id, "missing message, sending Graft");
+
                 // We don't have this message - start Graft timer
                 // Get alternative peers to try if the primary fails
                 let alternatives: Vec<I> = self.inner.peers.random_eager_except(&from, 2);
@@ -691,6 +1031,7 @@ where
 
                 // Promote sender to eager to get this and future messages
                 if self.inner.peers.promote_to_eager(&from) {
+                    debug!("promoted peer to eager after IHave");
                     self.inner.delegate.on_eager_promotion(&from);
                 }
 
@@ -711,24 +1052,40 @@ where
             }
         }
 
+        if missing_count > 0 {
+            debug!(
+                total = count,
+                missing = missing_count,
+                "IHave processing complete"
+            );
+        }
+
         Ok(())
     }
 
     /// Handle a Graft message (request to establish eager link).
     async fn handle_graft(&self, from: I, msg_id: MessageId, round: u32) -> Result<()> {
+        trace!(message_id = %msg_id, round, "received Graft request");
+
         // Rate limit Graft requests per peer
         if !self.inner.graft_rate_limiter.check(&from) {
-            tracing::warn!("rate limiting Graft request from {:?}", from);
+            warn!(message_id = %msg_id, "rate limiting Graft request");
             return Ok(());
         }
 
         // Promote requester to eager
         if self.inner.peers.promote_to_eager(&from) {
+            debug!("promoted peer to eager after Graft request");
             self.inner.delegate.on_eager_promotion(&from);
         }
 
         // Send the requested message unicast to the requester
         if let Some(payload) = self.inner.cache.get(&msg_id) {
+            debug!(
+                message_id = %msg_id,
+                payload_size = payload.len(),
+                "responding to Graft with cached message"
+            );
             let msg = PlumtreeMessage::Gossip {
                 id: msg_id,
                 round,
@@ -739,6 +1096,8 @@ where
                 .outgoing_tx
                 .send(OutgoingMessage::unicast(from, msg))
                 .await;
+        } else {
+            debug!(message_id = %msg_id, "Graft request for unknown message");
         }
 
         Ok(())
@@ -746,7 +1105,9 @@ where
 
     /// Handle a Prune message (demote to lazy).
     async fn handle_prune(&self, from: I) -> Result<()> {
+        trace!("received Prune request");
         if self.inner.peers.demote_to_lazy(&from) {
+            debug!("demoted peer to lazy after Prune");
             self.inner.delegate.on_lazy_demotion(&from);
         }
         Ok(())
@@ -757,15 +1118,33 @@ where
     /// This should be spawned as a background task.
     /// Uses a "linger" strategy: flushes immediately if batch is full,
     /// otherwise waits for the configured interval.
+    ///
+    /// Uses the AdaptiveBatcher for dynamic batch size adjustment based on:
+    /// - Network latency (smaller batches for low-latency)
+    /// - Graft success rate (reduce batches if many Grafts fail)
+    /// - Message throughput (larger batches under high load)
+    #[instrument(skip(self), name = "ihave_scheduler")]
     pub async fn run_ihave_scheduler(&self) {
+        info!("IHave scheduler started with adaptive batching");
         let ihave_interval = self.inner.config.ihave_interval;
         // Check for early flush more frequently (every 10ms)
         let check_interval = std::time::Duration::from_millis(10);
         let mut last_flush = std::time::Instant::now();
+        let mut last_batch_size_update = std::time::Instant::now();
+        let batch_size_update_interval = std::time::Duration::from_secs(5);
 
         loop {
             if self.inner.shutdown.load(Ordering::Acquire) {
+                info!("IHave scheduler shutting down");
                 break;
+            }
+
+            // Periodically update batch size from adaptive batcher
+            if last_batch_size_update.elapsed() >= batch_size_update_interval {
+                let recommended_size = self.inner.adaptive_batcher.recommended_batch_size();
+                self.inner.scheduler.queue().set_flush_threshold(recommended_size);
+                trace!(batch_size = recommended_size, "updated IHave batch size from adaptive batcher");
+                last_batch_size_update = std::time::Instant::now();
             }
 
             // Check if we should flush early (queue reached batch size)
@@ -802,30 +1181,60 @@ where
             .peers
             .random_lazy_except(&self.inner.local_id, self.inner.config.lazy_fanout);
 
-        // Send IHave to each lazy peer
+        let peer_count = lazy_peers.len();
+        let batch_size = message_ids.len();
+
+        trace!(
+            batch_size,
+            peer_count,
+            round,
+            "flushing IHave batch to lazy peers"
+        );
+
+        // Send IHave to each lazy peer with backpressure handling
+        let mut ihave_dropped = 0;
         for peer in lazy_peers {
             let msg = PlumtreeMessage::IHave {
                 message_ids: message_ids.clone(),
                 round,
             };
-            // Send IHave unicast to specific lazy peer
-            let _ = self
+            // Use try_send to avoid blocking under backpressure
+            if self
                 .inner
                 .outgoing_tx
-                .send(OutgoingMessage::unicast(peer, msg))
-                .await;
+                .try_send(OutgoingMessage::unicast(peer, msg))
+                .is_err()
+            {
+                ihave_dropped += 1;
+            }
         }
+
+        if ihave_dropped > 0 {
+            debug!(
+                batch_size,
+                dropped = ihave_dropped,
+                total = peer_count,
+                "backpressure: some IHave messages dropped"
+            );
+        }
+
+        // Record IHaves sent for adaptive batcher feedback
+        let ihaves_sent = (peer_count - ihave_dropped) * batch_size;
+        self.inner.adaptive_batcher.record_ihave_sent(ihaves_sent);
     }
 
     /// Run the Graft timer checker background task.
     ///
     /// This should be spawned as a background task.
+    #[instrument(skip(self), name = "graft_timer")]
     pub async fn run_graft_timer(&self) {
+        info!("Graft timer started");
         let check_interval = self.inner.config.graft_timeout / 2;
         let mut interval = Delay::new(check_interval);
 
         loop {
             if self.inner.shutdown.load(Ordering::Acquire) {
+                info!("Graft timer shutting down");
                 break;
             }
 
@@ -837,13 +1246,17 @@ where
             let (expired, failed) = self.inner.graft_timer.get_expired_with_failures();
 
             // Handle failed grafts (zombie peer detection)
-            for failed_graft in failed {
-                tracing::warn!(
-                    "Graft failed for message {:?} after {} retries from peer {:?}",
-                    failed_graft.message_id,
-                    failed_graft.total_retries,
-                    failed_graft.original_peer
+            for failed_graft in &failed {
+                warn!(
+                    message_id = %failed_graft.message_id,
+                    retries = failed_graft.total_retries,
+                    peer = ?failed_graft.original_peer,
+                    "Graft failed after max retries - penalizing peer"
                 );
+                // Record failure in peer scoring to penalize unresponsive peers
+                self.inner.peer_scoring.record_failure(&failed_graft.original_peer);
+                // Record failure for adaptive batcher to adjust batch sizes
+                self.inner.adaptive_batcher.record_graft_timeout();
                 self.inner
                     .delegate
                     .on_graft_failed(&failed_graft.message_id, &failed_graft.original_peer);
@@ -851,16 +1264,11 @@ where
 
             for expired_graft in expired {
                 // Send Graft to the peer determined by the timer (primary or alternative)
-                tracing::debug!(
-                    "Graft {} for message {:?} to peer {:?} (attempt {})",
-                    if expired_graft.retry_count == 0 {
-                        "initial"
-                    } else {
-                        "retry"
-                    },
-                    expired_graft.message_id,
-                    expired_graft.peer,
-                    expired_graft.retry_count
+                debug!(
+                    message_id = %expired_graft.message_id,
+                    attempt = expired_graft.retry_count,
+                    is_retry = expired_graft.retry_count > 0,
+                    "sending Graft request"
                 );
 
                 let _ = self
@@ -887,25 +1295,56 @@ where
     /// This removes old entries from the deduplication map to prevent
     /// unbounded memory growth. Entries older than message_cache_ttl are removed.
     ///
+    /// Uses the CleanupTuner for dynamic cleanup intervals based on:
+    /// - Cache utilization (more aggressive when near capacity)
+    /// - Message rate (more conservative under high load)
+    /// - Cleanup duration (adjusts batch size for responsiveness)
+    ///
     /// This should be spawned as a background task.
+    #[instrument(skip(self), name = "seen_cleanup")]
     pub async fn run_seen_cleanup(&self) {
-        // Run cleanup every half the TTL period
-        let cleanup_interval = self.inner.config.message_cache_ttl / 2;
+        info!("seen map cleanup started with dynamic tuning");
         let ttl = self.inner.config.message_cache_ttl;
-        let mut interval = Delay::new(cleanup_interval);
+        let tuner = &self.inner.cleanup_tuner;
+
+        // Start with initial interval from tuner
+        let initial_params = tuner.get_parameters(0.0, ttl);
+        let mut interval = Delay::new(initial_params.interval);
+        let mut rate_window_reset = std::time::Instant::now();
 
         loop {
             if self.inner.shutdown.load(Ordering::Acquire) {
+                info!("seen map cleanup shutting down");
                 break;
             }
 
-            // Wait for interval
+            // Wait for dynamically-tuned interval
             (&mut interval).await;
-            interval.reset(cleanup_interval);
+
+            // Get current utilization for tuning
+            let utilization = self
+                .seen_map_stats()
+                .map(|s| s.utilization)
+                .unwrap_or(0.0);
+
+            // Get tuned parameters based on current state
+            let params = tuner.get_parameters(utilization, ttl);
+
+            trace!(
+                interval_ms = params.interval.as_millis(),
+                batch_size = params.batch_size,
+                aggressive = params.aggressive,
+                utilization = format!("{:.2}", params.utilization),
+                message_rate = format!("{:.1}", params.message_rate),
+                "cleanup tuner parameters"
+            );
+
+            // Reset for next interval using tuned duration
+            interval.reset(params.interval);
 
             // Clean up expired entries from seen map, one shard at a time
-            // This prevents cleanup from blocking all message processing
-            let now = std::time::Instant::now();
+            let cleanup_start = std::time::Instant::now();
+            let now = cleanup_start;
             let mut total_removed = 0;
             let shard_count = self.inner.seen.shard_count();
 
@@ -920,12 +1359,33 @@ where
                 total_removed += removed;
 
                 // Brief yield to allow other tasks to make progress
-                // This prevents cleanup from monopolizing the executor
                 Delay::new(std::time::Duration::from_micros(1)).await;
             }
 
+            // Record cleanup metrics for tuner feedback
+            let cleanup_duration = cleanup_start.elapsed();
+            tuner.record_cleanup(cleanup_duration, total_removed, &params);
+
             if total_removed > 0 {
-                tracing::debug!("cleaned up {} expired entries from seen map ({} shards)", total_removed, shard_count);
+                debug!(
+                    removed = total_removed,
+                    shards = shard_count,
+                    duration_ms = cleanup_duration.as_millis(),
+                    aggressive = params.aggressive,
+                    "cleaned up expired entries from seen map"
+                );
+            }
+
+            // Periodically reset the rate window for responsive tuning
+            if rate_window_reset.elapsed() >= tuner.config().rate_window {
+                tuner.reset_rate_window();
+                rate_window_reset = std::time::Instant::now();
+            }
+
+            // Update seen map size metric after cleanup
+            #[cfg(feature = "metrics")]
+            if let Some(stats) = self.seen_map_stats() {
+                crate::metrics::set_seen_map_size(stats.size);
             }
         }
     }
@@ -1018,7 +1478,7 @@ impl<I> PlumtreeHandle<I> {
 mod tests {
     use super::*;
 
-    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
     struct TestNodeId(u64);
 
     struct TestDelegate {
