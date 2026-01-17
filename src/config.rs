@@ -9,6 +9,18 @@ use std::time::Duration;
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PlumtreeConfig {
+    /// Maximum number of peers to maintain.
+    ///
+    /// When set, the node will only maintain connections to this many peers.
+    /// Excess peers will be rejected or evicted (oldest lazy peers first).
+    /// This enables partial mesh topology instead of full mesh.
+    ///
+    /// The limit is enforced as: `eager_fanout + lazy_fanout <= max_peers`.
+    /// If not set (None), no limit is enforced and all peers are accepted.
+    ///
+    /// Default: None (unlimited)
+    pub max_peers: Option<usize>,
+
     /// Number of eager peers (spanning tree fanout).
     ///
     /// Eager peers receive full messages immediately. Higher values
@@ -114,16 +126,51 @@ pub struct PlumtreeConfig {
     /// Default: 5
     pub graft_max_retries: u32,
 
+    /// Interval for periodic topology maintenance.
+    ///
+    /// The maintenance loop checks if the eager peer count has dropped below
+    /// `eager_fanout` and promotes lazy peers to restore the spanning tree.
+    ///
+    /// Set to `Duration::ZERO` to disable periodic maintenance (not recommended).
+    ///
+    /// Default: 2s
+    #[cfg_attr(feature = "serde", serde(with = "humantime_serde_impl"))]
+    pub maintenance_interval: Duration,
+
+    /// Maximum random jitter added to maintenance interval.
+    ///
+    /// Jitter prevents "thundering herd" effects when multiple nodes detect
+    /// topology degradation simultaneously. Each maintenance cycle will have
+    /// a random delay between 0 and this value added.
+    ///
+    /// Default: 500ms
+    #[cfg_attr(feature = "serde", serde(with = "humantime_serde_impl"))]
+    pub maintenance_jitter: Duration,
+
     /// Enable metrics collection.
     ///
     /// Default: true (if metrics feature is enabled)
     #[cfg(feature = "metrics")]
     pub enable_metrics: bool,
+
+    /// Enable hash ring topology for peer selection.
+    ///
+    /// When enabled, peers are organized in a deterministic hash ring:
+    /// - Adjacent peers (i±1, i±2) form the base connectivity layer (Z≥2 redundancy)
+    /// - Long-range jump links (i±N/4) optimize message propagation
+    /// - Ring neighbors are protected from demotion
+    /// - Eviction uses fingerprint-based selection to preserve topological diversity
+    ///
+    /// This is automatically enabled when using `PlumtreeMemberlist`.
+    ///
+    /// Default: false
+    pub use_hash_ring: bool,
 }
 
 impl Default for PlumtreeConfig {
     fn default() -> Self {
         Self {
+            max_peers: None,
             eager_fanout: 3,
             lazy_fanout: 6,
             ihave_interval: Duration::from_millis(100),
@@ -136,8 +183,11 @@ impl Default for PlumtreeConfig {
             graft_rate_limit_per_second: 10.0,
             graft_rate_limit_burst: 20,
             graft_max_retries: 5,
+            maintenance_interval: Duration::from_secs(2),
+            maintenance_jitter: Duration::from_millis(500),
             #[cfg(feature = "metrics")]
             enable_metrics: true,
+            use_hash_ring: false,
         }
     }
 }
@@ -155,6 +205,7 @@ impl PlumtreeConfig {
     /// - More aggressive optimization
     pub fn lan() -> Self {
         Self {
+            max_peers: None,
             eager_fanout: 3,
             lazy_fanout: 6,
             ihave_interval: Duration::from_millis(50),
@@ -167,8 +218,11 @@ impl PlumtreeConfig {
             graft_rate_limit_per_second: 20.0,
             graft_rate_limit_burst: 40,
             graft_max_retries: 3,
+            maintenance_interval: Duration::from_secs(1),
+            maintenance_jitter: Duration::from_millis(200),
             #[cfg(feature = "metrics")]
             enable_metrics: true,
+            use_hash_ring: false,
         }
     }
 
@@ -179,6 +233,7 @@ impl PlumtreeConfig {
     /// - More conservative optimization
     pub fn wan() -> Self {
         Self {
+            max_peers: None,
             eager_fanout: 4,
             lazy_fanout: 8,
             ihave_interval: Duration::from_millis(200),
@@ -191,8 +246,11 @@ impl PlumtreeConfig {
             graft_rate_limit_per_second: 5.0,
             graft_rate_limit_burst: 15,
             graft_max_retries: 7,
+            maintenance_interval: Duration::from_secs(5),
+            maintenance_jitter: Duration::from_secs(1),
             #[cfg(feature = "metrics")]
             enable_metrics: true,
+            use_hash_ring: false,
         }
     }
 
@@ -203,6 +261,7 @@ impl PlumtreeConfig {
     /// - Conservative optimization to maintain reliability
     pub fn large_cluster() -> Self {
         Self {
+            max_peers: None,
             eager_fanout: 5,
             lazy_fanout: 10,
             ihave_interval: Duration::from_millis(150),
@@ -215,9 +274,33 @@ impl PlumtreeConfig {
             graft_rate_limit_per_second: 10.0,
             graft_rate_limit_burst: 30,
             graft_max_retries: 5,
+            maintenance_interval: Duration::from_secs(3),
+            maintenance_jitter: Duration::from_millis(750),
             #[cfg(feature = "metrics")]
             enable_metrics: true,
+            use_hash_ring: true,
         }
+    }
+
+    /// Set the maximum number of peers (builder pattern).
+    ///
+    /// When set, enables partial mesh topology where the node only
+    /// maintains connections to this many peers. Peers are auto-classified
+    /// as eager or lazy based on `eager_fanout` and `lazy_fanout`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use memberlist_plumtree::PlumtreeConfig;
+    ///
+    /// let config = PlumtreeConfig::default()
+    ///     .with_max_peers(8)      // Limit to 8 peers total
+    ///     .with_eager_fanout(2)   // 2 eager peers
+    ///     .with_lazy_fanout(6);   // 6 lazy peers
+    /// ```
+    pub const fn with_max_peers(mut self, max_peers: usize) -> Self {
+        self.max_peers = Some(max_peers);
+        self
     }
 
     /// Set the eager fanout (builder pattern).
@@ -291,6 +374,37 @@ impl PlumtreeConfig {
     /// Set the maximum Graft retries (builder pattern).
     pub const fn with_graft_max_retries(mut self, retries: u32) -> Self {
         self.graft_max_retries = retries;
+        self
+    }
+
+    /// Set the maintenance interval (builder pattern).
+    ///
+    /// The maintenance loop runs periodically to check and repair the
+    /// topology by promoting lazy peers when eager count drops.
+    pub const fn with_maintenance_interval(mut self, interval: Duration) -> Self {
+        self.maintenance_interval = interval;
+        self
+    }
+
+    /// Set the maintenance jitter (builder pattern).
+    ///
+    /// Random jitter prevents thundering herd effects when multiple nodes
+    /// detect topology degradation simultaneously.
+    pub const fn with_maintenance_jitter(mut self, jitter: Duration) -> Self {
+        self.maintenance_jitter = jitter;
+        self
+    }
+
+    /// Enable or disable hash ring topology (builder pattern).
+    ///
+    /// When enabled, peers are organized in a deterministic hash ring:
+    /// - Adjacent peers (i±1, i±2) form the base connectivity layer
+    /// - Long-range jump links (i±N/4) optimize message propagation
+    /// - Ring neighbors are protected from demotion
+    ///
+    /// This is automatically enabled when using `PlumtreeMemberlist`.
+    pub const fn with_hash_ring(mut self, enable: bool) -> Self {
+        self.use_hash_ring = enable;
         self
     }
 }

@@ -64,11 +64,12 @@ where
 
     /// Run all background tasks.
     pub async fn run(self) {
-        futures::future::join4(
+        futures::future::join5(
             self.run_ihave_scheduler(),
             self.run_graft_timer(),
             self.run_outgoing_processor(),
             self.run_seen_cleanup(),
+            self.run_maintenance_loop(),
         )
         .await;
     }
@@ -88,6 +89,14 @@ where
         self.plumtree.run_seen_cleanup().await;
     }
 
+    /// Run the periodic maintenance loop.
+    ///
+    /// This task checks if eager peer count has dropped below target
+    /// and promotes lazy peers to restore the spanning tree.
+    pub async fn run_maintenance_loop(&self) {
+        self.plumtree.run_maintenance_loop().await;
+    }
+
     /// Run the outgoing message processor with proper unicast delivery.
     pub async fn run_outgoing_processor(&self) {
         while let Some(outgoing) = self.handle.next_outgoing().await {
@@ -104,7 +113,9 @@ where
             } else {
                 // This should not happen in normal operation - all Plumtree messages
                 // after initial broadcast are unicast
-                tracing::warn!("received broadcast message in transport runner - this is unexpected");
+                tracing::warn!(
+                    "received broadcast message in transport runner - this is unexpected"
+                );
             }
         }
     }
@@ -171,11 +182,12 @@ where
     /// It should be spawned as a background task.
     pub async fn run(self) {
         // Run all tasks concurrently
-        futures::future::join4(
+        futures::future::join5(
             self.run_ihave_scheduler(),
             self.run_graft_timer(),
             self.run_outgoing_processor(),
             self.run_seen_cleanup(),
+            self.run_maintenance_loop(),
         )
         .await;
     }
@@ -193,6 +205,11 @@ where
     /// Run the seen map cleanup task.
     pub async fn run_seen_cleanup(&self) {
         self.plumtree.run_seen_cleanup().await;
+    }
+
+    /// Run the periodic maintenance loop.
+    pub async fn run_maintenance_loop(&self) {
+        self.plumtree.run_maintenance_loop().await;
     }
 
     /// Run the outgoing message processor.

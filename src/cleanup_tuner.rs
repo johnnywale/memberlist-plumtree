@@ -215,9 +215,11 @@ impl CleanupConfig {
 
         // Ensure backpressure thresholds are ordered
         self.drop_some_threshold = self.drop_some_threshold.clamp(0.85, 0.99);
-        self.drop_most_threshold = self.drop_most_threshold
+        self.drop_most_threshold = self
+            .drop_most_threshold
             .clamp(self.drop_some_threshold + 0.01, 0.99);
-        self.block_new_threshold = self.block_new_threshold
+        self.block_new_threshold = self
+            .block_new_threshold
             .clamp(self.drop_most_threshold + 0.01, 0.995);
     }
 
@@ -265,7 +267,7 @@ impl CleanupConfig {
         mut self,
         drop_some: f64,
         drop_most: f64,
-        block_new: f64
+        block_new: f64,
     ) -> Self {
         self.drop_some_threshold = drop_some;
         self.drop_most_threshold = drop_most;
@@ -723,7 +725,12 @@ impl CleanupTuner {
     /// * `duration` - How long the cleanup took
     /// * `entries_removed` - Number of entries actually removed/cleaned up
     /// * `params` - The parameters that were used for this cleanup (for tracking)
-    pub fn record_cleanup(&self, duration: Duration, entries_removed: usize, params: &CleanupParameters) {
+    pub fn record_cleanup(
+        &self,
+        duration: Duration,
+        entries_removed: usize,
+        params: &CleanupParameters,
+    ) {
         let mut state = self.state.lock();
 
         // Calculate removal efficiency
@@ -765,7 +772,9 @@ impl CleanupTuner {
     /// This synchronizes the lock-free counter with the rate window state.
     pub fn message_rate(&self) -> f64 {
         let mut state = self.state.lock();
-        state.rate_window.sync_and_calculate_rate(&self.rate_counter)
+        state
+            .rate_window
+            .sync_and_calculate_rate(&self.rate_counter)
     }
 
     /// Force reset the message rate window.
@@ -785,9 +794,15 @@ impl CleanupTuner {
     /// * `current_ttl` - The TTL duration used for cache entries. Cleanup interval
     ///   will be at least `current_ttl / ttl_divisor` to ensure entries are cleaned
     ///   multiple times per TTL period. Default divisor is 4.
-    pub fn get_parameters(&self, cache_utilization: f64, current_ttl: Duration) -> CleanupParameters {
+    pub fn get_parameters(
+        &self,
+        cache_utilization: f64,
+        current_ttl: Duration,
+    ) -> CleanupParameters {
         let mut state = self.state.lock();
-        let message_rate = state.rate_window.sync_and_calculate_rate(&self.rate_counter);
+        let message_rate = state
+            .rate_window
+            .sync_and_calculate_rate(&self.rate_counter);
 
         // Apply hysteresis to prevent threshold flapping
         let high_threshold = if state.was_aggressive {
@@ -839,9 +854,7 @@ impl CleanupTuner {
                         // Extreme pressure: very aggressive cleanup even under high load
                         self.config.min_interval / 2
                     }
-                    BackpressureHint::DropSome => {
-                        self.config.min_interval
-                    }
+                    BackpressureHint::DropSome => self.config.min_interval,
                     BackpressureHint::None => unreachable!(),
                 }
             }
@@ -876,8 +889,8 @@ impl CleanupTuner {
         let min_ttl_interval = if ttl_secs > 0.0 && ttl_secs.is_finite() {
             let raw_interval = ttl_secs / self.config.ttl_divisor;
             // Cap TTL-based interval to prevent huge values
-            let max_ttl_interval = self.config.max_interval.as_secs_f64()
-                * self.config.max_ttl_interval_factor;
+            let max_ttl_interval =
+                self.config.max_interval.as_secs_f64() * self.config.max_ttl_interval_factor;
             Duration::from_secs_f64(raw_interval.min(max_ttl_interval))
         } else {
             Duration::ZERO
@@ -920,8 +933,9 @@ impl CleanupTuner {
             EfficiencyTrend::Stable | EfficiencyTrend::Unknown => 1.0,
         };
 
-        let desired_batch = (state.target_batch_size * duration_ratio * efficiency_factor * trend_factor)
-            .clamp(10.0, 500.0);
+        let desired_batch =
+            (state.target_batch_size * duration_ratio * efficiency_factor * trend_factor)
+                .clamp(10.0, 500.0);
 
         // Apply smoothing to avoid jumpy behavior
         let alpha = self.config.batch_size_smoothing;
@@ -968,7 +982,8 @@ impl CleanupTuner {
             // Very high efficiency - decrease scanning more
             // But cap at 0.8 to avoid too aggressive reduction
             0.85 - (eff - HIGH_EFF).min(0.15) * 0.33
-        }.clamp(0.8, 1.3)
+        }
+        .clamp(0.8, 1.3)
     }
 
     /// Get cleanup statistics.
@@ -995,7 +1010,9 @@ impl CleanupTuner {
             entries_scanned: state.entries_scanned,
             avg_cleanup_duration: avg_duration,
             max_cleanup_duration: state.max_cleanup_duration,
-            current_message_rate: state.rate_window.sync_and_calculate_rate(&self.rate_counter),
+            current_message_rate: state
+                .rate_window
+                .sync_and_calculate_rate(&self.rate_counter),
             aggressive_cleanups: state.aggressive_cleanups,
             avg_removal_efficiency: avg_efficiency,
             recent_efficiency: state.efficiency_ema,
@@ -1230,8 +1247,7 @@ mod tests {
     #[test]
     fn test_efficiency_trend_tracking() {
         // Use a config with higher smoothing for more responsive trends
-        let config = CleanupConfig::default()
-            .with_efficiency_smoothing(0.4); // More responsive
+        let config = CleanupConfig::default().with_efficiency_smoothing(0.4); // More responsive
         let tuner = CleanupTuner::new(config);
 
         // Record enough cleanups to have valid trend data
@@ -1245,12 +1261,19 @@ mod tests {
 
         let stats = tuner.stats();
         // After enough cycles, trend should be determined (not Unknown)
-        assert_ne!(stats.efficiency_trend, EfficiencyTrend::Unknown,
+        assert_ne!(
+            stats.efficiency_trend,
+            EfficiencyTrend::Unknown,
             "Trend should be known after {} cycles (min_cycles={})",
-            stats.cleanup_cycles, tuner.config().min_cycles_for_efficiency);
+            stats.cleanup_cycles,
+            tuner.config().min_cycles_for_efficiency
+        );
         // Recent efficiency should be reasonable (around 0.5)
-        assert!(stats.recent_efficiency > 0.3 && stats.recent_efficiency < 0.7,
-            "Recent efficiency {} should be around 0.5", stats.recent_efficiency);
+        assert!(
+            stats.recent_efficiency > 0.3 && stats.recent_efficiency < 0.7,
+            "Recent efficiency {} should be around 0.5",
+            stats.recent_efficiency
+        );
     }
 
     #[test]
@@ -1276,7 +1299,13 @@ mod tests {
         let params = tuner.get_parameters(0.5, Duration::from_secs(86400 * 30)); // 30 days
 
         // Should be capped by max_interval * max_ttl_interval_factor
-        assert!(params.interval <= tuner.config().max_interval.mul_f64(tuner.config().max_ttl_interval_factor + 0.1));
+        assert!(
+            params.interval
+                <= tuner
+                    .config()
+                    .max_interval
+                    .mul_f64(tuner.config().max_ttl_interval_factor + 0.1)
+        );
     }
 
     #[test]
@@ -1303,13 +1332,13 @@ mod tests {
 
         // Test various efficiency levels
         let test_cases = [
-            (0.05, 1.25..1.35),  // Very low efficiency → increase scan
-            (0.15, 1.10..1.20),  // Low efficiency
-            (0.25, 0.95..1.05),  // At target low
-            (0.40, 0.95..1.05),  // Mid target range
-            (0.60, 0.95..1.05),  // At target high
-            (0.75, 0.85..0.95),  // Above target
-            (0.90, 0.78..0.88),  // Very high efficiency → decrease scan
+            (0.05, 1.25..1.35), // Very low efficiency → increase scan
+            (0.15, 1.10..1.20), // Low efficiency
+            (0.25, 0.95..1.05), // At target low
+            (0.40, 0.95..1.05), // Mid target range
+            (0.60, 0.95..1.05), // At target high
+            (0.75, 0.85..0.95), // Above target
+            (0.90, 0.78..0.88), // Very high efficiency → decrease scan
         ];
 
         for (eff, expected_range) in test_cases {
@@ -1319,7 +1348,9 @@ mod tests {
             assert!(
                 factor >= expected_range.start && factor <= expected_range.end,
                 "Efficiency {}: factor {} not in range {:?}",
-                eff, factor, expected_range
+                eff,
+                factor,
+                expected_range
             );
         }
     }

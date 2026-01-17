@@ -434,7 +434,13 @@ impl PlumtreeDelegate<NodeId> for EnhancedTrackingDelegate {
 
 /// A simulated network with latency, jitter, and enhanced tracking.
 struct EnhancedSimulatedNetwork {
-    nodes: HashMap<NodeId, (Plumtree<NodeId, EnhancedTrackingDelegate>, PlumtreeHandle<NodeId>)>,
+    nodes: HashMap<
+        NodeId,
+        (
+            Plumtree<NodeId, EnhancedTrackingDelegate>,
+            PlumtreeHandle<NodeId>,
+        ),
+    >,
     delegates: HashMap<NodeId, EnhancedTrackingDelegate>,
     stats: Arc<EnhancedStats>,
     latency: Arc<LatencySimulator>,
@@ -475,13 +481,14 @@ impl EnhancedSimulatedNetwork {
         self.nodes.get(&id).map(|(p, _)| p)
     }
 
+    /// Uses add_peer_lazy so tree forms naturally via Graft mechanism.
     fn setup_full_mesh(&self) {
         let node_ids: Vec<_> = self.nodes.keys().cloned().collect();
         for &id in &node_ids {
             if let Some((plumtree, _)) = self.nodes.get(&id) {
                 for &other_id in &node_ids {
                     if id != other_id {
-                        plumtree.add_peer(other_id);
+                        plumtree.add_peer_lazy(other_id);
                     }
                 }
             }
@@ -506,12 +513,12 @@ impl EnhancedSimulatedNetwork {
         let delegate = EnhancedTrackingDelegate::new(id, self.stats.clone());
         let (plumtree, handle) = Plumtree::new(id, config, delegate.clone());
 
-        // Add all existing alive nodes as peers
+        // Add all existing alive nodes as peers (lazy so tree forms via Graft)
         for &peer_id in &self.alive {
-            plumtree.add_peer(peer_id);
+            plumtree.add_peer_lazy(peer_id);
             // Also add this node to existing peers
             if let Some((peer_plumtree, _)) = self.nodes.get(&peer_id) {
-                peer_plumtree.add_peer(id);
+                peer_plumtree.add_peer_lazy(id);
             }
         }
 
@@ -551,14 +558,13 @@ impl EnhancedSimulatedNetwork {
         let mut processed = 0;
 
         // First, collect outgoing messages and queue them with latency
+        // Use non-blocking try_next_outgoing() to avoid timeout overhead
         for (&from_id, (_, handle)) in &self.nodes {
             if !self.is_alive(from_id) {
                 continue;
             }
 
-            while let Ok(Some(out)) =
-                tokio::time::timeout(Duration::from_millis(1), handle.next_outgoing()).await
-            {
+            while let Some(out) = handle.try_next_outgoing() {
                 if let Some(target) = out.target {
                     if !self.is_alive(target) {
                         continue;
@@ -575,7 +581,8 @@ impl EnhancedSimulatedNetwork {
                         _ => 0,
                     };
 
-                    self.latency.queue_message(from_id, target, out.message, hops);
+                    self.latency
+                        .queue_message(from_id, target, out.message, hops);
                 }
             }
         }
@@ -593,10 +600,7 @@ impl EnhancedSimulatedNetwork {
                     self.stats.record_gossip();
                     // Update hop count for this node
                     let mut msg_hops = self.message_hops.lock();
-                    msg_hops
-                        .entry(*id)
-                        .or_default()
-                        .insert(msg.to, msg.hops);
+                    msg_hops.entry(*id).or_default().insert(msg.to, msg.hops);
 
                     // Update delegate with hop count
                     if let Some(delegate) = self.delegates.get(&msg.to) {
@@ -882,7 +886,8 @@ async fn test_cache_stress() {
     }
 
     // Calculate statistics
-    let avg_delivery = delivered_counts.iter().sum::<usize>() as f64 / delivered_counts.len() as f64;
+    let avg_delivery =
+        delivered_counts.iter().sum::<usize>() as f64 / delivered_counts.len() as f64;
     let min_delivery = *delivered_counts.iter().min().unwrap_or(&0);
     let expected = 14; // 15 nodes - 1 sender
 
@@ -891,7 +896,10 @@ async fn test_cache_stress() {
     println!("  Minimum deliveries: {}/{}", min_delivery, expected);
     println!("  Total Gossip: {}", network.stats().gossip_count());
     println!("  Total Graft: {}", network.stats().graft_count());
-    println!("  Control Overhead: {:.2}", network.stats().control_overhead());
+    println!(
+        "  Control Overhead: {:.2}",
+        network.stats().control_overhead()
+    );
 
     // Memory/performance should remain stable
     // Average delivery should stay high even under cache pressure
@@ -1152,7 +1160,10 @@ async fn test_enhanced_protocol_validation() {
 
     let avg_ldh = phase2_ldh_sum as f64 / phase2_ldh_count.max(1) as f64;
     let optimal_ldh = (30.0_f64).log2().ceil();
-    println!("  Average LDH: {:.2} (optimal ≈ {:.0})", avg_ldh, optimal_ldh);
+    println!(
+        "  Average LDH: {:.2} (optimal ≈ {:.0})",
+        avg_ldh, optimal_ldh
+    );
 
     // Phase 3: Churn Recovery
     println!("\n--- Phase 3: Churn Recovery ---");
@@ -1188,9 +1199,15 @@ async fn test_enhanced_protocol_validation() {
 
     // Summary
     println!("\n=== Summary ===");
-    println!("Phase 1 (Construction): {:.1}% reliability", phase1_reliability);
+    println!(
+        "Phase 1 (Construction): {:.1}% reliability",
+        phase1_reliability
+    );
     println!("Phase 2 (Steady State): Avg LDH = {:.2}", avg_ldh);
-    println!("Phase 3 (Recovery): {:.1}% reliability", recovery_reliability);
+    println!(
+        "Phase 3 (Recovery): {:.1}% reliability",
+        recovery_reliability
+    );
 
     // Assertions
     assert!(

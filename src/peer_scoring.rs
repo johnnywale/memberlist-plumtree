@@ -130,11 +130,11 @@ impl ScoringConfig {
     /// Configuration for WAN environments (more stable).
     pub fn wan() -> Self {
         Self {
-            ema_alpha: 0.2,                            // More stable
+            ema_alpha: 0.2,                           // More stable
             max_sample_age: Duration::from_secs(600), // 10 minutes
             initial_rtt_estimate: Duration::from_millis(200),
             min_samples: 5,
-            loss_penalty: 1.5, // Lower penalty (some loss is normal)
+            loss_penalty: 1.5,              // Lower penalty (some loss is normal)
             failure_decay_halflife: 3600.0, // 1 hour (slower recovery)
             rtt_score_exponent: 1.15,
             rtt_score_floor: 20.0, // Higher floor for WAN
@@ -174,8 +174,8 @@ impl ScoringConfig {
     /// Compute base score for a given RTT.
     #[inline]
     fn compute_base_score(&self, rtt_ms: f64) -> f64 {
-        let rtt_adjusted = (rtt_ms.max(MIN_RTT_MS) + self.rtt_score_floor)
-            .powf(self.rtt_score_exponent);
+        let rtt_adjusted =
+            (rtt_ms.max(MIN_RTT_MS) + self.rtt_score_floor).powf(self.rtt_score_exponent);
         SCORE_SCALE / rtt_adjusted
     }
 }
@@ -245,7 +245,8 @@ impl PeerScore {
             self.rtt_max_ms = rtt_ms;
         } else {
             // Exponential moving average
-            self.rtt_ema_ms = config.ema_alpha * rtt_ms + (1.0 - config.ema_alpha) * self.rtt_ema_ms;
+            self.rtt_ema_ms =
+                config.ema_alpha * rtt_ms + (1.0 - config.ema_alpha) * self.rtt_ema_ms;
             self.rtt_min_ms = self.rtt_min_ms.min(rtt_ms);
             self.rtt_max_ms = self.rtt_max_ms.max(rtt_ms);
         }
@@ -500,14 +501,15 @@ impl<I: Clone + Eq + Hash + Ord> PeerScoring<I> {
     pub fn stats(&self) -> ScoringStats {
         let scores = self.scores.read();
         let total = scores.len();
-        let reliable = scores.values().filter(|s| s.is_reliable(&self.config)).count();
+        let reliable = scores
+            .values()
+            .filter(|s| s.is_reliable(&self.config))
+            .count();
         let stale = scores.values().filter(|s| s.is_stale(&self.config)).count();
 
         let (avg_rtt, avg_score) = if total > 0 {
             let sum_rtt: f64 = scores.values().map(|s| s.rtt_ema_ms).sum();
-            let sum_score: f64 = scores.values()
-                .map(|s| s.current_score(&self.config))
-                .sum();
+            let sum_score: f64 = scores.values().map(|s| s.current_score(&self.config)).sum();
             (sum_rtt / total as f64, sum_score / total as f64)
         } else {
             (0.0, 0.0)
@@ -700,8 +702,12 @@ mod tests {
         let score_after = scoring.get_score(&1).unwrap();
         let loss_after = score_after.loss_rate(&scoring.config);
 
-        assert!(loss_after < loss_before,
-            "Loss rate should decrease over time: before={}, after={}", loss_before, loss_after);
+        assert!(
+            loss_after < loss_before,
+            "Loss rate should decrease over time: before={}, after={}",
+            loss_before,
+            loss_after
+        );
     }
 
     #[test]
@@ -796,7 +802,10 @@ mod tests {
         // Effective weight should be close to 3.0 (may be slightly less due to minimal decay)
         // With default half-life of 1800s, decay over a few ms is negligible but nonzero
         let effective = score.effective_failure_weight(&scoring.config);
-        assert!(effective >= 2.99 && effective <= 3.01,
-            "Effective failure weight {} should be approximately 3.0", effective);
+        assert!(
+            effective >= 2.99 && effective <= 3.01,
+            "Effective failure weight {} should be approximately 3.0",
+            effective
+        );
     }
 }

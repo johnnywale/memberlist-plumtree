@@ -253,10 +253,7 @@ mod tests {
         peers.insert(1u64, "192.168.1.10:9000".parse().unwrap());
         peers.insert(2u64, "192.168.1.11:9000".parse().unwrap());
 
-        let resolver = MapPeerResolver::with_peers(
-            "127.0.0.1:9000".parse().unwrap(),
-            peers,
-        );
+        let resolver = MapPeerResolver::with_peers("127.0.0.1:9000".parse().unwrap(), peers);
 
         assert_eq!(resolver.peer_count(), 2);
         assert!(resolver.contains(&1));

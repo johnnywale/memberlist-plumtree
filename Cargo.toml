@@ -20,7 +20,7 @@ default = []
 tokio = ["agnostic-io/tokio", "memberlist-core/tokio"]
 metrics = ["dep:metrics"]
 serde = ["dep:serde"]
-quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:webpki-roots", "dep:rustls-pemfile"]
+quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:webpki-roots", "dep:rustls-pemfile", "dep:thiserror", "dep:tokio"]
 
 [dependencies]
 
@@ -37,6 +37,7 @@ metrics = { version = "0.24", optional = true }
 serde = { version = "1", optional = true }
 nodecraft = { version = "0.8", features = ["default", "async", "agnostic", "resolver"] }
 parking_lot = { version = "0.12", features = ["send_guard"] }
+siphasher = "1"
 
 
 # Optional
@@ -47,26 +48,44 @@ crossbeam-queue = "0.3"
 # QUIC transport (optional)
 quinn = { version = "0.11", optional = true, default-features = false, features = ["runtime-tokio", "rustls", "ring"] }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }
-rcgen = { version = "0.13", optional = true }
-webpki-roots = { version = "0.26", optional = true }
+rcgen = { version = "0.14", optional = true }
+webpki-roots = { version = "1", optional = true }
 rustls-pemfile = { version = "2", optional = true }
+thiserror = { version = "2", optional = true }
+# Tokio is used directly for QUIC transport (spawn_blocking, background tasks)
+tokio = { version = "1", optional = true, default-features = false, features = ["rt", "time", "sync"] }
 
 
 # Runtime-agnostic timer
 futures-timer = "3"
 smallvec = "1.15.1"
 rand = "0.9.2"
+stable-hash = "0.4.3"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["full"] }
+# For tests, use full features but the same version as the optional dep
+tokio = { version = "1", features = ["full", "rt", "time", "sync"] }
+crossterm = "0.29"
 
-[[example]]
-name = "chat"
-path = "examples/chat.rs"
+# Web dependencies for web-chat example
+axum = { version = "0.7", features = ["ws"] }
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+serde_json = "1"
+
+# E2E testing with real memberlist
+memberlist = { version = "0.7", features = ["tcp", "tokio"] }
+smol_str = "0.2"
+generic-array = "1"
+typenum = "1"
+
 
 [[example]]
 name = "pubsub"
 path = "examples/pubsub.rs"
+
+[[example]]
+name = "web-chat"
+path = "examples/web_chat.rs"
 
 
 [lints.rust]

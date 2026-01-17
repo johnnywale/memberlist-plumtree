@@ -24,6 +24,12 @@ pub const DEFAULT_ALPN: &[u8] = b"plumtree/1";
 ///
 /// If custom certificates are provided, they will be loaded from disk.
 /// Otherwise, a self-signed certificate will be generated.
+///
+/// **Note**: If generating self-signed certificates, this performs CPU-intensive
+/// cryptographic operations. For async contexts, prefer [`server_config_async`].
+///
+/// This synchronous version is provided for non-async initialization scenarios.
+#[allow(dead_code)]
 pub fn server_config(tls: &TlsConfig) -> Result<quinn::ServerConfig, QuicError> {
     let (cert_chain, private_key) = if tls.has_custom_certs() {
         load_certs_and_key(tls)?
@@ -31,6 +37,29 @@ pub fn server_config(tls: &TlsConfig) -> Result<quinn::ServerConfig, QuicError> 
         generate_self_signed()?
     };
 
+    build_server_config(tls, cert_chain, private_key)
+}
+
+/// Build a QUIC server configuration from TLS settings (async version).
+///
+/// This function offloads self-signed certificate generation to a blocking
+/// thread pool, preventing it from blocking async worker threads.
+pub async fn server_config_async(tls: &TlsConfig) -> Result<quinn::ServerConfig, QuicError> {
+    let (cert_chain, private_key) = if tls.has_custom_certs() {
+        load_certs_and_key(tls)?
+    } else {
+        generate_self_signed_async().await?
+    };
+
+    build_server_config(tls, cert_chain, private_key)
+}
+
+/// Internal helper to build server config from certs.
+fn build_server_config(
+    tls: &TlsConfig,
+    cert_chain: Vec<CertificateDer<'static>>,
+    private_key: PrivateKeyDer<'static>,
+) -> Result<quinn::ServerConfig, QuicError> {
     let mut crypto = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(cert_chain, private_key)
@@ -184,15 +213,37 @@ fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, QuicError> {
 }
 
 /// Generate a self-signed certificate for development.
+///
+/// **Note**: This function performs CPU-intensive cryptographic operations.
+/// For use in async contexts, prefer [`generate_self_signed_async`] which
+/// offloads the work to a blocking thread pool.
 pub fn generate_self_signed(
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), QuicError> {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+    let certified_key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
         .map_err(|e| QuicError::Certificate(format!("failed to generate cert: {}", e)))?;
 
-    let cert_der = CertificateDer::from(cert.cert);
-    let key_der = PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
+    let cert_der = CertificateDer::from(certified_key.cert);
+    let key_der = PrivateKeyDer::Pkcs8(certified_key.signing_key.serialize_der().into());
 
     Ok((vec![cert_der], key_der))
+}
+
+/// Generate a self-signed certificate for development (async version).
+///
+/// This function offloads the CPU-intensive certificate generation to a
+/// blocking thread pool, preventing it from blocking async worker threads.
+///
+/// # Example
+///
+/// ```ignore
+/// let (certs, key) = generate_self_signed_async().await?;
+/// ```
+pub async fn generate_self_signed_async(
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), QuicError> {
+    // Offload CPU-intensive crypto work to the blocking thread pool
+    tokio::task::spawn_blocking(generate_self_signed)
+        .await
+        .map_err(|e| QuicError::Internal(format!("spawn_blocking failed: {}", e)))?
 }
 
 /// Server verifier that accepts any certificate.

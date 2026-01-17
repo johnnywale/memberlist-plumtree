@@ -474,11 +474,8 @@ impl<I: Clone + Send + Sync + 'static> GraftTimer<I> {
 
         // Collect expired timeout keys - only iterate over times <= now
         // This is O(K) where K is the number of expired time buckets
-        let expired_times: Vec<std::time::Instant> = inner
-            .timeouts
-            .range(..=now)
-            .map(|(t, _)| *t)
-            .collect();
+        let expired_times: Vec<std::time::Instant> =
+            inner.timeouts.range(..=now).map(|(t, _)| *t).collect();
 
         // Collect updates to apply after processing (to avoid borrow issues)
         let mut to_reschedule: Vec<(MessageId, std::time::Instant)> = Vec::new();

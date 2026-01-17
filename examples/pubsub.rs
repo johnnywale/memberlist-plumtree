@@ -97,8 +97,7 @@ impl PubSubMessage {
         // Simple encoding: topic_len|topic|publisher|sequence|timestamp|payload
         let topic_bytes = self.topic.0.as_bytes();
 
-        let mut buf =
-            Vec::with_capacity(2 + topic_bytes.len() + 8 + 8 + 8 + self.payload.len());
+        let mut buf = Vec::with_capacity(2 + topic_bytes.len() + 8 + 8 + 8 + self.payload.len());
 
         // Topic
         buf.extend_from_slice(&(topic_bytes.len() as u16).to_be_bytes());

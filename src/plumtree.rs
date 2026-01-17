@@ -30,6 +30,7 @@ use crate::{
     peer_state::{PeerState, SharedPeerState},
     rate_limiter::RateLimiter,
     scheduler::{GraftTimer, IHaveScheduler, PendingIHave},
+    PeerStateBuilder,
 };
 
 /// Number of shards for the seen map.
@@ -157,7 +158,11 @@ impl<I: Clone> ShardedSeenMap<I> {
     /// Returns (is_duplicate, receive_count, evicted_count).
     ///
     /// If the shard exceeds capacity, emergency eviction removes the oldest entries.
-    async fn check_and_mark_seen(&self, id: MessageId, entry_fn: impl FnOnce() -> SeenEntry<I>) -> (bool, u32, usize) {
+    async fn check_and_mark_seen(
+        &self,
+        id: MessageId,
+        entry_fn: impl FnOnce() -> SeenEntry<I>,
+    ) -> (bool, u32, usize) {
         let idx = self.shard_index(&id);
         let mut shard = self.shards[idx].write().await;
 
@@ -207,7 +212,12 @@ impl<I: Clone> ShardedSeenMap<I> {
 
     /// Clean up expired entries from one shard.
     /// Returns the number of entries removed.
-    async fn cleanup_shard(&self, shard_idx: usize, now: std::time::Instant, ttl: std::time::Duration) -> usize {
+    async fn cleanup_shard(
+        &self,
+        shard_idx: usize,
+        now: std::time::Instant,
+        ttl: std::time::Duration,
+    ) -> usize {
         let mut shard = self.shards[shard_idx].write().await;
         let before = shard.len();
         shard.retain(|_, entry| now.duration_since(entry.seen_at) < ttl);
@@ -535,8 +545,20 @@ where
             config.graft_rate_limit_per_second,
         );
 
+        // Create peer state with or without hash ring topology
+        let peers = if config.use_hash_ring {
+            Arc::new(
+                PeerStateBuilder::new()
+                    .use_hash_ring(true)
+                    .with_local_id(local_id.clone())
+                    .build(),
+            )
+        } else {
+            Arc::new(PeerState::new())
+        };
+
         let inner = Arc::new(PlumtreeInner {
-            peers: Arc::new(PeerState::new()),
+            peers,
             cache: Arc::new(MessageCache::new(
                 config.message_cache_ttl,
                 config.message_cache_max_size,
@@ -698,16 +720,49 @@ where
             .build()
     }
 
-    /// Add a peer (joins as lazy initially).
-    pub fn add_peer(&self, peer: I) {
+    /// Add a peer with automatic classification.
+    ///
+    /// The peer is automatically classified as eager or lazy based on
+    /// the current state and configuration:
+    /// - If `max_peers` is set and the limit is reached, the peer is rejected
+    /// - If the eager set is below `eager_fanout`, the peer joins as eager
+    /// - Otherwise, the peer joins as lazy
+    ///
+    /// Returns the result of the add operation.
+    pub fn add_peer(&self, peer: I) -> crate::peer_state::AddPeerResult {
+        use crate::peer_state::AddPeerResult;
+
+        if peer == self.inner.local_id {
+            return AddPeerResult::AlreadyExists;
+        }
+
+        self.inner.peers.add_peer_auto(
+            peer,
+            self.inner.config.max_peers,
+            self.inner.config.eager_fanout,
+        )
+    }
+
+    /// Add a peer to the lazy set only (traditional behavior).
+    ///
+    /// New peers always start as lazy. They are promoted to eager
+    /// via the Graft mechanism if needed.
+    ///
+    /// This bypasses the `max_peers` limit check and auto-classification.
+    pub fn add_peer_lazy(&self, peer: I) {
         if peer != self.inner.local_id {
             self.inner.peers.add_peer(peer);
         }
     }
 
     /// Remove a peer.
+    ///
+    /// Removes the peer from both the topology state (eager/lazy sets) and
+    /// the scoring state (RTT, failure counts) to prevent memory leaks.
     pub fn remove_peer(&self, peer: &I) {
         self.inner.peers.remove_peer(peer);
+        // Clean up scoring data to free memory for departed peers
+        self.inner.peer_scoring.remove_peer(peer);
     }
 
     /// Broadcast a message to all nodes.
@@ -749,15 +804,18 @@ where
         self.inner.cache.insert(msg_id, payload.clone());
 
         // Mark as seen (no parent since we originated this message)
-        self.inner.seen.insert(
-            msg_id,
-            SeenEntry {
-                round,
-                receive_count: 1,
-                seen_at: std::time::Instant::now(),
-                parent: None, // We originated this message
-            },
-        ).await;
+        self.inner
+            .seen
+            .insert(
+                msg_id,
+                SeenEntry {
+                    round,
+                    receive_count: 1,
+                    seen_at: std::time::Instant::now(),
+                    parent: None, // We originated this message
+                },
+            )
+            .await;
 
         // Send to eager peers with backpressure handling
         let eager_peers = self.inner.peers.eager_peers();
@@ -875,15 +933,16 @@ where
         }
 
         // Check if already seen and track parent atomically (single shard lock)
-        let (is_duplicate, receive_count, evicted) = self.inner.seen.check_and_mark_seen(
-            msg_id,
-            || SeenEntry {
+        let (is_duplicate, receive_count, evicted) = self
+            .inner
+            .seen
+            .check_and_mark_seen(msg_id, || SeenEntry {
                 round,
                 receive_count: 1,
                 seen_at: std::time::Instant::now(),
                 parent: Some(from.clone()), // Track who delivered this message
-            }
-        ).await;
+            })
+            .await;
 
         if evicted > 0 {
             debug!(
@@ -916,7 +975,10 @@ where
                     let _ = self
                         .inner
                         .outgoing_tx
-                        .send(OutgoingMessage::unicast(from.clone(), PlumtreeMessage::Prune))
+                        .send(OutgoingMessage::unicast(
+                            from.clone(),
+                            PlumtreeMessage::Prune,
+                        ))
                         .await;
                     self.inner.delegate.on_prune_sent(&from);
 
@@ -1142,8 +1204,14 @@ where
             // Periodically update batch size from adaptive batcher
             if last_batch_size_update.elapsed() >= batch_size_update_interval {
                 let recommended_size = self.inner.adaptive_batcher.recommended_batch_size();
-                self.inner.scheduler.queue().set_flush_threshold(recommended_size);
-                trace!(batch_size = recommended_size, "updated IHave batch size from adaptive batcher");
+                self.inner
+                    .scheduler
+                    .queue()
+                    .set_flush_threshold(recommended_size);
+                trace!(
+                    batch_size = recommended_size,
+                    "updated IHave batch size from adaptive batcher"
+                );
                 last_batch_size_update = std::time::Instant::now();
             }
 
@@ -1254,7 +1322,9 @@ where
                     "Graft failed after max retries - penalizing peer"
                 );
                 // Record failure in peer scoring to penalize unresponsive peers
-                self.inner.peer_scoring.record_failure(&failed_graft.original_peer);
+                self.inner
+                    .peer_scoring
+                    .record_failure(&failed_graft.original_peer);
                 // Record failure for adaptive batcher to adjust batch sizes
                 self.inner.adaptive_batcher.record_graft_timeout();
                 self.inner
@@ -1322,10 +1392,7 @@ where
             (&mut interval).await;
 
             // Get current utilization for tuning
-            let utilization = self
-                .seen_map_stats()
-                .map(|s| s.utilization)
-                .unwrap_or(0.0);
+            let utilization = self.seen_map_stats().map(|s| s.utilization).unwrap_or(0.0);
 
             // Get tuned parameters based on current state
             let params = tuner.get_parameters(utilization, ttl);
@@ -1390,6 +1457,104 @@ where
         }
     }
 
+    /// Run the periodic topology maintenance loop.
+    ///
+    /// This background task periodically checks if the eager peer count has
+    /// dropped below `eager_fanout` and promotes lazy peers to restore the
+    /// spanning tree. This is critical for automatic recovery from node failures.
+    ///
+    /// The loop includes random jitter to prevent "thundering herd" effects
+    /// when multiple nodes detect topology degradation simultaneously.
+    ///
+    /// This should be spawned as a background task.
+    #[instrument(skip(self), name = "maintenance_loop")]
+    pub async fn run_maintenance_loop(&self)
+    where
+        I: Clone + Eq + std::hash::Hash + std::fmt::Debug,
+    {
+        use rand::Rng;
+
+        let interval = self.inner.config.maintenance_interval;
+        let jitter = self.inner.config.maintenance_jitter;
+
+        // Skip if maintenance is disabled
+        if interval.is_zero() {
+            info!("maintenance loop disabled (interval=0)");
+            return;
+        }
+
+        info!(
+            interval_ms = interval.as_millis(),
+            jitter_ms = jitter.as_millis(),
+            "topology maintenance loop started"
+        );
+
+        loop {
+            if self.inner.shutdown.load(Ordering::Acquire) {
+                info!("maintenance loop shutting down");
+                break;
+            }
+
+            // Add random jitter to prevent thundering herd
+            let jitter_duration = if !jitter.is_zero() {
+                let jitter_ms = rand::rng().random_range(0..jitter.as_millis() as u64);
+                std::time::Duration::from_millis(jitter_ms)
+            } else {
+                std::time::Duration::ZERO
+            };
+
+            // Wait for interval + jitter
+            Delay::new(interval + jitter_duration).await;
+
+            // Check for shutdown after waking
+            if self.inner.shutdown.load(Ordering::Acquire) {
+                break;
+            }
+
+            // Check if repair is needed
+            let target_eager = self.inner.config.eager_fanout;
+            if self.inner.peers.needs_repair(target_eager) {
+                let stats_before = self.inner.peers.stats();
+
+                // Try non-blocking rebalance first to avoid contention
+                if self.inner.peers.try_rebalance(target_eager) {
+                    let stats_after = self.inner.peers.stats();
+                    let promoted = stats_after
+                        .eager_count
+                        .saturating_sub(stats_before.eager_count);
+
+                    if promoted > 0 {
+                        info!(
+                            promoted = promoted,
+                            eager_before = stats_before.eager_count,
+                            eager_after = stats_after.eager_count,
+                            lazy_count = stats_after.lazy_count,
+                            target = target_eager,
+                            "topology repair: promoted lazy peers to eager"
+                        );
+
+                        #[cfg(feature = "metrics")]
+                        for _ in 0..promoted {
+                            crate::metrics::record_peer_promotion();
+                        }
+                    }
+                } else {
+                    // Lock was contended, will retry next cycle
+                    trace!("maintenance: lock contended, will retry");
+                }
+            }
+
+            // Update metrics
+            #[cfg(feature = "metrics")]
+            {
+                let stats = self.inner.peers.stats();
+                crate::metrics::set_eager_peers(stats.eager_count);
+                crate::metrics::set_lazy_peers(stats.lazy_count);
+                crate::metrics::set_total_peers(stats.eager_count + stats.lazy_count);
+            }
+        }
+    }
+
     /// Shutdown the Plumtree instance.
     pub fn shutdown(&self) {
         self.inner.shutdown.store(true, Ordering::Release);
@@ -1438,6 +1603,14 @@ impl<I> PlumtreeHandle<I> {
     /// Get the next outgoing message to send.
     pub async fn next_outgoing(&self) -> Option<OutgoingMessage<I>> {
         self.outgoing_rx.recv().await.ok()
+    }
+
+    /// Try to get the next outgoing message without blocking.
+    ///
+    /// Returns `Some(message)` if a message is available, `None` otherwise.
+    /// This is useful for non-blocking polling in tests and simulations.
+    pub fn try_next_outgoing(&self) -> Option<OutgoingMessage<I>> {
+        self.outgoing_rx.try_recv().ok()
     }
 
     /// Submit an incoming message for processing.
@@ -1588,7 +1761,8 @@ mod tests {
         let (plumtree, _handle) =
             Plumtree::new(TestNodeId(1), PlumtreeConfig::default(), delegate.clone());
 
-        plumtree.add_peer(TestNodeId(2));
+        // Use add_peer_lazy to test promotion from lazy to eager
+        plumtree.add_peer_lazy(TestNodeId(2));
 
         // Peer starts as lazy
         assert!(plumtree.inner.peers.is_lazy(&TestNodeId(2)));

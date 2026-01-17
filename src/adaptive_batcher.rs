@@ -342,7 +342,9 @@ impl BatcherState {
     fn reset_window(&mut self) {
         // Preserve totals
         self.total_ihaves = self.total_ihaves.saturating_add(self.ihaves_sent);
-        self.total_grafts_success = self.total_grafts_success.saturating_add(self.grafts_success);
+        self.total_grafts_success = self
+            .total_grafts_success
+            .saturating_add(self.grafts_success);
         self.total_grafts_failed = self.total_grafts_failed.saturating_add(self.grafts_failed);
 
         // Reset window counters
@@ -621,12 +623,17 @@ impl AdaptiveBatcher {
 
         BatcherStats {
             ihaves_sent: state.total_ihaves.saturating_add(state.ihaves_sent),
-            grafts_total: state.total_grafts_success
+            grafts_total: state
+                .total_grafts_success
                 .saturating_add(state.total_grafts_failed)
                 .saturating_add(state.grafts_success)
                 .saturating_add(state.grafts_failed),
-            grafts_success: state.total_grafts_success.saturating_add(state.grafts_success),
-            grafts_failed: state.total_grafts_failed.saturating_add(state.grafts_failed),
+            grafts_success: state
+                .total_grafts_success
+                .saturating_add(state.grafts_success),
+            grafts_failed: state
+                .total_grafts_failed
+                .saturating_add(state.grafts_failed),
             graft_success_rate,
             avg_latency: Duration::from_secs_f64(state.latency_ema_ms / 1000.0),
             current_batch_size: state.current_batch_size,
@@ -1046,15 +1053,15 @@ mod tests {
 
         // After reset, new latency should have more impact
         assert!(
-            (latency_after.as_millis() as i64 - 5).abs() < (latency_before.as_millis() as i64 - 5).abs(),
+            (latency_after.as_millis() as i64 - 5).abs()
+                < (latency_before.as_millis() as i64 - 5).abs(),
             "EMA reset should make new samples more impactful"
         );
     }
 
     #[test]
     fn test_window_reset() {
-        let config = BatcherConfig::default()
-            .with_observation_window(Duration::from_millis(100));
+        let config = BatcherConfig::default().with_observation_window(Duration::from_millis(100));
         let batcher = AdaptiveBatcher::new(config);
 
         // Record some data
@@ -1070,7 +1077,10 @@ mod tests {
 
         // Check that window counters are in totals
         let stats = batcher.stats();
-        assert!(stats.ihaves_sent >= 50, "Window data should be preserved in totals");
+        assert!(
+            stats.ihaves_sent >= 50,
+            "Window data should be preserved in totals"
+        );
     }
 
     #[test]
@@ -1119,7 +1129,10 @@ mod tests {
 
         // Should scale up but be capped reasonably (logarithmic + 1.8x cap)
         assert!(batch_size > 16, "High throughput should increase batch");
-        assert!(batch_size <= 64, "Logarithmic scaling should prevent excessive growth");
+        assert!(
+            batch_size <= 64,
+            "Logarithmic scaling should prevent excessive growth"
+        );
     }
 
     #[test]

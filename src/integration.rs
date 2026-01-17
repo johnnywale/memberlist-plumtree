@@ -200,19 +200,23 @@ const PLUMTREE_MAGIC: u8 = 0x50;
 
 /// Outgoing broadcast envelope (unencooded).
 ///
-/// Used internally to defer serialization until the message is actually
-/// sent over the network, reducing unnecessary allocations.
+/// This represents a Plumtree message that should be broadcast to all cluster
+/// members via memberlist's gossip/broadcast mechanism.
+///
+/// Use [`encode()`](Self::encode) to serialize for network transmission.
 #[derive(Debug, Clone)]
-pub(crate) struct BroadcastEnvelope<I> {
+pub struct BroadcastEnvelope<I> {
     /// Sender's node ID (included in envelope for protocol operation).
-    sender: I,
+    pub sender: I,
     /// The Plumtree protocol message.
-    message: PlumtreeMessage,
+    pub message: PlumtreeMessage,
 }
 
 impl<I: IdCodec> BroadcastEnvelope<I> {
     /// Encode this envelope for network transmission.
-    fn encode(&self) -> Bytes {
+    ///
+    /// Returns bytes that can be passed to memberlist's broadcast API.
+    pub fn encode(&self) -> Bytes {
         encode_plumtree_envelope(&self.sender, &self.message)
     }
 }
@@ -243,57 +247,61 @@ impl<I: IdCodec> UnicastEnvelope<I> {
 /// Wraps a memberlist instance and provides efficient O(n) broadcast
 /// via the Plumtree protocol while using memberlist for membership.
 ///
-/// # Recommended Usage
+/// # Recommended Usage (High-Performance Integration)
 ///
-/// Use [`run_with_transport`](Self::run_with_transport) which handles unicast
-/// delivery automatically and prevents common mistakes:
-///
-/// ```ignore
-/// use memberlist_plumtree::{PlumtreeMemberlist, PlumtreeConfig, NoopDelegate, Transport};
-///
-/// // Implement Transport for your memberlist
-/// struct MyTransport { memberlist: Memberlist }
-/// impl Transport<NodeId> for MyTransport {
-///     type Error = MyError;
-///     async fn send_to(&self, target: &NodeId, data: Bytes) -> Result<(), Self::Error> {
-///         self.memberlist.send_reliable(target, data).await
-///     }
-/// }
-///
-/// let pm = PlumtreeMemberlist::new(local_id, PlumtreeConfig::lan(), NoopDelegate);
-/// let transport = MyTransport { memberlist };
-///
-/// // Run with automatic unicast handling (recommended!)
-/// tokio::spawn(async move {
-///     pm.run_with_transport(transport).await;
-/// });
-///
-/// // Only need to handle broadcast messages for gossip
-/// let broadcast_rx = pm.outgoing_receiver();
-/// tokio::spawn(async move {
-///     while let Ok(msg) = broadcast_rx.recv().await {
-///         memberlist.broadcast(msg).await;
-///     }
-/// });
-/// ```
-///
-/// # Manual Unicast Handling (Advanced)
-///
-/// If you need more control, you can use [`run`](Self::run) and manually handle
-/// unicast messages from [`unicast_receiver`](Self::unicast_receiver). However,
-/// **failing to process unicast messages will break the protocol**.
+/// For production, it is recommended to combine Plumtree with a reliable unicast
+/// transport (like QUIC) and a pooling layer for backpressure control.
 ///
 /// ```ignore
-/// // Only use this if you have a specific reason!
-/// tokio::spawn(pm.run());
+/// use memberlist_plumtree::{
+///     PlumtreeMemberlist, PlumtreeConfig, NoopDelegate,
+///     QuicTransport, QuicConfig, PooledTransport, PoolConfig,
+///     MapPeerResolver, decode_plumtree_envelope
+/// };
+/// use std::sync::Arc;
 ///
-/// // You MUST handle unicast messages yourself
-/// let unicast_rx = pm.unicast_receiver();
+/// // 1. Setup QUIC Transport with Connection Pooling
+/// // MapPeerResolver maps Node IDs to actual Socket Addresses
+/// let resolver = Arc::new(MapPeerResolver::new(local_addr));
+/// let quic_transport = QuicTransport::new(QuicConfig::default(), resolver, quinn_endpoint);
+///
+/// // 2. Wrap with PooledTransport for Concurrency & Queueing control
+/// let pool_config = PoolConfig::default()
+///     .with_max_concurrent_global(100)
+///     .with_max_queue_per_peer(512);
+/// let transport = PooledTransport::new(quic_transport, pool_config);
+///
+/// // 3. Initialize PlumtreeMemberlist
+/// let pm = Arc::new(PlumtreeMemberlist::new(local_id, PlumtreeConfig::lan(), NoopDelegate));
+///
+/// // 4. Start the runners
+/// // run_with_transport automatically drives the internal PlumtreeRunner (runner.rs)
+/// // and pumps Unicast messages (Graft/Prune) through your PooledTransport.
+/// let pm_run = pm.clone();
+/// let transport_clone = transport.clone();
 /// tokio::spawn(async move {
-///     while let Ok((target, msg)) = unicast_rx.recv().await {
-///         memberlist.send_to(&target, msg).await; // REQUIRED!
+///     pm_run.run_with_transport(transport_clone).await
+/// });
+///
+/// // Handle incoming message processor
+/// let pm_proc = pm.clone();
+/// tokio::spawn(async move { pm_proc.run_incoming_processor().await });
+///
+/// // 5. Bridge Broadcasts to Memberlist Gossip
+/// // While Unicast uses QUIC, common Gossip/IHave still use memberlist's UDP channel.
+/// let pm_out = pm.clone();
+/// let ml = memberlist_instance.clone();
+/// tokio::spawn(async move {
+///     let mut broadcast_rx = pm_out.outgoing_receiver_raw();
+///     while let Ok(envelope) = broadcast_rx.recv().await {
+///         ml.broadcast(envelope.encode()).await;
 ///     }
 /// });
+///
+/// // 6. Inbound Injection (Inside your NodeDelegate or Transport Acceptor)
+/// // if let Some((sender_id, message)) = decode_plumtree_envelope::<u64>(&raw_data) {
+/// //     pm.incoming_sender().send((sender_id, message)).await.ok();
+/// // }
 /// ```
 pub struct PlumtreeMemberlist<I, PD>
 where
@@ -308,7 +316,6 @@ where
     /// Channel for receiving incoming Plumtree messages from memberlist.
     incoming_rx: async_channel::Receiver<(I, PlumtreeMessage)>,
     /// Channel for outgoing broadcast messages (unencooded, serialization deferred).
-    #[allow(dead_code)]
     outgoing_rx: async_channel::Receiver<BroadcastEnvelope<I>>,
     /// Sender for outgoing broadcast messages.
     outgoing_tx: async_channel::Sender<BroadcastEnvelope<I>>,
@@ -317,8 +324,6 @@ where
     unicast_rx: async_channel::Receiver<UnicastEnvelope<I>>,
     /// Sender for outgoing unicast messages.
     unicast_tx: async_channel::Sender<UnicastEnvelope<I>>,
-    /// Peer state reference for external sync.
-    peers: Arc<PeerState<I>>,
 }
 
 impl<I, PD> PlumtreeMemberlist<I, PD>
@@ -331,19 +336,24 @@ where
     /// # Arguments
     ///
     /// * `local_id` - The local node's identifier
-    /// * `config` - Plumtree configuration
+    /// * `config` - Plumtree configuration (hash ring is automatically enabled)
     /// * `delegate` - Application delegate for message delivery
+    ///
+    /// # Note
+    ///
+    /// Hash ring topology is automatically enabled for `PlumtreeMemberlist` to ensure
+    /// deterministic peer selection and Z≥2 redundancy guarantees.
     pub fn new(local_id: I, config: PlumtreeConfig, delegate: PD) -> Self {
         // Create channels for communication
         let (incoming_tx, incoming_rx) = async_channel::bounded(1024);
         let (outgoing_tx, outgoing_rx) = async_channel::bounded(1024);
         let (unicast_tx, unicast_rx) = async_channel::bounded(1024);
 
-        // Create shared peer state
-        let peers = Arc::new(PeerState::new());
-
         // Create the event handler that wraps the user delegate
-        let event_handler = PlumtreeEventHandler::new(delegate, peers.clone());
+        let event_handler = PlumtreeEventHandler::new(delegate);
+
+        // Force hash ring topology for PlumtreeMemberlist
+        let config = config.with_hash_ring(true);
 
         // Create the Plumtree instance
         let (plumtree, handle) = Plumtree::new(local_id, config, event_handler);
@@ -357,7 +367,6 @@ where
             outgoing_tx,
             unicast_rx,
             unicast_tx,
-            peers,
         }
     }
 
@@ -378,9 +387,7 @@ where
     ///
     /// Pass this to `PlumtreeNodeDelegate` for memberlist broadcast.
     #[allow(dead_code)]
-    pub(crate) fn outgoing_receiver_raw(
-        &self,
-    ) -> async_channel::Receiver<BroadcastEnvelope<I>> {
+    pub(crate) fn outgoing_receiver_raw(&self) -> async_channel::Receiver<BroadcastEnvelope<I>> {
         self.outgoing_rx.clone()
     }
 
@@ -405,9 +412,7 @@ where
     /// }
     /// ```
     #[allow(dead_code)]
-    pub(crate) fn unicast_receiver_raw(
-        &self,
-    ) -> async_channel::Receiver<UnicastEnvelope<I>> {
+    pub(crate) fn unicast_receiver_raw(&self) -> async_channel::Receiver<UnicastEnvelope<I>> {
         self.unicast_rx.clone()
     }
 
@@ -462,11 +467,22 @@ where
         self.plumtree.cache_stats()
     }
 
-    /// Add a peer to the Plumtree overlay.
+    /// Add a peer to the Plumtree overlay with automatic classification.
     ///
     /// Called when a node joins the memberlist cluster.
-    pub fn add_peer(&self, peer: I) {
-        self.plumtree.add_peer(peer);
+    /// The peer is automatically classified as eager or lazy based on
+    /// the current state and configuration.
+    ///
+    /// Returns the result of the add operation.
+    pub fn add_peer(&self, peer: I) -> crate::peer_state::AddPeerResult {
+        self.plumtree.add_peer(peer)
+    }
+
+    /// Add a peer to the lazy set only (traditional behavior).
+    ///
+    /// This bypasses the `max_peers` limit check and auto-classification.
+    pub fn add_peer_lazy(&self, peer: I) {
+        self.plumtree.add_peer_lazy(peer);
     }
 
     /// Remove a peer from the Plumtree overlay.
@@ -477,8 +493,54 @@ where
     }
 
     /// Get a reference to the shared peer state.
+    ///
+    /// This returns the Plumtree's internal peer state, which tracks
+    /// eager and lazy peers for message routing.
     pub fn peers(&self) -> &Arc<PeerState<I>> {
-        &self.peers
+        self.plumtree.peers()
+    }
+
+    /// Wrap a memberlist delegate with Plumtree integration.
+    ///
+    /// This creates a `PlumtreeNodeDelegate` that wraps your delegate and
+    /// automatically synchronizes peer state when nodes join or leave the cluster.
+    ///
+    /// The wrapped delegate should be passed to memberlist when creating it.
+    ///
+    /// # Arguments
+    ///
+    /// * `delegate` - Your memberlist delegate implementation
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use memberlist_plumtree::{PlumtreeMemberlist, PlumtreeConfig};
+    ///
+    /// // Create PlumtreeMemberlist
+    /// let pm = PlumtreeMemberlist::new(node_id, PlumtreeConfig::default(), my_plumtree_delegate);
+    ///
+    /// // Wrap your memberlist delegate
+    /// let wrapped = pm.wrap_delegate(my_memberlist_delegate);
+    ///
+    /// // Create memberlist with the wrapped delegate
+    /// let memberlist = Memberlist::new(wrapped, memberlist_config).await?;
+    ///
+    /// // Run PlumtreeMemberlist with transport
+    /// pm.run_with_transport(transport).await;
+    /// ```
+    pub fn wrap_delegate<A, D>(&self, delegate: D) -> PlumtreeNodeDelegate<I, A, D>
+    where
+        A: Send + Sync + 'static,
+    {
+        let config = self.plumtree.config();
+        PlumtreeNodeDelegate::new(
+            delegate,
+            self.incoming_tx.clone(),
+            self.outgoing_rx.clone(),
+            self.plumtree.peers().clone(),
+            config.eager_fanout,
+            config.max_peers,
+        )
     }
 
     /// Run the Plumtree background tasks (manual unicast handling).
@@ -554,7 +616,11 @@ where
             // Encode at the last moment before network transmission
             let encoded = envelope.encode();
             if let Err(e) = transport.send_to(&envelope.target, encoded).await {
-                tracing::warn!("failed to send unicast message to {:?}: {}", envelope.target, e);
+                tracing::warn!(
+                    "failed to send unicast message to {:?}: {}",
+                    envelope.target,
+                    e
+                );
             }
         }
     }
@@ -633,6 +699,14 @@ pub struct PlumtreeNodeDelegate<I, A, D> {
     /// Outgoing Plumtree messages to broadcast via memberlist (unencooded).
     /// Serialization is deferred until messages are sent over the network.
     outgoing_rx: async_channel::Receiver<BroadcastEnvelope<I>>,
+    /// Shared peer state for synchronizing membership changes.
+    /// When memberlist detects a node join/leave, this is updated to keep
+    /// Plumtree's peer state in sync.
+    peers: Arc<PeerState<I>>,
+    /// Target number of eager peers for auto-classification.
+    eager_fanout: usize,
+    /// Maximum total peers allowed (None = unlimited).
+    max_peers: Option<usize>,
     /// Marker.
     _marker: PhantomData<A>,
 }
@@ -640,21 +714,45 @@ pub struct PlumtreeNodeDelegate<I, A, D> {
 impl<I, A, D> PlumtreeNodeDelegate<I, A, D> {
     /// Create a new Plumtree node delegate.
     ///
+    /// This wraps a user's memberlist delegate to automatically synchronize
+    /// peer state when nodes join or leave the cluster.
+    ///
     /// # Arguments
     ///
     /// * `inner` - The user's delegate implementation
     /// * `plumtree_tx` - Sender for forwarding received Plumtree messages
-    /// * `outgoing_rx` - Receiver for outgoing Plumtree messages to broadcast (unencooded)
-    #[allow(dead_code)]
-    pub(crate) fn new(
+    /// * `outgoing_rx` - Receiver for outgoing Plumtree messages to broadcast
+    /// * `peers` - Shared peer state for synchronizing membership changes
+    /// * `eager_fanout` - Target number of eager peers
+    /// * `max_peers` - Maximum total peers allowed (None = unlimited)
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Create PlumtreeMemberlist first
+    /// let pm = PlumtreeMemberlist::new(node_id, config, delegate);
+    ///
+    /// // Wrap your memberlist delegate with PlumtreeNodeDelegate
+    /// let wrapped_delegate = pm.wrap_delegate(your_memberlist_delegate);
+    ///
+    /// // Use wrapped_delegate when creating memberlist
+    /// let memberlist = Memberlist::new(wrapped_delegate, memberlist_config).await?;
+    /// ```
+    pub fn new(
         inner: D,
         plumtree_tx: async_channel::Sender<(I, PlumtreeMessage)>,
         outgoing_rx: async_channel::Receiver<BroadcastEnvelope<I>>,
+        peers: Arc<PeerState<I>>,
+        eager_fanout: usize,
+        max_peers: Option<usize>,
     ) -> Self {
         Self {
             inner,
             plumtree_tx,
             outgoing_rx,
+            peers,
+            eager_fanout,
+            max_peers,
             _marker: PhantomData,
         }
     }
@@ -793,7 +891,7 @@ where
 
 impl<I, A, D> EventDelegate for PlumtreeNodeDelegate<I, A, D>
 where
-    I: Id + IdCodec + Clone + Send + Sync + 'static,
+    I: Id + IdCodec + Clone + Ord + Send + Sync + 'static,
     A: CheapClone + Send + Sync + 'static,
     D: EventDelegate<Id = I, Address = A>,
 {
@@ -801,10 +899,18 @@ where
     type Address = A;
 
     async fn notify_join(&self, node: Arc<NodeState<Self::Id, Self::Address>>) {
+        // Sync: Add to Plumtree peers with hash ring-based auto-classification
+        // This ensures new peers are placed correctly in the topology
+        self.peers
+            .add_peer_auto(node.id().clone(), self.max_peers, self.eager_fanout);
+
         self.inner.notify_join(node).await;
     }
 
     async fn notify_leave(&self, node: Arc<NodeState<Self::Id, Self::Address>>) {
+        // Sync: Remove from Plumtree peers immediately to stop sending to dead node
+        self.peers.remove_peer(node.id());
+
         self.inner.notify_leave(node).await;
     }
 
@@ -879,23 +985,21 @@ where
 
 /// Event handler that synchronizes memberlist events to Plumtree.
 ///
-/// Wraps a user's PlumtreeDelegate and provides peer state management.
+/// Wraps a user's PlumtreeDelegate to forward events.
 pub struct PlumtreeEventHandler<I, PD> {
     /// Inner Plumtree delegate for application events.
     inner: PD,
-    /// Reference to peer state for management.
-    peers: Arc<PeerState<I>>,
+    /// Marker for I type parameter.
+    _marker: std::marker::PhantomData<I>,
 }
 
 impl<I, PD> PlumtreeEventHandler<I, PD> {
     /// Create a new event handler.
-    pub fn new(inner: PD, peers: Arc<PeerState<I>>) -> Self {
-        Self { inner, peers }
-    }
-
-    /// Get a reference to the peer state.
-    pub fn peers(&self) -> &Arc<PeerState<I>> {
-        &self.peers
+    pub fn new(inner: PD) -> Self {
+        Self {
+            inner,
+            _marker: std::marker::PhantomData,
+        }
     }
 }
 

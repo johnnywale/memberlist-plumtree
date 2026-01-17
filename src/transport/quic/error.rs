@@ -4,38 +4,51 @@
 //! - **Transient**: May succeed on retry (connection issues, timeouts)
 //! - **Permanent**: Will not succeed on retry (TLS config, peer not found)
 
-use std::fmt;
 use std::io;
 use std::net::SocketAddr;
 
+use thiserror::Error;
+
 /// Error type for QUIC transport operations.
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum QuicError {
     /// Peer ID could not be resolved to a socket address.
+    ///
+    /// This usually indicates stale resolver data. Consider triggering
+    /// a resolver refresh or peer rediscovery when this error occurs.
+    #[error("peer not found: {0} (consider refreshing resolver)")]
     PeerNotFound(String),
 
     /// TLS configuration error.
+    #[error("TLS configuration error: {0}")]
     TlsConfig(String),
 
     /// Certificate loading or validation error.
+    #[error("certificate error: {0}")]
     Certificate(String),
 
     /// Failed to bind to the local address.
-    Bind(io::Error),
+    #[error("failed to bind: {0}")]
+    Bind(#[source] io::Error),
 
     /// QUIC connection error.
-    Connection(quinn::ConnectionError),
+    #[error("connection error: {0}")]
+    Connection(#[source] quinn::ConnectionError),
 
     /// Failed to open a stream on the connection.
+    #[error("stream error: {0}")]
     Stream(String),
 
     /// Failed to write data to a stream.
-    Write(quinn::WriteError),
+    #[error("write error: {0}")]
+    Write(#[source] quinn::WriteError),
 
     /// Failed to read data from a stream.
-    Read(quinn::ReadError),
+    #[error("read error: {0}")]
+    Read(#[source] quinn::ReadError),
 
     /// Connection handshake timed out.
+    #[error("handshake to {addr} timed out after {timeout_ms}ms")]
     HandshakeTimeout {
         /// Target address that timed out.
         addr: SocketAddr,
@@ -44,6 +57,7 @@ pub enum QuicError {
     },
 
     /// Connection was closed by peer or locally.
+    #[error("connection closed (code={code}): {reason}")]
     ConnectionClosed {
         /// Error code (if available).
         code: u64,
@@ -52,6 +66,7 @@ pub enum QuicError {
     },
 
     /// Maximum number of connections reached.
+    #[error("max connections reached ({current}/{max})")]
     MaxConnectionsReached {
         /// Current connection count.
         current: usize,
@@ -63,82 +78,16 @@ pub enum QuicError {
     ///
     /// This happens when the server doesn't accept early data
     /// (e.g., no session ticket, anti-replay triggered).
+    #[error("0-RTT early data was rejected by server")]
     EarlyDataRejected,
 
     /// Invalid message format.
+    #[error("invalid message: {0}")]
     InvalidMessage(String),
 
     /// Internal error.
+    #[error("internal error: {0}")]
     Internal(String),
-}
-
-impl fmt::Display for QuicError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            QuicError::PeerNotFound(id) => {
-                write!(f, "peer not found: {}", id)
-            }
-            QuicError::TlsConfig(msg) => {
-                write!(f, "TLS configuration error: {}", msg)
-            }
-            QuicError::Certificate(msg) => {
-                write!(f, "certificate error: {}", msg)
-            }
-            QuicError::Bind(err) => {
-                write!(f, "failed to bind: {}", err)
-            }
-            QuicError::Connection(err) => {
-                write!(f, "connection error: {}", err)
-            }
-            QuicError::Stream(msg) => {
-                write!(f, "stream error: {}", msg)
-            }
-            QuicError::Write(err) => {
-                write!(f, "write error: {}", err)
-            }
-            QuicError::Read(err) => {
-                write!(f, "read error: {}", err)
-            }
-            QuicError::HandshakeTimeout { addr, timeout_ms } => {
-                write!(
-                    f,
-                    "handshake to {} timed out after {}ms",
-                    addr, timeout_ms
-                )
-            }
-            QuicError::ConnectionClosed { code, reason } => {
-                write!(f, "connection closed (code={}): {}", code, reason)
-            }
-            QuicError::MaxConnectionsReached { current, max } => {
-                write!(
-                    f,
-                    "max connections reached ({}/{})",
-                    current, max
-                )
-            }
-            QuicError::EarlyDataRejected => {
-                write!(f, "0-RTT early data was rejected by server")
-            }
-            QuicError::InvalidMessage(msg) => {
-                write!(f, "invalid message: {}", msg)
-            }
-            QuicError::Internal(msg) => {
-                write!(f, "internal error: {}", msg)
-            }
-        }
-    }
-}
-
-impl std::error::Error for QuicError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            QuicError::Bind(err) => Some(err),
-            QuicError::Connection(err) => Some(err),
-            QuicError::Write(err) => Some(err),
-            QuicError::Read(err) => Some(err),
-            _ => None,
-        }
-    }
 }
 
 impl QuicError {
@@ -172,10 +121,39 @@ impl QuicError {
 
     /// Check if this error indicates the connection was closed cleanly.
     pub fn is_clean_close(&self) -> bool {
-        matches!(
-            self,
-            QuicError::ConnectionClosed { code: 0, .. }
-        )
+        matches!(self, QuicError::ConnectionClosed { code: 0, .. })
+    }
+
+    /// Check if this error indicates a peer resolution failure.
+    ///
+    /// When this returns true, the caller should consider:
+    /// - Triggering a resolver refresh
+    /// - Initiating peer rediscovery
+    /// - Removing the peer from local state if refresh fails
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// match transport.send_to(&peer_id, data).await {
+    ///     Err(e) if e.should_refresh_resolver() => {
+    ///         // Peer not found - try to refresh resolver
+    ///         resolver.refresh(&peer_id).await;
+    ///         // Optionally retry the send
+    ///     }
+    ///     Err(e) => return Err(e),
+    ///     Ok(()) => {}
+    /// }
+    /// ```
+    pub fn should_refresh_resolver(&self) -> bool {
+        matches!(self, QuicError::PeerNotFound(_))
+    }
+
+    /// Get the peer ID string if this is a PeerNotFound error.
+    pub fn peer_not_found_id(&self) -> Option<&str> {
+        match self {
+            QuicError::PeerNotFound(id) => Some(id),
+            _ => None,
+        }
     }
 }
 

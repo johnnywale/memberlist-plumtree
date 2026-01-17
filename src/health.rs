@@ -111,7 +111,10 @@ impl HealthReport {
         is_shutdown: bool,
     ) -> (HealthStatus, String) {
         if is_shutdown {
-            return (HealthStatus::Unhealthy, "Protocol is shutting down".to_string());
+            return (
+                HealthStatus::Unhealthy,
+                "Protocol is shutting down".to_string(),
+            );
         }
 
         // Check for unhealthy conditions
@@ -150,7 +153,10 @@ impl HealthReport {
         if delivery.pending_grafts > 50 {
             return (
                 HealthStatus::Degraded,
-                format!("{} Grafts pending - possible network issues", delivery.pending_grafts),
+                format!(
+                    "{} Grafts pending - possible network issues",
+                    delivery.pending_grafts
+                ),
             );
         }
 
@@ -291,13 +297,7 @@ impl HealthReportBuilder {
     }
 
     /// Set peer counts.
-    pub fn peers(
-        mut self,
-        total: usize,
-        eager: usize,
-        lazy: usize,
-        target_eager: usize,
-    ) -> Self {
+    pub fn peers(mut self, total: usize, eager: usize, lazy: usize, target_eager: usize) -> Self {
         self.total_peers = total;
         self.eager_peers = eager;
         self.lazy_peers = lazy;
@@ -370,9 +370,7 @@ mod tests {
 
     #[test]
     fn test_unhealthy_no_peers() {
-        let report = HealthReportBuilder::new()
-            .peers(0, 0, 0, 3)
-            .build();
+        let report = HealthReportBuilder::new().peers(0, 0, 0, 3).build();
 
         assert_eq!(report.status, HealthStatus::Unhealthy);
         assert!(!report.is_operational());
@@ -392,9 +390,7 @@ mod tests {
 
     #[test]
     fn test_degraded_no_eager_peers() {
-        let report = HealthReportBuilder::new()
-            .peers(5, 0, 5, 3)
-            .build();
+        let report = HealthReportBuilder::new().peers(5, 0, 5, 3).build();
 
         assert_eq!(report.status, HealthStatus::Degraded);
         assert!(report.is_operational());
@@ -403,9 +399,7 @@ mod tests {
 
     #[test]
     fn test_degraded_low_peer_count() {
-        let report = HealthReportBuilder::new()
-            .peers(2, 1, 1, 3)
-            .build();
+        let report = HealthReportBuilder::new().peers(2, 1, 1, 3).build();
 
         assert_eq!(report.status, HealthStatus::Degraded);
         assert!(report.message.contains("Low peer count"));

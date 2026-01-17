@@ -45,6 +45,7 @@
 #![allow(clippy::type_complexity)]
 
 mod adaptive_batcher;
+mod bridge;
 mod cleanup_tuner;
 mod config;
 mod error;
@@ -53,6 +54,7 @@ mod integration;
 mod message;
 mod peer_scoring;
 mod peer_state;
+
 mod plumtree;
 mod pooled_transport;
 mod rate_limiter;
@@ -63,6 +65,9 @@ mod transport;
 
 #[cfg(feature = "metrics")]
 mod metrics;
+
+#[cfg(test)]
+mod peer_state_test;
 
 // Re-export adaptive batcher types
 pub use adaptive_batcher::{AdaptiveBatcher, BatcherConfig, BatcherStats};
@@ -90,7 +95,9 @@ pub use message::{
 };
 
 // Re-export peer state types
-pub use peer_state::{PeerState, PeerStateBuilder, PeerStats};
+pub use peer_state::{
+    AddPeerResult, PeerState, PeerStateBuilder, PeerStats, PeerTopology, RemovePeerResult,
+};
 
 // Re-export peer scoring types
 pub use peer_scoring::{PeerScore, PeerScoring, ScoringConfig, ScoringStats};
@@ -112,7 +119,8 @@ pub use runner::{PlumtreeRunner, PlumtreeRunnerBuilder};
 pub use integration::{
     decode_plumtree_envelope, decode_plumtree_message, encode_plumtree_envelope,
     encode_plumtree_envelope_into, encode_plumtree_message, envelope_encoded_len,
-    is_plumtree_message, IdCodec, PlumtreeEventHandler, PlumtreeMemberlist, PlumtreeNodeDelegate,
+    is_plumtree_message, BroadcastEnvelope, IdCodec, PlumtreeEventHandler, PlumtreeMemberlist,
+    PlumtreeNodeDelegate,
 };
 
 // Re-export scheduler types
@@ -138,6 +146,12 @@ pub use pooled_transport::{PoolConfig, PoolStats, PooledTransport, PooledTranspo
 
 // Re-export scheduler failure types
 pub use scheduler::FailedGraft;
+
+// Re-export bridge types for Plumtree-Memberlist integration
+pub use bridge::{
+    AddressExtractor, BridgeConfig, BridgeEventDelegate, MemberlistStack, MemberlistStackError,
+    PlumtreeBridge, PlumtreeStackBuilder,
+};
 
 /// Re-export memberlist-core types for convenience
 pub mod memberlist {

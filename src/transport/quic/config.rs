@@ -233,6 +233,18 @@ pub struct TlsConfig {
     ///
     /// Only use for development/testing. Vulnerable to MITM attacks.
     pub skip_verification: bool,
+
+    /// Server name for TLS SNI (Server Name Indication).
+    ///
+    /// This is used during TLS handshake for:
+    /// - SNI extension (allows server to select correct certificate)
+    /// - Certificate hostname verification (unless `skip_verification` is true)
+    ///
+    /// For self-signed certificates, this should match the CN or SAN in the cert.
+    /// Common values: `"localhost"` for development, hostname/domain for production.
+    ///
+    /// Default: `"localhost"` (suitable for self-signed certs).
+    pub server_name: Option<String>,
 }
 
 impl TlsConfig {
@@ -277,9 +289,20 @@ impl TlsConfig {
         self
     }
 
+    /// Builder method to set server name for SNI.
+    pub fn with_server_name(mut self, name: impl Into<String>) -> Self {
+        self.server_name = Some(name.into());
+        self
+    }
+
     /// Check if custom certificates are configured.
     pub fn has_custom_certs(&self) -> bool {
         self.cert_path.is_some() && self.key_path.is_some()
+    }
+
+    /// Get server name for TLS, defaulting to "localhost".
+    pub fn server_name_or_default(&self) -> &str {
+        self.server_name.as_deref().unwrap_or("localhost")
     }
 
     /// Get the ALPN protocols, using defaults if not specified.
@@ -416,9 +439,9 @@ impl Default for StreamConfig {
         Self {
             max_uni_streams: 100,
             max_bi_streams: 100,
-            recv_buffer: 64 * 1024,       // 64KB
-            send_buffer: 64 * 1024,       // 64KB
-            max_data: 1024 * 1024,        // 1MB
+            recv_buffer: 64 * 1024, // 64KB
+            send_buffer: 64 * 1024, // 64KB
+            max_data: 1024 * 1024,  // 1MB
         }
     }
 }
@@ -462,7 +485,23 @@ impl StreamConfig {
 
 /// 0-RTT early data configuration.
 ///
-/// # Security Warning
+/// # ⚠️ Not Yet Implemented
+///
+/// **Important**: The 0-RTT configuration is currently a **placeholder** for future
+/// implementation. Setting `enabled: true` has **no effect** - all messages are sent
+/// via regular 1-RTT streams regardless of this setting.
+///
+/// The configuration is provided to:
+/// 1. Reserve the API for future 0-RTT support
+/// 2. Allow applications to express intent for when support is added
+/// 3. Document the security considerations upfront
+///
+/// Full 0-RTT support requires:
+/// - Session ticket caching for connection resumption
+/// - Using `connection.open_uni_early()` for early data
+/// - Handling `EarlyDataRejected` errors with fallback
+///
+/// # Security Warning (for future implementation)
 ///
 /// 0-RTT data is **replayable**! An attacker can capture and replay 0-RTT packets.
 /// Only enable 0-RTT for idempotent operations (like Gossip messages).
@@ -471,6 +510,8 @@ impl StreamConfig {
 #[derive(Debug, Clone)]
 pub struct ZeroRttConfig {
     /// Enable 0-RTT early data.
+    ///
+    /// **Note**: Currently has no effect. See struct-level documentation.
     ///
     /// Default: false (safe default).
     pub enabled: bool,
@@ -496,10 +537,10 @@ pub struct ZeroRttConfig {
 impl Default for ZeroRttConfig {
     fn default() -> Self {
         Self {
-            enabled: false,        // Safe default: disabled
+            enabled: false,            // Safe default: disabled
             max_early_data: 16 * 1024, // 16KB
             session_cache_capacity: 256,
-            gossip_only: true,     // Only Gossip via 0-RTT
+            gossip_only: true, // Only Gossip via 0-RTT
         }
     }
 }
@@ -741,7 +782,7 @@ impl Default for MessagePriorities {
         Self {
             gossip: 2,
             ihave: 1,
-            graft: 3,  // Highest - critical for tree repair
+            graft: 3, // Highest - critical for tree repair
             prune: 1,
         }
     }

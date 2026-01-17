@@ -9,9 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use memberlist_plumtree::{
-    MapPeerResolver, PeerResolver, QuicConfig, QuicTransport, Transport,
-};
+use memberlist_plumtree::{MapPeerResolver, PeerResolver, QuicConfig, QuicTransport, Transport};
 
 /// Get an available port for testing.
 fn get_test_addr(port: u16) -> SocketAddr {
@@ -26,7 +24,11 @@ async fn test_quic_transport_creation() {
     let config = QuicConfig::insecure_dev();
     let transport = QuicTransport::new(addr, config, resolver).await;
 
-    assert!(transport.is_ok(), "Failed to create transport: {:?}", transport.err());
+    assert!(
+        transport.is_ok(),
+        "Failed to create transport: {:?}",
+        transport.err()
+    );
 
     let transport = transport.unwrap();
     let local_addr = transport.local_addr();
@@ -140,11 +142,9 @@ async fn test_shared_resolver() {
     let resolver = Arc::new(MapPeerResolver::<u64>::new(addr));
 
     let config = QuicConfig::insecure_dev();
-    let transport = QuicTransport::with_shared_resolver(
-        addr,
-        config,
-        resolver.clone(),
-    ).await.unwrap();
+    let transport = QuicTransport::with_shared_resolver(addr, config, resolver.clone())
+        .await
+        .unwrap();
 
     // Add a peer through the shared resolver
     resolver.add_peer(1, "192.168.1.10:9000".parse().unwrap());
@@ -173,9 +173,7 @@ async fn test_quic_transport_clone() {
 
 #[tokio::test]
 async fn test_quic_config_builder() {
-    use memberlist_plumtree::{
-        ConnectionConfig, StreamConfig, ZeroRttConfig,
-    };
+    use memberlist_plumtree::{ConnectionConfig, StreamConfig, ZeroRttConfig};
 
     let config = QuicConfig::default()
         .with_connection(
@@ -183,10 +181,7 @@ async fn test_quic_config_builder() {
                 .with_max_connections(512)
                 .with_idle_timeout(Duration::from_secs(60)),
         )
-        .with_streams(
-            StreamConfig::default()
-                .with_max_uni_streams(200),
-        )
+        .with_streams(StreamConfig::default().with_max_uni_streams(200))
         .with_zero_rtt(
             ZeroRttConfig::default()
                 .with_enabled(true)

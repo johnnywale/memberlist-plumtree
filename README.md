@@ -495,21 +495,124 @@ let cache_stats = plumtree_ml.cache_stats();
 - Easy peer management (`add_peer`, `remove_peer`)
 - Graceful shutdown handling
 
+### `MemberlistStack` - Full Integration (Recommended)
+
+The `MemberlistStack` struct provides the complete integration stack, combining Plumtree with a real Memberlist instance for automatic SWIM-based peer discovery. **This is the recommended entry point** for production deployments:
+
+```rust
+use memberlist_plumtree::{
+    MemberlistStack, PlumtreeConfig, PlumtreeNodeDelegate, NoopDelegate,
+};
+use memberlist_core::{
+    transport::net::NetTransport,
+    Options,
+};
+use std::net::SocketAddr;
+
+// Create your transport (e.g., NetTransport for real networking)
+let transport = NetTransport::new(transport_config).await?;
+
+// Create the stack with PlumtreeNodeDelegate wrapping your delegate
+let delegate = PlumtreeNodeDelegate::new(
+    node_id.clone(),
+    NoopDelegate,  // Or your custom PlumtreeDelegate
+    pm.clone(),    // PlumtreeMemberlist reference for peer sync
+);
+
+// Build the complete stack
+let stack = MemberlistStack::new(
+    pm,           // PlumtreeMemberlist
+    memberlist,   // Memberlist instance
+    advertise_addr,
+);
+
+// Join the cluster - just pass seed addresses!
+let seeds: Vec<SocketAddr> = vec![
+    "192.168.1.10:7946".parse()?,
+    "192.168.1.11:7946".parse()?,
+];
+stack.join(&seeds).await?;
+
+// Broadcast messages - automatically routes via spanning tree
+let msg_id = stack.broadcast(b"Hello cluster!").await?;
+
+// Get cluster status
+println!("Members: {}", stack.num_members());
+println!("Peers: {:?}", stack.peer_stats());
+
+// Graceful shutdown
+stack.leave().await?;
+stack.shutdown().await?;
+```
+
+**Key features of `MemberlistStack`**:
+- **Automatic peer discovery**: SWIM protocol discovers peers without manual `add_peer()` calls
+- **Simplified join API**: Just pass seed addresses, no need to deal with `MaybeResolvedAddress`
+- **Integrated lifecycle**: Single struct manages both Memberlist and Plumtree
+- **Peer sync**: `PlumtreeNodeDelegate` automatically syncs Plumtree peers when Memberlist membership changes
+
+**When to use each API**:
+
+| API | Use Case |
+|-----|----------|
+| `Plumtree` | Custom transport, fine-grained control |
+| `PlumtreeMemberlist` | Manual peer management, testing |
+| `MemberlistStack` | **Production** - full SWIM + Plumtree integration |
+
 ## Examples
 
-### Chat Example
+### Terminal Chat Example
 
-A simple multicast chat demonstrating the core Plumtree API:
+An interactive terminal-based chat with fault injection for testing:
 
 ```bash
 cargo run --example chat
 ```
 
-This demonstrates:
-- Multiple node creation and mesh topology
-- Message broadcasting via `Plumtree`
-- Peer state management (eager/lazy)
-- Protocol statistics
+**Features:**
+- 20 simulated nodes with full mesh topology
+- Real-time protocol metrics (Grafts, Prunes, Promotions, Demotions)
+- Fault injection controls:
+  - `F` - Toggle node offline/online
+  - `L` - Toggle 20% packet loss
+  - `E` - Promote all peers to eager (triggers prunes)
+  - `R` - Reset metrics
+  - `M` - Toggle metrics panel
+- User switching: Tab, Shift+Tab, number keys (1-9, 0=10), PageUp/PageDown
+- Color-coded event log showing protocol activity
+
+### Web Chat Example
+
+A web-based visualization with peer tree display:
+
+```bash
+cargo run --example web-chat
+# Then open http://localhost:3000
+```
+
+**Features:**
+- Real-time WebSocket updates
+- Visual peer tree showing eager (green) and lazy (orange) connections
+- Interactive controls: user switching, fault injection, metrics reset
+- Three-panel layout: Tree visualization | Chat messages | Event log + Metrics
+- Static HTML/JS frontend served from `examples/static/`
+
+**Web UI Layout:**
+```
+┌─────────────────┬─────────────────────┬─────────────────┐
+│   Peer Tree     │    Chat Messages    │   Event Log     │
+│                 │                     │                 │
+│    [U3]         │ [12:34:56] U1: Hi   │ [00:15] GOSSIP  │
+│   /    \        │ [12:34:57] U2: Hey  │ [00:16] PRUNE   │
+│ [U2]  [U4]      │                     │ [00:17] PROMOTE │
+│  (eager) (lazy) │ > Type message...   │                 │
+│                 │                     │ ┌─────────────┐ │
+│ Legend:         │                     │ │ Metrics     │ │
+│ ● Current       │                     │ │ Sent: 5     │ │
+│ ● Eager         │                     │ │ Recv: 12    │ │
+│ ● Lazy          │                     │ │ Grafts: 2   │ │
+└─────────────────┴─────────────────────┴─────────────────┘
+```
 
 ### Pub/Sub Example
 
