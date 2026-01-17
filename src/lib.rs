@@ -124,6 +124,15 @@ pub use rate_limiter::{GlobalRateLimiter, RateLimiter};
 // Re-export transport types
 pub use transport::{ChannelTransport, ChannelTransportError, NoopTransport, Transport};
 
+// Re-export QUIC transport types (requires "quic" feature)
+#[cfg(feature = "quic")]
+#[cfg_attr(docsrs, doc(cfg(feature = "quic")))]
+pub use transport::quic::{
+    CongestionConfig, CongestionController, ConnectionConfig, ConnectionStats, MapPeerResolver,
+    MessagePriorities, MigrationConfig, PeerResolver, PlumtreeQuicConfig, QuicConfig, QuicError,
+    QuicStats, QuicTransport, StreamConfig, TlsConfig, ZeroRttConfig,
+};
+
 // Re-export pooled transport types
 pub use pooled_transport::{PoolConfig, PoolStats, PooledTransport, PooledTransportError};
 

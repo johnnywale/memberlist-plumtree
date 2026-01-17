@@ -37,7 +37,7 @@ use async_lock::Semaphore;
 use bytes::Bytes;
 use parking_lot::Mutex;
 
-use crate::transport::Transport;
+use crate::Transport;
 
 /// Configuration for the pooled transport.
 #[derive(Debug, Clone)]

@@ -12,11 +12,20 @@
 //! - **Prune**: Must be sent to the peer being demoted
 //!
 //! Using broadcast for these messages will break the protocol.
+//!
+//! # Available Transports
+//!
+//! - [`ChannelTransport`]: Channel-based transport for testing
+//! - [`NoopTransport`]: No-op transport that discards messages
+//! - [`QuicTransport`](quic::QuicTransport): QUIC-based transport (requires `quic` feature)
 
 use bytes::Bytes;
 use std::fmt::Debug;
 use std::future::Future;
 use std::hash::Hash;
+
+#[cfg(feature = "quic")]
+pub mod quic;
 
 /// Transport trait for sending Plumtree messages.
 ///

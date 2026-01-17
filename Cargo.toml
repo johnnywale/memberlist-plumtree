@@ -20,6 +20,7 @@ default = []
 tokio = ["agnostic-io/tokio", "memberlist-core/tokio"]
 metrics = ["dep:metrics"]
 serde = ["dep:serde"]
+quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:webpki-roots", "dep:rustls-pemfile"]
 
 [dependencies]
 
@@ -42,6 +43,13 @@ parking_lot = { version = "0.12", features = ["send_guard"] }
 
 # Lock-free data structures
 crossbeam-queue = "0.3"
+
+# QUIC transport (optional)
+quinn = { version = "0.11", optional = true, default-features = false, features = ["runtime-tokio", "rustls", "ring"] }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }
+rcgen = { version = "0.13", optional = true }
+webpki-roots = { version = "0.26", optional = true }
+rustls-pemfile = { version = "2", optional = true }
 
 
 # Runtime-agnostic timer
