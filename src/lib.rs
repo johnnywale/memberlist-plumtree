@@ -149,9 +149,12 @@ pub use scheduler::FailedGraft;
 
 // Re-export bridge types for Plumtree-Memberlist integration
 pub use bridge::{
-    AddressExtractor, BridgeConfig, BridgeEventDelegate, MemberlistStack, MemberlistStackError,
-    PlumtreeBridge, PlumtreeStackBuilder,
+    AddressExtractor, BridgeConfig, BridgeEventDelegate, LazarusHandle, LazarusStats,
+    MemberlistStack, MemberlistStackError, PlumtreeBridge, PlumtreeStackBuilder,
 };
+
+// Re-export persistence module for peer state recovery
+pub use bridge::persistence;
 
 /// Re-export memberlist-core types for convenience
 pub mod memberlist {

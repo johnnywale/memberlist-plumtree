@@ -179,6 +179,9 @@ pub struct PeerState<I> {
     /// Local node ID for hash ring position computation.
     /// If None, hash ring topology features are disabled.
     local_id: Option<I>,
+    /// Whether to use hash ring topology with ring neighbor protection.
+    /// When false, local_id is only used for diverse peer ordering.
+    use_hash_ring: bool,
 }
 
 #[derive(Debug)]
@@ -258,6 +261,7 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
                 cached_ring: None,
             }),
             local_id: None,
+            use_hash_ring: false,
         }
     }
 
@@ -280,6 +284,7 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
                 cached_ring: None,
             }),
             local_id: Some(local_id),
+            use_hash_ring: true, // Full hash ring features when local_id is explicitly set
         }
     }
 
@@ -309,6 +314,11 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
     /// Compute ring neighbors for the local node.
     /// Returns (adjacent: i±1, second_nearest: i±2, long_range: i±X/4).
     fn compute_ring_neighbors(&self, inner: &PeerStateInner<I>) -> HashSet<I> {
+        // Only compute ring neighbors when hash ring is explicitly enabled
+        if !self.use_hash_ring {
+            return HashSet::new();
+        }
+
         let Some(ref local_id) = self.local_id else {
             return HashSet::new();
         };
@@ -389,6 +399,7 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
                 cached_ring: None,
             }),
             local_id: None,
+            use_hash_ring: false,
         }
     }
 
@@ -522,6 +533,7 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
                 cached_ring: Some(sorted_ring),
             }),
             local_id: Some(local_id),
+            use_hash_ring: true, // Full hash ring features
         }
     }
 
@@ -685,6 +697,13 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
         eager_fanout: usize,
         allow_eviction: bool,
     ) -> AddPeerResult {
+        // Never add self as a peer
+        if let Some(ref local_id) = self.local_id {
+            if &peer == local_id {
+                return AddPeerResult::AlreadyExists;
+            }
+        }
+
         let mut inner = self.inner.write();
 
         // Check if already exists
@@ -737,8 +756,8 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
                     inner.lazy.insert(peer.clone());
                     inner.lazy_vec.push(peer.clone());
 
-                    // Rebalance to ensure ring neighbors are in eager
-                    if self.local_id.is_some() {
+                    // Rebalance to ensure ring neighbors are in eager (only if hash ring enabled)
+                    if self.local_id.is_some() && self.use_hash_ring {
                         self.rebalance_eager_with_ring_neighbors(&mut inner, eager_fanout);
                     }
 
@@ -755,8 +774,8 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
         // Update ring neighbors (this recomputes based on new known_peers)
         self.update_ring_neighbors(&mut inner);
 
-        // Hash ring-based classification when local_id is set
-        if self.local_id.is_some() {
+        // Hash ring-based classification when hash ring is enabled
+        if self.local_id.is_some() && self.use_hash_ring {
             // Add the new peer to lazy first (temporary placement)
             inner.lazy.insert(peer.clone());
             inner.lazy_vec.push(peer.clone());
@@ -1102,13 +1121,27 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
     ///
     /// If `local_id` is set, uses hash ring-based selection for promotions.
     pub fn try_rebalance(&self, target_eager: usize) -> bool {
+        self.try_rebalance_with_scorer(target_eager, |_| 0.5)
+    }
+
+    /// Try to rebalance using try_write with a custom scoring function.
+    ///
+    /// The `scorer` closure should return a value between 0.0 (worst) and 1.0 (best).
+    /// This allows combining topological preference with network performance metrics.
+    ///
+    /// Returns true if rebalance was performed, false if lock was contended.
+    pub fn try_rebalance_with_scorer<F>(&self, target_eager: usize, scorer: F) -> bool
+    where
+        F: Fn(&I) -> f64,
+    {
         if let Some(mut inner) = self.inner.try_write() {
             let current_eager = inner.eager.len();
 
             if current_eager < target_eager && !inner.lazy.is_empty() {
                 // Promote lazy peers to eager
                 let promote_count = (target_eager - current_eager).min(inner.lazy.len());
-                let to_promote = self.select_peers_for_promotion(&inner, promote_count);
+                let to_promote =
+                    self.select_peers_for_promotion_scored(&inner, promote_count, &scorer);
 
                 for peer in to_promote {
                     inner.lazy.remove(&peer);
@@ -1123,58 +1156,87 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
         }
     }
 
-    /// Select lazy peers to promote based on hash ring topology.
+    /// Select lazy peers to promote using hybrid scoring.
     ///
-    /// When `local_id` is set, selects peers nearest on the hash ring.
-    /// Otherwise, returns arbitrary peers.
-    fn select_peers_for_promotion(&self, inner: &PeerStateInner<I>, count: usize) -> Vec<I> {
+    /// Priorities:
+    /// 1. Ring Neighbors (structural requirement - always promoted first)
+    /// 2. Hybrid Score = (Topology proximity × weight) + (Network score × weight)
+    ///
+    /// The `scorer` closure provides the network performance score (0.0-1.0).
+    fn select_peers_for_promotion_scored<F>(
+        &self,
+        inner: &PeerStateInner<I>,
+        count: usize,
+        scorer: &F,
+    ) -> Vec<I>
+    where
+        F: Fn(&I) -> f64,
+    {
         if count == 0 || inner.lazy.is_empty() {
             return Vec::new();
         }
 
-        if self.local_id.is_some() {
-            let sorted_ring = self.get_or_compute_ring(inner);
-            let ring_size = sorted_ring.len();
+        let mut selected = Vec::with_capacity(count);
 
-            if let Some(local_pos) = self
-                .local_id
-                .as_ref()
-                .and_then(|id| find_position_in_ring(&sorted_ring, id))
-            {
-                // Select nearest lazy peers on the hash ring
-                let mut selected = Vec::with_capacity(count);
-
-                // Walk outward from local position in both directions
-                for offset in 1..ring_size {
-                    if selected.len() >= count {
-                        break;
-                    }
-
-                    // Check predecessor
-                    let pred_pos = (local_pos + ring_size - offset) % ring_size;
-                    let pred = &sorted_ring[pred_pos];
-                    if inner.lazy.contains(pred) && !selected.contains(pred) {
-                        selected.push(pred.clone());
-                    }
-
-                    if selected.len() >= count {
-                        break;
-                    }
-
-                    // Check successor
-                    let succ_pos = (local_pos + offset) % ring_size;
-                    let succ = &sorted_ring[succ_pos];
-                    if inner.lazy.contains(succ) && !selected.contains(succ) {
-                        selected.push(succ.clone());
-                    }
+        // 1. First, prioritize lazy peers that ARE ring neighbors (structural requirement)
+        // These should always be promoted to maintain Z≥2 redundancy
+        // Only applies when hash ring is enabled
+        if self.local_id.is_some() && self.use_hash_ring {
+            for peer in inner.lazy.iter() {
+                if selected.len() >= count {
+                    break;
                 }
-
-                return selected;
+                if inner.ring_neighbors.contains(peer) && !selected.contains(peer) {
+                    selected.push(peer.clone());
+                }
             }
         }
 
-        // Fallback: arbitrary selection
-        inner.lazy.iter().take(count).cloned().collect()
+        if selected.len() >= count {
+            return selected;
+        }
+
+        // 2. For remaining slots, use hybrid scoring (topology + network performance)
+        let remaining_needed = count - selected.len();
+
+        // Collect remaining candidates (lazy peers not yet selected)
+        let candidates: Vec<I> = inner
+            .lazy
+            .iter()
+            .filter(|p| !selected.contains(p))
+            .cloned()
+            .collect();
+
+        if candidates.is_empty() {
+            return selected;
+        }
+
+        // Calculate hybrid scores and sort (highest score = best candidate)
+        let mut scored: Vec<(f64, I)> = candidates
+            .into_iter()
+            .map(|peer| {
+                let score = self.calculate_hybrid_score(&peer, inner, scorer);
+                (score, peer)
+            })
+            .collect();
+
+        // Sort by hybrid score descending (best first)
+        // For tie-breaking: use a hash that includes local_id to give each node
+        // a different ordering. This prevents all nodes from selecting the same
+        // set of peers when scores are equal.
+        scored.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    // Use stable_hash with local_id to create per-node ordering
+                    let hash_a = self.peer_order_hash(&a.1, inner);
+                    let hash_b = self.peer_order_hash(&b.1, inner);
+                    hash_a.cmp(&hash_b)
+                })
+        });
+
+        selected.extend(scored.into_iter().take(remaining_needed).map(|(_, p)| p));
+        selected
     }
 
     /// Rebalance peers to match target fanout values.
@@ -1185,6 +1247,48 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
     ///
     /// **Note**: Ring neighbors are protected and will not be demoted.
     pub fn rebalance(&self, target_eager: usize) {
+        self.rebalance_with_scorer(target_eager, |_| 0.5)
+    }
+
+    /// Rebalance peers using a custom scoring function for network-aware optimization.
+    ///
+    /// The `scorer` closure should return a value between 0.0 (worst) and 1.0 (best).
+    /// This allows combining topological preference with network performance metrics
+    /// (e.g., RTT, reliability) from `PeerScoring`.
+    ///
+    /// # Hybrid Scoring
+    ///
+    /// Peers are scored using a weighted combination:
+    /// ```text
+    /// hybrid_score = (topology_score × 0.4) + (network_score × 0.6)
+    /// ```
+    ///
+    /// - **Topology score**: Based on hash ring distance (closer = higher)
+    /// - **Network score**: From the `scorer` closure (lower RTT/higher reliability = higher)
+    ///
+    /// # Safety Guarantees
+    ///
+    /// - Ring neighbors (i±1, i±2) are **never demoted** regardless of network score
+    /// - Ring neighbors in lazy set are **always promoted first**
+    /// - This preserves Z≥2 redundancy while optimizing performance
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use memberlist_plumtree::PeerScoring;
+    ///
+    /// let peer_scoring = PeerScoring::default();
+    /// // ... record RTT samples ...
+    ///
+    /// // Rebalance using network performance scores
+    /// peer_state.rebalance_with_scorer(3, |peer| {
+    ///     peer_scoring.normalized_score(peer, 0.5)
+    /// });
+    /// ```
+    pub fn rebalance_with_scorer<F>(&self, target_eager: usize, scorer: F)
+    where
+        F: Fn(&I) -> f64,
+    {
         let mut inner = self.inner.write();
 
         let current_eager = inner.eager.len();
@@ -1192,7 +1296,8 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
         if current_eager < target_eager {
             // Need to promote some lazy peers to eager
             let promote_count = target_eager - current_eager;
-            let to_promote = self.select_peers_for_promotion(&inner, promote_count);
+            let to_promote =
+                self.select_peers_for_promotion_scored(&inner, promote_count, &scorer);
 
             for peer in to_promote {
                 inner.lazy.remove(&peer);
@@ -1205,7 +1310,7 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
             // Need to demote some eager peers to lazy
             // Ring neighbors are protected
             let demote_count = current_eager - target_eager;
-            let to_demote = self.select_peers_for_demotion(&inner, demote_count);
+            let to_demote = self.select_peers_for_demotion_scored(&inner, demote_count, &scorer);
 
             for peer in to_demote {
                 inner.eager.remove(&peer);
@@ -1217,18 +1322,24 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
         }
     }
 
-    /// Select eager peers to demote based on hash ring topology.
+    /// Select eager peers to demote using hybrid scoring.
     ///
-    /// When `local_id` is set, prefers to keep adjacent neighbors as eager
-    /// and demotes more distant peers first.
-    ///
-    /// **Ring neighbors (i±1, i±2) are never selected for demotion.**
-    fn select_peers_for_demotion(&self, inner: &PeerStateInner<I>, count: usize) -> Vec<I> {
+    /// Peers with the LOWEST hybrid score are demoted first.
+    /// Ring neighbors are always protected.
+    fn select_peers_for_demotion_scored<F>(
+        &self,
+        inner: &PeerStateInner<I>,
+        count: usize,
+        scorer: &F,
+    ) -> Vec<I>
+    where
+        F: Fn(&I) -> f64,
+    {
         if count == 0 || inner.eager.is_empty() {
             return Vec::new();
         }
 
-        // Filter out protected ring neighbors
+        // Filter out protected ring neighbors (strict rule - never demoted)
         let demotable: Vec<I> = inner
             .eager
             .iter()
@@ -1240,45 +1351,112 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
             return Vec::new();
         }
 
-        if self.local_id.is_some() {
-            let sorted_ring = self.get_or_compute_ring(inner);
-            let ring_size = sorted_ring.len();
+        // Calculate hybrid scores and sort (lowest score = worst candidate = demote first)
+        let mut scored: Vec<(f64, I)> = demotable
+            .into_iter()
+            .map(|peer| {
+                let score = self.calculate_hybrid_score(&peer, inner, scorer);
+                (score, peer)
+            })
+            .collect();
 
-            if let Some(local_pos) = self
-                .local_id
-                .as_ref()
-                .and_then(|id| find_position_in_ring(&sorted_ring, id))
-            {
-                // Select most distant demotable peers on the hash ring
-                let mut with_distance: Vec<(usize, I)> = demotable
-                    .iter()
-                    .filter_map(|peer| {
-                        find_position_in_ring(&sorted_ring, peer).map(|pos| {
-                            let forward = if pos >= local_pos {
-                                pos - local_pos
-                            } else {
-                                ring_size - local_pos + pos
-                            };
-                            let backward = ring_size - forward;
-                            let distance = forward.min(backward);
-                            (distance, peer.clone())
-                        })
-                    })
-                    .collect();
+        // Sort by hybrid score ascending (worst first), then by peer ID for stability
+        scored.sort_by(|a, b| {
+            a.0.partial_cmp(&b.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.cmp(&b.1))
+        });
 
-                // Sort by distance descending (furthest first)
-                with_distance.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.into_iter().take(count).map(|(_, p)| p).collect()
+    }
 
-                return with_distance
-                    .into_iter()
-                    .take(count)
-                    .map(|(_, p)| p)
-                    .collect();
+    /// Calculate hybrid score combining topology proximity and network performance.
+    ///
+    /// Score = (topology_score × WEIGHT_TOPO) + (network_score × WEIGHT_NET)
+    ///
+    /// - topology_score: 1.0 for immediate neighbor, decays with ring distance
+    /// - network_score: From scorer closure (0.0-1.0, higher = better RTT/reliability)
+    fn calculate_hybrid_score<F>(&self, peer: &I, inner: &PeerStateInner<I>, scorer: &F) -> f64
+    where
+        F: Fn(&I) -> f64,
+    {
+        // Weight configuration: Performance slightly more important than topology
+        // for non-ring-neighbor peers (ring neighbors are handled separately)
+        const WEIGHT_TOPO: f64 = 0.4;
+        const WEIGHT_NET: f64 = 0.6;
+
+        // 1. Get network performance score (0.0 to 1.0)
+        let net_score = scorer(peer).clamp(0.0, 1.0);
+
+        // 2. Get topological score based on ring distance
+        let topo_score = if let Some(dist) = self.hash_ring_distance_internal(peer, inner) {
+            let ring_size = inner.known_peers.len() + 1;
+            if ring_size <= 1 {
+                0.5
+            } else {
+                // Normalize: 1.0 for immediate neighbor (dist=1), decaying for further
+                // Using inverse linear: 1.0 - (dist / (ring_size / 2))
+                // Clamped to [0.0, 1.0]
+                let max_dist = ring_size / 2;
+                if max_dist == 0 {
+                    1.0
+                } else {
+                    (1.0 - (dist as f64 / max_dist as f64)).clamp(0.0, 1.0)
+                }
             }
+        } else {
+            0.5 // Default if no topology info
+        };
+
+        // 3. Weighted combination
+        (topo_score * WEIGHT_TOPO) + (net_score * WEIGHT_NET)
+    }
+
+    /// Generate a deterministic ordering hash for a peer, unique per local_id.
+    ///
+    /// This ensures each node gets a different but deterministic ordering of peers
+    /// when scores are equal, preventing all nodes from selecting the same subset.
+    fn peer_order_hash(&self, peer: &I, inner: &PeerStateInner<I>) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+
+        // Include local_id if available for per-node diversity
+        if let Some(ref local_id) = self.local_id {
+            local_id.hash(&mut hasher);
+        } else {
+            // Fallback: use a hash of known_peers count as entropy
+            inner.known_peers.len().hash(&mut hasher);
         }
 
-        // Fallback: arbitrary selection from demotable
-        demotable.into_iter().take(count).collect()
+        // Include the peer itself
+        peer.hash(&mut hasher);
+
+        hasher.finish()
+    }
+
+    /// Calculate hash ring distance without acquiring read lock (for use when holding write lock).
+    fn hash_ring_distance_internal(&self, peer: &I, inner: &PeerStateInner<I>) -> Option<usize> {
+        let local_id = self.local_id.as_ref()?;
+
+        if !inner.known_peers.contains(peer) {
+            return None;
+        }
+
+        let sorted_ring = self.get_or_compute_ring(inner);
+        let ring_size = sorted_ring.len();
+
+        let local_pos = find_position_in_ring(&sorted_ring, local_id)?;
+        let peer_pos = find_position_in_ring(&sorted_ring, peer)?;
+
+        // Calculate minimum distance (can go either direction on ring)
+        let forward = if peer_pos >= local_pos {
+            peer_pos - local_pos
+        } else {
+            ring_size - local_pos + peer_pos
+        };
+        let backward = ring_size - forward;
+
+        Some(forward.min(backward))
     }
 
     /// Promote the nearest lazy peer on the hash ring to eager.
@@ -1521,7 +1699,20 @@ impl<I: Clone + Eq + Hash + Ord> PeerStateBuilder<I> {
             }
 
             // local_id set but not using hash ring for initial classification
-            let state = PeerState::new_with_local_id(local_id);
+            // This gives us diverse peer ordering without ring neighbor protection
+            let state = PeerState {
+                inner: RwLock::new(PeerStateInner {
+                    eager: HashSet::new(),
+                    lazy: HashSet::new(),
+                    eager_vec: Vec::new(),
+                    lazy_vec: Vec::new(),
+                    known_peers: HashSet::new(),
+                    ring_neighbors: HashSet::new(),
+                    cached_ring: None,
+                }),
+                local_id: Some(local_id),
+                use_hash_ring: false, // No ring neighbor protection
+            };
             for peer in peers {
                 state.add_peer_auto(peer, self.max_peers, self.eager_fanout);
             }

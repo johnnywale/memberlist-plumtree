@@ -17,7 +17,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = []
-tokio = ["agnostic-io/tokio", "memberlist-core/tokio"]
+tokio = ["agnostic-io/tokio", "memberlist-core/tokio", "dep:tokio"]
 metrics = ["dep:metrics"]
 serde = ["dep:serde"]
 quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:webpki-roots", "dep:rustls-pemfile", "dep:thiserror", "dep:tokio"]
@@ -66,6 +66,7 @@ stable-hash = "0.4.3"
 # For tests, use full features but the same version as the optional dep
 tokio = { version = "1", features = ["full", "rt", "time", "sync"] }
 crossterm = "0.29"
+tempfile = "3"
 
 # Web dependencies for web-chat example
 axum = { version = "0.7", features = ["ws"] }

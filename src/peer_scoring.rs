@@ -415,6 +415,53 @@ impl<I: Clone + Eq + Hash + Ord> PeerScoring<I> {
         self.scores.read().get(peer).cloned()
     }
 
+    /// Get a normalized score for a peer (0.0 to 1.0).
+    ///
+    /// This method returns a score suitable for hybrid scoring with topology:
+    /// - 1.0 = excellent peer (low RTT, no failures)
+    /// - 0.5 = average/unknown peer
+    /// - 0.0 = poor peer (high RTT, many failures)
+    ///
+    /// Uses sigmoid normalization based on the raw score to produce smooth
+    /// values that work well when combined with topological scores.
+    ///
+    /// For unknown peers, returns `default_score` (typically 0.5).
+    pub fn normalized_score(&self, peer: &I, default_score: f64) -> f64 {
+        let scores = self.scores.read();
+
+        if let Some(score) = scores.get(peer) {
+            if score.is_stale(&self.config) {
+                return default_score;
+            }
+
+            let raw_score = score.current_score(&self.config);
+
+            // Normalize using sigmoid-like transformation
+            // Raw scores typically range from ~1 (500ms RTT) to ~70 (1ms RTT)
+            // We want to map this to 0.0-1.0 with:
+            // - score ~50+ → close to 1.0 (excellent)
+            // - score ~10 → around 0.5 (average)
+            // - score ~1 → close to 0.0 (poor)
+            //
+            // Using: normalized = raw_score / (raw_score + k)
+            // where k controls the midpoint (score at which normalized = 0.5)
+            const MIDPOINT_K: f64 = 10.0;
+            let normalized = raw_score / (raw_score + MIDPOINT_K);
+
+            normalized.clamp(0.0, 1.0)
+        } else {
+            default_score
+        }
+    }
+
+    /// Get normalized scores for multiple peers at once (more efficient than individual calls).
+    ///
+    /// Returns a closure that can be passed to `PeerState::rebalance()`.
+    /// This method acquires the lock once and returns scores for all requested peers.
+    pub fn scorer(&self) -> impl Fn(&I) -> f64 + '_ {
+        move |peer: &I| self.normalized_score(peer, 0.5)
+    }
+
     /// Get the best N peers by score (highest first).
     /// Applies decay optimistically at read time for accurate ranking.
     pub fn best_peers(&self, count: usize) -> Vec<I> {

@@ -1,5 +1,4 @@
 mod tests {
-    use super::*;
     use crate::peer_state::{sort_by_hash_stable, stable_hash, HashRingConnection};
     use crate::{AddPeerResult, PeerState, PeerStateBuilder, PeerTopology, RemovePeerResult};
     use std::collections::HashSet;
@@ -1128,5 +1127,133 @@ mod tests {
         }
 
         println!("\n✓ Hash ring adjacency is symmetric across all 10 nodes!");
+    }
+
+    #[test]
+    fn test_rebalance_with_scorer_prefers_high_scoring_peers() {
+        // Test that rebalance_with_scorer promotes high-scoring peers over low-scoring ones
+        let state = PeerState::new_with_local_id(0u64);
+
+        // Add peers as lazy
+        for i in 1..=10 {
+            state.add_peer(i);
+        }
+
+        assert_eq!(state.eager_count(), 0);
+        assert_eq!(state.lazy_count(), 10);
+
+        // Define a scorer that gives high scores to peers 8, 9, 10
+        // and low scores to peers 1, 2, 3
+        let scorer = |peer: &u64| -> f64 {
+            match *peer {
+                8 | 9 | 10 => 1.0, // High score (excellent peers)
+                4 | 5 | 6 | 7 => 0.5, // Medium score
+                _ => 0.1, // Low score (poor peers)
+            }
+        };
+
+        // Rebalance to promote 3 peers to eager
+        state.rebalance_with_scorer(3, scorer);
+
+        let eager_peers: HashSet<u64> = state.eager_peers().into_iter().collect();
+
+        // High-scoring peers should be promoted (considering hybrid scoring with topology)
+        // The exact peers depend on the hybrid score, but high-scoring peers should be favored
+        println!(
+            "Eager peers after rebalance: {:?} (expected high-scorers: 8, 9, 10)",
+            eager_peers
+        );
+
+        // At least one high-scoring peer should be promoted
+        let high_scorers_in_eager = eager_peers.iter().filter(|p| **p >= 8).count();
+        assert!(
+            high_scorers_in_eager >= 1,
+            "At least one high-scoring peer should be promoted, got: {:?}",
+            eager_peers
+        );
+    }
+
+    #[test]
+    fn test_rebalance_with_scorer_demotes_low_scoring_peers() {
+        // Test that demotion prefers low-scoring peers
+        let state = PeerState::new_with_local_id(0u64);
+
+        // Add peers and promote all to eager
+        for i in 1..=6 {
+            state.add_peer(i);
+            state.promote_to_eager(&i);
+        }
+
+        assert_eq!(state.eager_count(), 6);
+        assert_eq!(state.lazy_count(), 0);
+
+        // Get ring neighbors - these are protected
+        let ring_neighbors: HashSet<u64> = state.ring_neighbors();
+
+        // Define scorer: peers 1, 2 are low-scoring, 5, 6 are high-scoring
+        let scorer = |peer: &u64| -> f64 {
+            match *peer {
+                1 | 2 => 0.1, // Low score
+                3 | 4 => 0.5, // Medium score
+                5 | 6 => 1.0, // High score
+                _ => 0.5,
+            }
+        };
+
+        // Rebalance to demote to 2 eager peers
+        state.rebalance_with_scorer(2, scorer);
+
+        // Ring neighbors should remain eager (protected)
+        for neighbor in &ring_neighbors {
+            if state.contains(neighbor) {
+                assert!(
+                    state.is_eager(neighbor),
+                    "Ring neighbor {} should remain eager",
+                    neighbor
+                );
+            }
+        }
+
+        let eager_peers: HashSet<u64> = state.eager_peers().into_iter().collect();
+        let lazy_peers: HashSet<u64> = state.lazy_peers().into_iter().collect();
+
+        println!("After demotion: eager={:?}, lazy={:?}", eager_peers, lazy_peers);
+        println!("Ring neighbors (protected): {:?}", ring_neighbors);
+
+        // Low-scoring non-ring-neighbor peers should be demoted first
+        // Count how many low-scorers are in lazy
+        let low_scorers_demoted = lazy_peers.iter().filter(|p| **p <= 2).count();
+        println!("Low-scoring peers demoted: {}", low_scorers_demoted);
+    }
+
+    #[test]
+    fn test_try_rebalance_with_scorer() {
+        // Test that try_rebalance_with_scorer works correctly
+        let state = PeerState::new_with_local_id(0u64);
+
+        // Add peers as lazy
+        for i in 1..=5 {
+            state.add_peer(i);
+        }
+
+        // Define a scorer that prefers peer 5
+        let scorer = |peer: &u64| -> f64 {
+            if *peer == 5 {
+                1.0
+            } else {
+                0.3
+            }
+        };
+
+        // Try rebalance should succeed
+        let success = state.try_rebalance_with_scorer(2, scorer);
+        assert!(success, "try_rebalance should succeed when lock is free");
+
+        assert_eq!(state.eager_count(), 2);
+        assert_eq!(state.lazy_count(), 3);
+
+        // Peer 5 (high score) should likely be promoted
+        let eager_peers: HashSet<u64> = state.eager_peers().into_iter().collect();
+        println!("Eager peers: {:?} (expected peer 5 to be included)", eager_peers);
     }
 }

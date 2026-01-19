@@ -24,6 +24,8 @@ Plumtree combines the efficiency of tree-based broadcast with the reliability of
 - **Connection Pooling**: Efficient connection management with per-peer queues
 - **Adaptive Batching**: Dynamic IHave batch sizing based on network conditions
 - **Dynamic Cleanup Tuning**: Lock-free rate tracking with adaptive cleanup intervals
+- **Lazarus Seed Recovery**: Automatic reconnection to restarted seed nodes
+- **Peer Persistence**: Save known peers to disk for crash recovery
 
 ## How Plumtree Works
 
@@ -162,7 +164,7 @@ memberlist-plumtree = "0.1"
 
 | Feature | Description |
 |---------|-------------|
-| `tokio` | Enable Tokio runtime support |
+| `tokio` | Enable Tokio runtime support (required for Lazarus background task) |
 | `metrics` | Enable metrics collection via the `metrics` crate |
 | `serde` | Enable serialization/deserialization for config |
 
@@ -550,6 +552,98 @@ stack.shutdown().await?;
 - **Simplified join API**: Just pass seed addresses, no need to deal with `MaybeResolvedAddress`
 - **Integrated lifecycle**: Single struct manages both Memberlist and Plumtree
 - **Peer sync**: `PlumtreeNodeDelegate` automatically syncs Plumtree peers when Memberlist membership changes
+- **Lazarus seed recovery**: Automatic reconnection to restarted seed nodes (see below)
+- **Peer persistence**: Save known peers to disk for crash recovery
+
+### Lazarus Seed Recovery
+
+The "Lazarus" feature solves the **Ghost Seed Problem**: when a seed node fails and restarts, other nodes have already marked it as dead and stopped probing it. Without intervention, the restarted seed remains isolated.
+
+**How it works:**
+1. Configure static seed addresses in `BridgeConfig`
+2. Enable the Lazarus background task
+3. The task periodically checks if seeds are in the alive set
+4. Missing seeds are automatically probed and rejoined
+
+```rust
+use memberlist_plumtree::{BridgeConfig, MemberlistStack};
+use std::time::Duration;
+use std::path::PathBuf;
+
+// Configure Lazarus seed recovery
+let config = BridgeConfig::new()
+    // Static seeds to monitor
+    .with_static_seeds(vec![
+        "192.168.1.100:7946".parse().unwrap(),
+        "192.168.1.101:7946".parse().unwrap(),
+        "192.168.1.102:7946".parse().unwrap(),
+    ])
+    // Enable the Lazarus background task
+    .with_lazarus_enabled(true)
+    // Probe interval (default: 30 seconds)
+    .with_lazarus_interval(Duration::from_secs(30))
+    // Optional: persist known peers for crash recovery
+    .with_persistence_path(PathBuf::from("/var/lib/myapp/peers.txt"));
+
+// After creating MemberlistStack, spawn the Lazarus task
+let lazarus_handle = stack.spawn_lazarus_task(config);
+
+// Monitor Lazarus statistics
+let stats = lazarus_handle.stats();
+println!("Probes sent: {}", stats.probes_sent);
+println!("Reconnections: {}", stats.reconnections);
+println!("Missing seeds: {}", stats.missing_seeds);
+
+// Gracefully shutdown when done
+lazarus_handle.shutdown();
+```
+
+**BridgeConfig Parameters:**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `static_seeds` | `[]` | List of seed node addresses to monitor |
+| `lazarus_enabled` | `false` | Enable the Lazarus background task |
+| `lazarus_interval` | 30s | Interval between seed probes |
+| `persistence_path` | `None` | Path to persist known peers |
+| `log_changes` | `true` | Log topology changes |
+| `auto_promote` | `true` | Auto-promote new peers based on fanout |
+
+### Peer Persistence
+
+For crash recovery, `MemberlistStack` can save known peer addresses to disk. Combined with static seeds, this provides robust bootstrap options:
+
+```rust
+use memberlist_plumtree::{persistence, BridgeConfig, MemberlistStack};
+
+// Save current peers to file (call periodically or on shutdown)
+stack.save_peers_to_file(&PathBuf::from("/var/lib/myapp/peers.txt")).await?;
+
+// On startup, load bootstrap addresses from both sources
+let config = BridgeConfig::new()
+    .with_static_seeds(vec!["192.168.1.100:7946".parse().unwrap()])
+    .with_persistence_path(PathBuf::from("/var/lib/myapp/peers.txt"));
+
+// Combines static seeds + persisted peers (deduplicated)
+let bootstrap_addrs = MemberlistStack::load_bootstrap_addresses(&config);
+
+// Use bootstrap addresses to join the cluster
+stack.join(&bootstrap_addrs).await?;
+```
+
+**Persistence File Format:**
+```
+# Comments are supported
+192.168.1.100:7946
+192.168.1.101:7946
+192.168.1.102:7946
+```
+
+**Important:** Each node should use a **unique persistence path** to avoid conflicts:
+```rust
+let node_id = "node-42";
+let path = PathBuf::from(format!("/var/lib/myapp/{}/peers.txt", node_id));
+```
 
 **When to use each API**:
 

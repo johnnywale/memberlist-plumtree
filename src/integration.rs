@@ -909,7 +909,13 @@ where
 
     async fn notify_leave(&self, node: Arc<NodeState<Self::Id, Self::Address>>) {
         // Sync: Remove from Plumtree peers immediately to stop sending to dead node
-        self.peers.remove_peer(node.id());
+        let result = self.peers.remove_peer(node.id());
+
+        // If an eager peer was removed, rebalance to promote a lazy peer
+        // This maintains tree connectivity when eager peers leave
+        if result.was_eager() {
+            self.peers.rebalance(self.eager_fanout);
+        }
 
         self.inner.notify_leave(node).await;
     }

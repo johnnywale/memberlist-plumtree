@@ -27,7 +27,7 @@ use crate::{
     health::{HealthReport, HealthReportBuilder},
     message::{MessageCache, MessageId, PlumtreeMessage},
     peer_scoring::{PeerScoring, ScoringConfig},
-    peer_state::{PeerState, SharedPeerState},
+    peer_state::SharedPeerState,
     rate_limiter::RateLimiter,
     scheduler::{GraftTimer, IHaveScheduler, PendingIHave},
     PeerStateBuilder,
@@ -546,6 +546,7 @@ where
         );
 
         // Create peer state with or without hash ring topology
+        // Always set local_id for diverse peer selection even without hash ring
         let peers = if config.use_hash_ring {
             Arc::new(
                 PeerStateBuilder::new()
@@ -554,7 +555,12 @@ where
                     .build(),
             )
         } else {
-            Arc::new(PeerState::new())
+            Arc::new(
+                PeerStateBuilder::new()
+                    .use_hash_ring(false)
+                    .with_local_id(local_id.clone())
+                    .build(),
+            )
         };
 
         let inner = Arc::new(PlumtreeInner {
@@ -1516,8 +1522,17 @@ where
             if self.inner.peers.needs_repair(target_eager) {
                 let stats_before = self.inner.peers.stats();
 
+                // Use network-aware rebalancing with PeerScoring
+                // This prefers peers with lower RTT and higher reliability for eager set
+                let peer_scoring = &self.inner.peer_scoring;
+                let scorer = |peer: &I| peer_scoring.normalized_score(peer, 0.5);
+
                 // Try non-blocking rebalance first to avoid contention
-                if self.inner.peers.try_rebalance(target_eager) {
+                if self
+                    .inner
+                    .peers
+                    .try_rebalance_with_scorer(target_eager, scorer)
+                {
                     let stats_after = self.inner.peers.stats();
                     let promoted = stats_after
                         .eager_count
@@ -1530,7 +1545,7 @@ where
                             eager_after = stats_after.eager_count,
                             lazy_count = stats_after.lazy_count,
                             target = target_eager,
-                            "topology repair: promoted lazy peers to eager"
+                            "topology repair: promoted lazy peers to eager (network-aware)"
                         );
 
                         #[cfg(feature = "metrics")]
@@ -1568,9 +1583,20 @@ where
         self.inner.shutdown.load(Ordering::Acquire)
     }
 
-    /// Rebalance peers to match target fanout.
+    /// Rebalance peers to match target fanout using network-aware scoring.
+    ///
+    /// Uses hybrid scoring that combines:
+    /// - Topology proximity (hash ring distance)
+    /// - Network performance (RTT and reliability from PeerScoring)
+    ///
+    /// Ring neighbors are protected and will not be demoted.
     pub fn rebalance_peers(&self) {
-        self.inner.peers.rebalance(self.inner.config.eager_fanout);
+        let peer_scoring = &self.inner.peer_scoring;
+        self.inner
+            .peers
+            .rebalance_with_scorer(self.inner.config.eager_fanout, |peer| {
+                peer_scoring.normalized_score(peer, 0.5)
+            });
     }
 
     /// Get access to the peer state for testing/debugging.
