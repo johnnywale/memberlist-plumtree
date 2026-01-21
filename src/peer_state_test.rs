@@ -1256,4 +1256,265 @@ mod tests {
         let eager_peers: HashSet<u64> = state.eager_peers().into_iter().collect();
         println!("Eager peers: {:?} (expected peer 5 to be included)", eager_peers);
     }
+
+    #[test]
+    fn test_remove_peer_auto_preserves_total_count() {
+        // Test that remove_peer_auto removes exactly one peer and rebalances
+        // Total count should be exactly (original - 1) after removal
+        let state = PeerState::new_with_local_id(0u64);
+
+        // Add 10 peers using add_peer_auto (3 eager, 7 lazy expected)
+        for i in 1..=10 {
+            state.add_peer_auto(i, None, 3);
+        }
+
+        let initial_eager = state.eager_count();
+        let initial_lazy = state.lazy_count();
+        let initial_total = initial_eager + initial_lazy;
+
+        assert_eq!(initial_total, 10);
+        assert_eq!(initial_eager, 3);
+        assert_eq!(initial_lazy, 7);
+
+        // Find a lazy peer to remove (with hash ring, specific peers may be eager)
+        let lazy_peers = state.lazy_peers();
+        assert!(!lazy_peers.is_empty(), "Should have lazy peers");
+        let peer_to_remove = lazy_peers[0];
+
+        // Remove a lazy peer
+        let result = state.remove_peer_auto(&peer_to_remove, 3);
+        assert_eq!(result, RemovePeerResult::RemovedLazy);
+
+        let after_lazy_removal_eager = state.eager_count();
+        let after_lazy_removal_lazy = state.lazy_count();
+        let after_lazy_removal_total = after_lazy_removal_eager + after_lazy_removal_lazy;
+
+        // Total should be exactly 9 (10 - 1)
+        assert_eq!(
+            after_lazy_removal_total, 9,
+            "After removing lazy peer: eager={}, lazy={}, total={} (expected 9)",
+            after_lazy_removal_eager, after_lazy_removal_lazy, after_lazy_removal_total
+        );
+
+        // Eager count should remain 3 (rebalancing shouldn't change it since we removed lazy)
+        assert_eq!(after_lazy_removal_eager, 3);
+        assert_eq!(after_lazy_removal_lazy, 6);
+
+        println!(
+            "After removing lazy peer {}: eager={}, lazy={}, total={}",
+            peer_to_remove, after_lazy_removal_eager, after_lazy_removal_lazy, after_lazy_removal_total
+        );
+    }
+
+    #[test]
+    fn test_remove_peer_auto_eager_triggers_rebalance() {
+        // Test that removing an eager peer triggers rebalancing
+        // Ring neighbors should be promoted from lazy to eager
+        let state = PeerState::new_with_local_id(0u64);
+
+        // Add 10 peers
+        for i in 1..=10 {
+            state.add_peer_auto(i, None, 3);
+        }
+
+        let initial_total = state.eager_count() + state.lazy_count();
+        assert_eq!(initial_total, 10);
+
+        // Find an eager peer that is NOT a ring neighbor (can be removed without protection issues)
+        let ring_neighbors = state.ring_neighbors();
+        let eager_peers = state.eager_peers();
+        let removable_eager: Option<u64> = eager_peers
+            .iter()
+            .find(|p| !ring_neighbors.contains(p))
+            .cloned();
+
+        if let Some(peer_to_remove) = removable_eager {
+            let result = state.remove_peer_auto(&peer_to_remove, 3);
+            assert_eq!(result, RemovePeerResult::RemovedEager);
+
+            let after_removal_eager = state.eager_count();
+            let after_removal_lazy = state.lazy_count();
+            let after_removal_total = after_removal_eager + after_removal_lazy;
+
+            // Total should be exactly 9
+            assert_eq!(
+                after_removal_total, 9,
+                "After removing eager peer: eager={}, lazy={}, total={} (expected 9)",
+                after_removal_eager, after_removal_lazy, after_removal_total
+            );
+
+            // After rebalancing, eager count should be back to 3 (if enough lazy peers)
+            // or at least ring neighbors should be in eager
+            for neighbor in &ring_neighbors {
+                if state.contains(neighbor) {
+                    assert!(
+                        state.is_eager(neighbor),
+                        "Ring neighbor {} should be in eager set after rebalance",
+                        neighbor
+                    );
+                }
+            }
+
+            println!(
+                "After removing eager peer {}: eager={}, lazy={}, total={}",
+                peer_to_remove, after_removal_eager, after_removal_lazy, after_removal_total
+            );
+        } else {
+            // All eager peers are ring neighbors, try removing one anyway
+            let peer_to_remove = eager_peers[0];
+            let result = state.remove_peer_auto(&peer_to_remove, 3);
+            assert_eq!(result, RemovePeerResult::RemovedEager);
+
+            let after_removal_total = state.eager_count() + state.lazy_count();
+            assert_eq!(after_removal_total, 9);
+        }
+    }
+
+    #[test]
+    fn test_remove_peer_auto_not_found() {
+        let state = PeerState::new_with_local_id(0u64);
+
+        // Add some peers
+        for i in 1..=5 {
+            state.add_peer_auto(i, None, 2);
+        }
+
+        // Try to remove non-existent peer
+        let result = state.remove_peer_auto(&99, 2);
+        assert_eq!(result, RemovePeerResult::NotFound);
+
+        // Total should be unchanged
+        assert_eq!(state.eager_count() + state.lazy_count(), 5);
+    }
+
+    #[test]
+    fn test_remove_peer_auto_all_peers() {
+        // Test removing all peers one by one
+        let state = PeerState::new_with_local_id(0u64);
+
+        // Add 5 peers
+        for i in 1..=5 {
+            state.add_peer_auto(i, None, 2);
+        }
+
+        assert_eq!(state.eager_count() + state.lazy_count(), 5);
+
+        // Remove all peers
+        for i in 1..=5 {
+            let before_total = state.eager_count() + state.lazy_count();
+            let result = state.remove_peer_auto(&i, 2);
+            assert!(result.was_removed(), "Peer {} should be removed", i);
+
+            let after_total = state.eager_count() + state.lazy_count();
+            assert_eq!(
+                after_total,
+                before_total - 1,
+                "After removing peer {}: total should be {} but got {}",
+                i,
+                before_total - 1,
+                after_total
+            );
+        }
+
+        // All peers removed
+        assert_eq!(state.eager_count(), 0);
+        assert_eq!(state.lazy_count(), 0);
+        assert_eq!(state.total_count(), 0);
+    }
+
+    #[test]
+    fn test_remove_peer_auto_rebalance_ring_neighbors_promoted() {
+        // Test that when we remove peers, ring neighbors are prioritized in eager set
+        // Note: Not all ring neighbors will be eager if there are more ring neighbors than eager_fanout
+        let state = PeerState::new_with_local_id(0u64);
+
+        // Add 20 peers with hash ring
+        for i in 1..=20 {
+            state.add_peer_auto(i, None, 3);
+        }
+
+        let initial_total = state.eager_count() + state.lazy_count();
+        assert_eq!(initial_total, 20);
+
+        // Get ring neighbors before any removal
+        let ring_neighbors_before = state.ring_neighbors();
+        println!("Ring neighbors before removal: {:?}", ring_neighbors_before);
+
+        // Remove several peers (not ring neighbors)
+        let mut removed_count = 0;
+        for i in 10..=15 {
+            if !ring_neighbors_before.contains(&i) && state.contains(&i) {
+                let result = state.remove_peer_auto(&i, 3);
+                if result.was_removed() {
+                    removed_count += 1;
+                }
+            }
+        }
+
+        let final_total = state.eager_count() + state.lazy_count();
+        assert_eq!(
+            final_total,
+            initial_total - removed_count,
+            "Expected {} peers after removing {}, got {}",
+            initial_total - removed_count,
+            removed_count,
+            final_total
+        );
+
+        // Ring neighbors that are in eager should still be in eager
+        // Count how many ring neighbors are in eager vs eager_fanout
+        let ring_neighbors_after = state.ring_neighbors();
+        let ring_neighbors_in_eager: Vec<_> = ring_neighbors_after
+            .iter()
+            .filter(|n| state.is_eager(n))
+            .collect();
+
+        // At least some ring neighbors should be in eager (up to eager_fanout)
+        let expected_ring_in_eager = ring_neighbors_after.len().min(3); // eager_fanout = 3
+        assert!(
+            ring_neighbors_in_eager.len() >= expected_ring_in_eager.saturating_sub(1),
+            "Expected at least {} ring neighbors in eager, got {} (ring_neighbors={:?}, eager={:?})",
+            expected_ring_in_eager.saturating_sub(1),
+            ring_neighbors_in_eager.len(),
+            ring_neighbors_after,
+            state.eager_peers()
+        );
+
+        println!(
+            "After removing {} peers: eager={}, lazy={}, total={}, ring_neighbors_in_eager={}",
+            removed_count,
+            state.eager_count(),
+            state.lazy_count(),
+            final_total,
+            ring_neighbors_in_eager.len()
+        );
+    }
+
+    #[test]
+    fn test_remove_peer_auto_without_hash_ring() {
+        // Test remove_peer_auto when hash ring is not enabled
+        let state: PeerState<u64> = PeerState::new();
+
+        // Add peers (no hash ring, simple first-come-first-served)
+        for i in 1..=10 {
+            state.add_peer_auto(i, None, 3);
+        }
+
+        let initial_total = state.eager_count() + state.lazy_count();
+        assert_eq!(initial_total, 10);
+        assert_eq!(state.eager_count(), 3);
+        assert_eq!(state.lazy_count(), 7);
+
+        // Remove an eager peer
+        let result = state.remove_peer_auto(&1, 3);
+        assert_eq!(result, RemovePeerResult::RemovedEager);
+
+        let after_total = state.eager_count() + state.lazy_count();
+        assert_eq!(after_total, 9);
+
+        // Without hash ring, eager count should decrease (no automatic rebalance)
+        // The rebalance_eager_with_ring_neighbors is skipped when !use_hash_ring
+        assert_eq!(state.eager_count(), 2);
+        assert_eq!(state.lazy_count(), 7);
+    }
 }

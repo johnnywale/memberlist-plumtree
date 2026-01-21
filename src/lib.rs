@@ -96,7 +96,8 @@ pub use message::{
 
 // Re-export peer state types
 pub use peer_state::{
-    AddPeerResult, PeerState, PeerStateBuilder, PeerStats, PeerTopology, RemovePeerResult,
+    AddPeerResult, PeerState, PeerStateBuilder, PeerStats, PeerTopology, RebalanceResult,
+    RemovePeerResult,
 };
 
 // Re-export peer scoring types
@@ -119,8 +120,8 @@ pub use runner::{PlumtreeRunner, PlumtreeRunnerBuilder};
 pub use integration::{
     decode_plumtree_envelope, decode_plumtree_message, encode_plumtree_envelope,
     encode_plumtree_envelope_into, encode_plumtree_message, envelope_encoded_len,
-    is_plumtree_message, BroadcastEnvelope, IdCodec, PlumtreeEventHandler, PlumtreeMemberlist,
-    PlumtreeNodeDelegate,
+    is_plumtree_message, BroadcastEnvelope, DemotionCallback, IdCodec, PlumtreeEventHandler,
+    PlumtreeMemberlist, PlumtreeNodeDelegate, PromotionCallback,
 };
 
 // Re-export scheduler types

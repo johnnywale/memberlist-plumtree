@@ -16,7 +16,7 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
-default = []
+default = ["tokio", "metrics", "serde", "quic"]
 tokio = ["agnostic-io/tokio", "memberlist-core/tokio", "dep:tokio"]
 metrics = ["dep:metrics"]
 serde = ["dep:serde"]

@@ -687,6 +687,12 @@ where
     }
 }
 
+/// Callback for handling peer promotion events during rebalancing.
+pub type PromotionCallback<I> = Arc<dyn Fn(&I) + Send + Sync>;
+
+/// Callback for handling peer demotion events during rebalancing.
+pub type DemotionCallback<I> = Arc<dyn Fn(&I) + Send + Sync>;
+
 /// Delegate that intercepts messages for Plumtree protocol.
 ///
 /// Wraps a user delegate and handles Plumtree message routing.
@@ -707,6 +713,10 @@ pub struct PlumtreeNodeDelegate<I, A, D> {
     eager_fanout: usize,
     /// Maximum total peers allowed (None = unlimited).
     max_peers: Option<usize>,
+    /// Optional callback for peer promotion events during rebalancing.
+    on_promotion: Option<PromotionCallback<I>>,
+    /// Optional callback for peer demotion events during rebalancing.
+    on_demotion: Option<DemotionCallback<I>>,
     /// Marker.
     _marker: PhantomData<A>,
 }
@@ -753,8 +763,28 @@ impl<I, A, D> PlumtreeNodeDelegate<I, A, D> {
             peers,
             eager_fanout,
             max_peers,
+            on_promotion: None,
+            on_demotion: None,
             _marker: PhantomData,
         }
+    }
+
+    /// Set the callback for peer promotion events during rebalancing.
+    ///
+    /// This callback is invoked when a lazy peer is promoted to eager
+    /// during rebalancing (e.g., when an eager peer leaves the cluster).
+    pub fn with_promotion_callback(mut self, callback: PromotionCallback<I>) -> Self {
+        self.on_promotion = Some(callback);
+        self
+    }
+
+    /// Set the callback for peer demotion events during rebalancing.
+    ///
+    /// This callback is invoked when an eager peer is demoted to lazy
+    /// during rebalancing (e.g., when too many eager peers exist).
+    pub fn with_demotion_callback(mut self, callback: DemotionCallback<I>) -> Self {
+        self.on_demotion = Some(callback);
+        self
     }
 
     /// Get a reference to the inner delegate.
@@ -914,7 +944,19 @@ where
         // If an eager peer was removed, rebalance to promote a lazy peer
         // This maintains tree connectivity when eager peers leave
         if result.was_eager() {
-            self.peers.rebalance(self.eager_fanout);
+            let rebalance_result = self.peers.rebalance(self.eager_fanout);
+
+            // Trigger callbacks for any peers that were promoted or demoted
+            if let Some(ref on_promotion) = self.on_promotion {
+                for peer in &rebalance_result.promoted {
+                    on_promotion(peer);
+                }
+            }
+            if let Some(ref on_demotion) = self.on_demotion {
+                for peer in &rebalance_result.demoted {
+                    on_demotion(peer);
+                }
+            }
         }
 
         self.inner.notify_leave(node).await;

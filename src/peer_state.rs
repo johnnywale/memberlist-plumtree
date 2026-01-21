@@ -88,6 +88,40 @@ impl RemovePeerResult {
     }
 }
 
+/// Result of a rebalance operation.
+///
+/// Contains the lists of peers that were promoted or demoted during rebalancing.
+/// This allows callers to trigger appropriate callbacks (e.g., `on_eager_promotion`,
+/// `on_lazy_demotion`) for each changed peer.
+#[derive(Debug, Clone)]
+pub struct RebalanceResult<I> {
+    /// Peers that were promoted from lazy to eager.
+    pub promoted: Vec<I>,
+    /// Peers that were demoted from eager to lazy.
+    pub demoted: Vec<I>,
+}
+
+impl<I> Default for RebalanceResult<I> {
+    fn default() -> Self {
+        Self {
+            promoted: Vec::new(),
+            demoted: Vec::new(),
+        }
+    }
+}
+
+impl<I> RebalanceResult<I> {
+    /// Returns true if any peers were promoted or demoted.
+    pub fn has_changes(&self) -> bool {
+        !self.promoted.is_empty() || !self.demoted.is_empty()
+    }
+
+    /// Returns the total number of changes (promotions + demotions).
+    pub fn change_count(&self) -> usize {
+        self.promoted.len() + self.demoted.len()
+    }
+}
+
 /// Snapshot of the current peer topology.
 ///
 /// Contains the list of eager and lazy peers at a point in time.
@@ -804,6 +838,56 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
         }
     }
 
+    /// Remove a peer with automatic rebalancing based on config limits.
+    ///
+    /// This method removes a peer and then rebalances the eager set to ensure
+    /// ring neighbors are properly maintained. It mirrors `add_peer_auto` behavior.
+    ///
+    /// # Arguments
+    ///
+    /// * `peer` - The peer to remove
+    /// * `eager_fanout` - Target number of eager peers (used for rebalancing)
+    ///
+    /// # Returns
+    ///
+    /// A [`RemovePeerResult`] indicating the outcome of the operation.
+    pub fn remove_peer_auto(&self, peer: &I, eager_fanout: usize) -> RemovePeerResult {
+        let mut inner = self.inner.write();
+
+        // Remove from known_peers
+        if !inner.known_peers.remove(peer) {
+            return RemovePeerResult::NotFound;
+        }
+
+        // Invalidate ring cache
+        Self::invalidate_ring_cache(&mut inner);
+
+        // Remove from ring_neighbors if present
+        inner.ring_neighbors.remove(peer);
+
+        // Determine which set the peer was in and remove
+        let result = if inner.eager.remove(peer) {
+            inner.eager_vec.retain(|p| p != peer);
+            RemovePeerResult::RemovedEager
+        } else if inner.lazy.remove(peer) {
+            inner.lazy_vec.retain(|p| p != peer);
+            RemovePeerResult::RemovedLazy
+        } else {
+            // Was in known_peers but not eager or lazy (shouldn't happen)
+            RemovePeerResult::NotFound
+        };
+
+        // Update ring neighbors after removal
+        self.update_ring_neighbors(&mut inner);
+
+        // Rebalance to ensure ring neighbors are in eager (only if hash ring enabled)
+        if self.local_id.is_some() && self.use_hash_ring {
+            self.rebalance_eager_with_ring_neighbors(&mut inner, eager_fanout);
+        }
+
+        result
+    }
+
     /// Rebalance eager set to prefer ring neighbors over non-ring-neighbors.
     ///
     /// This method ensures that ring neighbors are in the eager set by swapping:
@@ -1245,8 +1329,11 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
     /// When `local_id` is set, uses hash ring-based selection for promotions
     /// to maintain optimal topology.
     ///
+    /// Returns a [`RebalanceResult`] containing the lists of promoted and demoted peers,
+    /// allowing callers to trigger appropriate callbacks.
+    ///
     /// **Note**: Ring neighbors are protected and will not be demoted.
-    pub fn rebalance(&self, target_eager: usize) {
+    pub fn rebalance(&self, target_eager: usize) -> RebalanceResult<I> {
         self.rebalance_with_scorer(target_eager, |_| 0.5)
     }
 
@@ -1255,6 +1342,9 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
     /// The `scorer` closure should return a value between 0.0 (worst) and 1.0 (best).
     /// This allows combining topological preference with network performance metrics
     /// (e.g., RTT, reliability) from `PeerScoring`.
+    ///
+    /// Returns a [`RebalanceResult`] containing the lists of promoted and demoted peers,
+    /// allowing callers to trigger appropriate callbacks.
     ///
     /// # Hybrid Scoring
     ///
@@ -1281,15 +1371,19 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
     /// // ... record RTT samples ...
     ///
     /// // Rebalance using network performance scores
-    /// peer_state.rebalance_with_scorer(3, |peer| {
+    /// let result = peer_state.rebalance_with_scorer(3, |peer| {
     ///     peer_scoring.normalized_score(peer, 0.5)
     /// });
+    /// for peer in &result.promoted {
+    ///     delegate.on_eager_promotion(peer);
+    /// }
     /// ```
-    pub fn rebalance_with_scorer<F>(&self, target_eager: usize, scorer: F)
+    pub fn rebalance_with_scorer<F>(&self, target_eager: usize, scorer: F) -> RebalanceResult<I>
     where
         F: Fn(&I) -> f64,
     {
         let mut inner = self.inner.write();
+        let mut result = RebalanceResult::default();
 
         let current_eager = inner.eager.len();
 
@@ -1304,7 +1398,8 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
                 inner.eager.insert(peer.clone());
                 // Update caches
                 inner.lazy_vec.retain(|p| *p != peer);
-                inner.eager_vec.push(peer);
+                inner.eager_vec.push(peer.clone());
+                result.promoted.push(peer);
             }
         } else if current_eager > target_eager {
             // Need to demote some eager peers to lazy
@@ -1317,9 +1412,12 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
                 inner.lazy.insert(peer.clone());
                 // Update caches
                 inner.eager_vec.retain(|p| *p != peer);
-                inner.lazy_vec.push(peer);
+                inner.lazy_vec.push(peer.clone());
+                result.demoted.push(peer);
             }
         }
+
+        result
     }
 
     /// Select eager peers to demote using hybrid scoring.

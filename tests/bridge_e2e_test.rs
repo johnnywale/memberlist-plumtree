@@ -208,12 +208,8 @@ impl PlumtreeDelegate<TestNodeId> for TrackingDelegate {
 // ============================================================================
 
 /// The memberlist transport type.
-type MemberlistTransport = memberlist::net::NetTransport<
-    TestNodeId,
-    TokioSocketAddrResolver,
-    TokioTcp,
-    TokioRuntime,
->;
+type MemberlistTransport =
+    memberlist::net::NetTransport<TestNodeId, TokioSocketAddrResolver, TokioTcp, TokioRuntime>;
 
 /// The delegate type used by MemberlistStack.
 type StackDelegate = memberlist_plumtree::PlumtreeNodeDelegate<
@@ -252,10 +248,7 @@ impl RealStack {
     /// # Arguments
     /// * `name` - Node name/ID
     /// * `port` - Port for SWIM gossip (0 for random)
-    async fn new(
-        name: &str,
-        port: u16,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    async fn new(name: &str, port: u16) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let config = PlumtreeConfig::lan()
             .with_eager_fanout(3)
             .with_lazy_fanout(3)
@@ -288,16 +281,14 @@ impl RealStack {
 
         // Wrap VoidDelegate with PlumtreeNodeDelegate
         // This automatically syncs Plumtree's peer state when memberlist discovers peers
-        let void_delegate =
-            memberlist::delegate::VoidDelegate::<TestNodeId, SocketAddr>::default();
+        let void_delegate = memberlist::delegate::VoidDelegate::<TestNodeId, SocketAddr>::default();
         let plumtree_delegate = pm.wrap_delegate(void_delegate);
 
         // Create NetTransport options
-        let mut transport_opts = NetTransportOptions::<
-            TestNodeId,
-            SocketAddrResolver<TokioRuntime>,
-            TokioTcp,
-        >::new(node_id);
+        let mut transport_opts =
+            NetTransportOptions::<TestNodeId, SocketAddrResolver<TokioRuntime>, TokioTcp>::new(
+                node_id,
+            );
         transport_opts.add_bind_address(bind_addr);
 
         // Create Memberlist options (use local() preset for fast testing)
@@ -306,9 +297,10 @@ impl RealStack {
             .with_gossip_interval(Duration::from_millis(200));
 
         // Create Memberlist with the delegate
-        let memberlist = Memberlist::with_delegate(plumtree_delegate, transport_opts, memberlist_opts)
-            .await
-            .map_err(|e| format!("Failed to create memberlist: {}", e))?;
+        let memberlist =
+            Memberlist::with_delegate(plumtree_delegate, transport_opts, memberlist_opts)
+                .await
+                .map_err(|e| format!("Failed to create memberlist: {}", e))?;
 
         let advertise_addr = *memberlist.advertise_address();
 
@@ -404,7 +396,10 @@ impl RealStack {
     }
 
     /// Save current peers to a persistence file.
-    async fn save_peers_to_file(&self, path: &std::path::Path) -> Result<(), persistence::PersistenceError> {
+    async fn save_peers_to_file(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<(), persistence::PersistenceError> {
         self.stack.save_peers_to_file(path).await
     }
 }
@@ -599,10 +594,14 @@ async fn test_e2e_self_healing() {
 #[tokio::test]
 async fn test_e2e_peer_topology_after_node_departure() {
     // Config: 1 eager + 2 lazy = 3 peers max per node
+
+    let eager = 2;
+    let lazy = 4;
+
     let config = PlumtreeConfig::lan()
-        .with_eager_fanout(1)
-        .with_lazy_fanout(2)
-        .with_max_peers(5) // Allow all peers to be tracked
+        .with_eager_fanout(eager)
+        .with_lazy_fanout(lazy)
+        .with_max_peers(eager + lazy)
         .with_ihave_interval(Duration::from_millis(100))
         .with_graft_timeout(Duration::from_millis(500));
 
@@ -696,7 +695,10 @@ async fn test_e2e_peer_topology_after_node_departure() {
         assert!(
             total_peers >= 3,
             "Node {} should have at least 3 peers, got {} (eager={}, lazy={})",
-            i, total_peers, stats.eager_count, stats.lazy_count
+            i,
+            total_peers,
+            stats.eager_count,
+            stats.lazy_count
         );
     }
 
@@ -763,12 +765,16 @@ async fn test_e2e_peer_topology_after_node_departure() {
             assert!(
                 !topology.eager.contains(stopped_id),
                 "Node {} should NOT have stopped node {:?} in eager set, but found: {:?}",
-                i, stopped_id, topology.eager
+                i,
+                stopped_id,
+                topology.eager
             );
             assert!(
                 !topology.lazy.contains(stopped_id),
                 "Node {} should NOT have stopped node {:?} in lazy set, but found: {:?}",
-                i, stopped_id, topology.lazy
+                i,
+                stopped_id,
+                topology.lazy
             );
         }
 
@@ -782,7 +788,10 @@ async fn test_e2e_peer_topology_after_node_departure() {
         assert!(
             other_peer_count >= 2 && other_peer_count <= 3,
             "Node {} should have 2-3 other peers, got {} (eager={:?}, lazy={:?})",
-            i, other_peer_count, eager_others, lazy_others
+            i,
+            other_peer_count,
+            eager_others,
+            lazy_others
         );
 
         // Verify all peers (excluding self) are in the alive set - no references to stopped nodes
@@ -791,7 +800,9 @@ async fn test_e2e_peer_topology_after_node_departure() {
                 assert!(
                     alive_ids.contains(peer),
                     "Node {} has peer {:?} which is not in alive set {:?}",
-                    i, peer, alive_ids
+                    i,
+                    peer,
+                    alive_ids
                 );
             }
         }
@@ -801,7 +812,10 @@ async fn test_e2e_peer_topology_after_node_departure() {
     let total_stopped_refs: usize = (0..4)
         .map(|i| {
             let topology = nodes[i].topology();
-            stopped_ids.iter().filter(|sid| topology.eager.contains(sid) || topology.lazy.contains(sid)).count()
+            stopped_ids
+                .iter()
+                .filter(|sid| topology.eager.contains(sid) || topology.lazy.contains(sid))
+                .count()
         })
         .sum();
     assert!(
@@ -836,11 +850,16 @@ async fn test_e2e_peer_topology_after_node_departure() {
 /// 6. Verify all 6 nodes have 5 peers each (1 eager + 4 lazy from the 5 other nodes)
 #[tokio::test]
 async fn test_e2e_peer_topology_after_node_restart() {
+    let eager = 2;
+    let lazy = 4;
+    let total = 10;
+    let shutdown_index_1 = 4;
+    let shutdown_index_2 = 5;
     // Config: 1 eager + up to 4 lazy = 5 peers max per node
     let config = PlumtreeConfig::lan()
-        .with_eager_fanout(1)
-        .with_lazy_fanout(2)
-        .with_max_peers(5) // Allow all 5 other peers to be tracked
+        .with_eager_fanout(eager)
+        .with_lazy_fanout(lazy)
+        .with_max_peers(eager + lazy) // Allow all 5 other peers to be tracked
         .with_ihave_interval(Duration::from_millis(100))
         .with_graft_timeout(Duration::from_millis(500));
 
@@ -857,7 +876,7 @@ async fn test_e2e_peer_topology_after_node_restart() {
     sleep(Duration::from_millis(100)).await;
 
     // Start remaining 5 nodes
-    for i in 1..6 {
+    for i in 1..total {
         let node = RealStack::new_with_config(&format!("node-{}-rs", i), 0, config.clone())
             .await
             .expect(&format!("Failed to create node {}", i));
@@ -872,12 +891,12 @@ async fn test_e2e_peer_topology_after_node_restart() {
     // Verify cluster formed with all 6 nodes
     let member_count = nodes[0].num_members().await;
     assert!(
-        member_count >= 6,
+        member_count >= total,
         "Should have 6 members, got {}",
         member_count
     );
 
-    println!("\n=== Initial Topology (6 nodes) ===");
+    println!("\n=== Initial Topology ({} nodes) ===", total);
     for (i, node) in nodes.iter().enumerate() {
         let stats = node.peer_stats();
         let topology = node.topology();
@@ -888,11 +907,17 @@ async fn test_e2e_peer_topology_after_node_restart() {
     }
 
     // 2. Stop nodes 4 and 5
-    let stopped_names = ["node-4-rs", "node-5-rs"];
-    println!("\n=== Stopping nodes 4 and 5 ===");
+    let stopped_names = [
+        format!("node-{}-rs", shutdown_index_1),
+        format!("node-{}-rs", shutdown_index_2),
+    ];
+    println!(
+        "\n=== Stopping nodes {} and {} ===",
+        shutdown_index_1, shutdown_index_2
+    );
 
-    nodes[4].shutdown().await;
-    nodes[5].shutdown().await;
+    nodes[shutdown_index_1].shutdown().await;
+    nodes[shutdown_index_2].shutdown().await;
 
     // 3. Wait for SWIM failure detection
     println!("Waiting for SWIM failure detection...");
@@ -901,11 +926,13 @@ async fn test_e2e_peer_topology_after_node_restart() {
     let start = std::time::Instant::now();
     loop {
         let mut all_detected = true;
-        for i in 0..4 {
-            let member_count = nodes[i].num_members().await;
-            if member_count > 4 {
-                all_detected = false;
-                break;
+        for i in 0..total {
+            if i != shutdown_index_1 && i != shutdown_index_2 {
+                let member_count = nodes[i].num_members().await;
+                if member_count > total - 2 {
+                    all_detected = false;
+                    break;
+                }
             }
         }
 
@@ -922,25 +949,29 @@ async fn test_e2e_peer_topology_after_node_restart() {
         sleep(Duration::from_millis(500)).await;
     }
 
-    // Verify we have 4 nodes remaining
-    println!("\n=== After Node Departure (4 nodes) ===");
-    for i in 0..4 {
-        let stats = nodes[i].peer_stats();
+    // Verify we have all nodes remaining
+    println!("\n=== After Node Departure ({} nodes) ===", total);
+    for (i, node) in nodes.iter().enumerate() {
+        let stats = node.peer_stats();
+        let topology = node.topology();
         println!(
-            "Node {}: {} eager, {} lazy",
-            i, stats.eager_count, stats.lazy_count
+            "Node {}: {} eager, {} lazy | eager={:?}, lazy={:?}",
+            i, stats.eager_count, stats.lazy_count, topology.eager, topology.lazy
         );
     }
 
     // 4. Restart nodes 4 and 5 (create new instances with same names)
-    println!("\n=== Restarting nodes 4 and 5 ===");
+    println!(
+        "\n=== Restarting nodes {} and {} ===",
+        shutdown_index_1, shutdown_index_2
+    );
 
-    let node_4 = RealStack::new_with_config(stopped_names[0], 0, config.clone())
+    let node_4 = RealStack::new_with_config(stopped_names[0].as_str(), 0, config.clone())
         .await
         .expect("Failed to restart node 4");
     node_4.join(seed_addr).await.expect("Rejoin should succeed");
 
-    let node_5 = RealStack::new_with_config(stopped_names[1], 0, config.clone())
+    let node_5 = RealStack::new_with_config(stopped_names[1].as_str(), 0, config.clone())
         .await
         .expect("Failed to restart node 5");
     node_5.join(seed_addr).await.expect("Rejoin should succeed");
@@ -959,11 +990,13 @@ async fn test_e2e_peer_topology_after_node_restart() {
         let mut all_detected = true;
 
         // Check original nodes 0-3
-        for i in 0..4 {
-            let member_count = nodes[i].num_members().await;
-            if member_count < 6 {
-                all_detected = false;
-                break;
+        for i in 0..total {
+            if i != shutdown_index_1 && i != shutdown_index_2 {
+                let member_count = nodes[i].num_members().await;
+                if member_count < total {
+                    all_detected = false;
+                    break;
+                }
             }
         }
 
@@ -971,7 +1004,7 @@ async fn test_e2e_peer_topology_after_node_restart() {
         if all_detected {
             for node in &restarted_nodes {
                 let member_count = node.num_members().await;
-                if member_count < 6 {
+                if member_count < total {
                     all_detected = false;
                     break;
                 }
@@ -992,16 +1025,18 @@ async fn test_e2e_peer_topology_after_node_restart() {
     }
 
     // 6. Verify all 6 nodes have 5 peers each
-    println!("\n=== Final Topology After Node Restart (6 nodes) ===");
+    println!(
+        "\n=== Final Topology After Node Restart ({} nodes) ===",
+        total
+    );
 
     // Collect all node IDs
-    let all_node_ids: HashSet<TestNodeId> = (0..4)
+    let all_node_ids: HashSet<TestNodeId> = (0..total)
         .map(|i| nodes[i].node_id())
         .chain(restarted_nodes.iter().map(|n| n.node_id()))
         .collect();
 
-    // Check original nodes 0-3
-    for i in 0..4 {
+    for i in 0..total {
         let node_id = nodes[i].node_id();
         let stats = nodes[i].peer_stats();
         let topology = nodes[i].topology();
@@ -1014,9 +1049,11 @@ async fn test_e2e_peer_topology_after_node_restart() {
 
         // Each node should have 5 peers (the other 5 nodes)
         assert!(
-            total_peers >= 3, // At minimum should have eager_fanout + lazy_fanout peers
-            "Node {} should have at least 3 peers, got {}",
-            i, total_peers
+            total_peers >= lazy + eager, // At minimum should have eager_fanout + lazy_fanout peers
+            "Node {} should have at least {} peers, got {}",
+            i,
+            lazy + eager,
+            total_peers
         );
 
         // All peers should be valid node IDs (not self, not invalid)
@@ -1029,7 +1066,8 @@ async fn test_e2e_peer_topology_after_node_restart() {
             assert!(
                 all_node_ids.contains(peer),
                 "Node {} has unknown peer {:?}",
-                i, peer
+                i,
+                peer
             );
         }
     }
@@ -1043,14 +1081,20 @@ async fn test_e2e_peer_topology_after_node_restart() {
 
         println!(
             "Node {} ({}): {} eager, {} lazy | eager={:?}, lazy={:?}",
-            idx + 4, node_id, stats.eager_count, stats.lazy_count, topology.eager, topology.lazy
+            idx + 4,
+            node_id,
+            stats.eager_count,
+            stats.lazy_count,
+            topology.eager,
+            topology.lazy
         );
 
         // Each node should have at least 3 peers
         assert!(
             total_peers >= 3,
             "Restarted node {} should have at least 3 peers, got {}",
-            idx + 4, total_peers
+            idx + 4,
+            total_peers
         );
 
         // All peers should be valid
@@ -1063,13 +1107,14 @@ async fn test_e2e_peer_topology_after_node_restart() {
             assert!(
                 all_node_ids.contains(peer),
                 "Restarted node {} has unknown peer {:?}",
-                idx + 4, peer
+                idx + 4,
+                peer
             );
         }
     }
 
     // Verify total peer count across cluster
-    let total_peer_counts: usize = (0..4)
+    let total_peer_counts: usize = (0..total)
         .map(|i| {
             let stats = nodes[i].peer_stats();
             stats.eager_count + stats.lazy_count
@@ -1096,7 +1141,7 @@ async fn test_e2e_peer_topology_after_node_restart() {
     println!("\n=== Test Passed: Peer topology correctly rebalanced after node restart ===");
 
     // Cleanup
-    for i in 0..4 {
+    for i in 0..total {
         nodes[i].shutdown().await;
     }
     for node in restarted_nodes {
@@ -1195,10 +1240,7 @@ async fn test_e2e_network_aware_rebalancing() {
         for peer in &all_peers {
             // Simulate varying RTT based on peer index
             // Lower indexed peers get better (lower) RTT
-            let peer_idx = all_node_ids
-                .iter()
-                .position(|id| id == peer)
-                .unwrap_or(0);
+            let peer_idx = all_node_ids.iter().position(|id| id == peer).unwrap_or(0);
 
             let rtt = if peer_idx < 2 {
                 Duration::from_millis(5) // Fast peer
@@ -1215,21 +1257,14 @@ async fn test_e2e_network_aware_rebalancing() {
         }
 
         // Also record some failures for the slowest peers
-        for peer in all_peers.iter().filter(|p| {
-            all_node_ids
-                .iter()
-                .position(|id| id == *p)
-                .unwrap_or(0)
-                >= 4
-        }) {
+        for peer in all_peers
+            .iter()
+            .filter(|p| all_node_ids.iter().position(|id| id == *p).unwrap_or(0) >= 4)
+        {
             node.record_peer_failure(peer);
         }
 
-        println!(
-            "Node {}: Recorded RTT for {} peers",
-            i,
-            all_peers.len()
-        );
+        println!("Node {}: Recorded RTT for {} peers", i, all_peers.len());
     }
 
     // 3. Verify PeerScoring has recorded samples
@@ -1245,7 +1280,8 @@ async fn test_e2e_network_aware_rebalancing() {
         assert!(
             stats.total_peers >= 1,
             "Node {} should have scored at least 1 peer, got {}",
-            i, stats.total_peers
+            i,
+            stats.total_peers
         );
     }
 
@@ -1284,7 +1320,8 @@ async fn test_e2e_network_aware_rebalancing() {
         assert!(
             stats.eager_count >= 1,
             "Node {} should have at least 1 eager peer after rebalance, got {}",
-            i, stats.eager_count
+            i,
+            stats.eager_count
         );
 
         // Verify total peers maintained
@@ -1292,7 +1329,8 @@ async fn test_e2e_network_aware_rebalancing() {
         assert!(
             total_peers >= 3,
             "Node {} should have at least 3 total peers, got {}",
-            i, total_peers
+            i,
+            total_peers
         );
 
         // Verify ring neighbors are still protected (in eager set)
@@ -1344,7 +1382,9 @@ async fn test_e2e_network_aware_rebalancing() {
         total_eager
     );
 
-    println!("\n=== Test Passed: Network-aware rebalancing integrates correctly with PeerScoring ===");
+    println!(
+        "\n=== Test Passed: Network-aware rebalancing integrates correctly with PeerScoring ==="
+    );
 
     // Cleanup
     for node in nodes {
@@ -1432,14 +1472,10 @@ async fn test_e2e_peer_persistence_unique_paths() {
     println!("\n=== Verifying Persistence Files ===");
 
     for (i, path) in persistence_paths.iter().enumerate() {
-        let peers = persistence::load_peers(path).expect(&format!("Failed to load peers for node {}", i));
+        let peers =
+            persistence::load_peers(path).expect(&format!("Failed to load peers for node {}", i));
 
-        println!(
-            "Node {}: Loaded {} peers from {:?}",
-            i,
-            peers.len(),
-            path
-        );
+        println!("Node {}: Loaded {} peers from {:?}", i, peers.len(), path);
 
         // Each node should have saved at least 1 peer (themselves excluded)
         // Note: The actual count depends on what the node sees in memberlist
@@ -1447,7 +1483,8 @@ async fn test_e2e_peer_persistence_unique_paths() {
         assert!(
             peers.len() >= 1,
             "Node {} should have saved at least 1 peer, got {}",
-            i, peers.len()
+            i,
+            peers.len()
         );
 
         // Verify all addresses are valid and on localhost
@@ -1455,7 +1492,8 @@ async fn test_e2e_peer_persistence_unique_paths() {
             assert!(
                 peer.ip().is_loopback(),
                 "Node {} has non-loopback peer address: {}",
-                i, peer
+                i,
+                peer
             );
         }
     }
@@ -1566,8 +1604,14 @@ async fn test_e2e_lazarus_seed_recovery() {
     let stats_1 = handle_1.stats();
     let stats_2 = handle_2.stats();
 
-    assert_eq!(stats_1.probes_sent, 0, "Node 1 should have 0 probes initially");
-    assert_eq!(stats_2.probes_sent, 0, "Node 2 should have 0 probes initially");
+    assert_eq!(
+        stats_1.probes_sent, 0,
+        "Node 1 should have 0 probes initially"
+    );
+    assert_eq!(
+        stats_2.probes_sent, 0,
+        "Node 2 should have 0 probes initially"
+    );
     assert!(!handle_1.is_shutdown(), "Handle 1 should not be shutdown");
     assert!(!handle_2.is_shutdown(), "Handle 2 should not be shutdown");
 
@@ -1636,8 +1680,14 @@ async fn test_e2e_lazarus_seed_recovery() {
     println!("New seed started at: {}", new_seed_addr);
 
     // Have nodes 1 and 2 manually join the new seed to verify cluster can reform
-    node_1.join(new_seed_addr).await.expect("Rejoin should succeed");
-    node_2.join(new_seed_addr).await.expect("Rejoin should succeed");
+    node_1
+        .join(new_seed_addr)
+        .await
+        .expect("Rejoin should succeed");
+    node_2
+        .join(new_seed_addr)
+        .await
+        .expect("Rejoin should succeed");
 
     // Wait for cluster to reform
     sleep(Duration::from_secs(3)).await;
@@ -1708,7 +1758,11 @@ async fn test_e2e_load_bootstrap_addresses() {
     persistence::save_peers(&persistence_path, &persisted_peers)
         .expect("Failed to save persisted peers");
 
-    println!("Saved {} persisted peers to {:?}", persisted_peers.len(), persistence_path);
+    println!(
+        "Saved {} persisted peers to {:?}",
+        persisted_peers.len(),
+        persistence_path
+    );
 
     // 2. Create BridgeConfig with static seeds (some overlap with persisted)
     let static_seeds: Vec<SocketAddr> = vec![

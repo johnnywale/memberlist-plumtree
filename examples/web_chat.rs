@@ -873,7 +873,28 @@ impl ChatNode {
 
         // Wrap VoidDelegate with PlumtreeNodeDelegate for automatic peer sync
         let void_delegate = memberlist::delegate::VoidDelegate::<NodeId, SocketAddr>::default();
-        let plumtree_delegate = pm.wrap_delegate(void_delegate);
+
+        // Set up callbacks for rebalance events to notify the UI
+        let delegate_for_promotion = self.delegate.clone();
+        let delegate_for_demotion = self.delegate.clone();
+
+        let plumtree_delegate = pm
+            .wrap_delegate(void_delegate)
+            .with_promotion_callback(std::sync::Arc::new(move |peer: &NodeId| {
+                // Clone delegate and peer for the spawned task
+                let delegate = delegate_for_promotion.clone();
+                let peer = peer.clone();
+                tokio::spawn(async move {
+                    delegate.on_eager_promotion(&peer);
+                });
+            }))
+            .with_demotion_callback(std::sync::Arc::new(move |peer: &NodeId| {
+                let delegate = delegate_for_demotion.clone();
+                let peer = peer.clone();
+                tokio::spawn(async move {
+                    delegate.on_lazy_demotion(&peer);
+                });
+            }));
 
         // Create NetTransport options
         let mut transport_opts = NetTransportOptions::<

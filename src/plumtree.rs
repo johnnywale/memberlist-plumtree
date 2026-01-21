@@ -766,7 +766,9 @@ where
     /// Removes the peer from both the topology state (eager/lazy sets) and
     /// the scoring state (RTT, failure counts) to prevent memory leaks.
     pub fn remove_peer(&self, peer: &I) {
-        self.inner.peers.remove_peer(peer);
+        self.inner
+            .peers
+            .remove_peer_auto(peer, self.inner.config.eager_fanout);
         // Clean up scoring data to free memory for departed peers
         self.inner.peer_scoring.remove_peer(peer);
     }
