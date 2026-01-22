@@ -763,6 +763,91 @@ where
         self.advertise_addr
     }
 
+    /// Start the Plumtree background tasks.
+    ///
+    /// **IMPORTANT**: This method MUST be called after creating the stack for the
+    /// Plumtree protocol to work correctly. Without it:
+    /// - IHave messages won't be sent to lazy peers
+    /// - Graft retry logic won't work
+    /// - Tree self-healing will be broken
+    ///
+    /// This spawns the following background tasks:
+    /// - IHave scheduler (sends announcements to lazy peers)
+    /// - Graft timer (handles retry logic for missing messages)
+    /// - Seen map cleanup (memory management)
+    /// - Outgoing message processor (routes messages)
+    /// - Incoming message processor (handles received messages)
+    ///
+    /// # Arguments
+    ///
+    /// * `transport` - Transport for unicast message delivery (Graft/Prune messages)
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let stack = MemberlistStack::new(pm, memberlist, advertise_addr);
+    ///
+    /// // REQUIRED: Start background tasks before using the stack
+    /// stack.start(transport);
+    ///
+    /// // Now you can join and broadcast
+    /// stack.join(&seeds).await?;
+    /// stack.broadcast(b"Hello!").await?;
+    /// ```
+    #[cfg(feature = "tokio")]
+    pub fn start<PT>(&self, transport: PT)
+    where
+        PT: crate::Transport<I> + 'static,
+        PD: 'static,
+    {
+        // Spawn the main Plumtree runner (IHave scheduler, Graft timer, etc.)
+        let pm_runner = self.pm.clone();
+        tokio::spawn(async move {
+            pm_runner.run_with_transport(transport).await;
+        });
+
+        // Spawn the incoming message processor
+        let pm_incoming = self.pm.clone();
+        tokio::spawn(async move {
+            pm_incoming.run_incoming_processor().await;
+        });
+
+        tracing::info!("MemberlistStack background tasks started");
+    }
+
+    /// Start the Plumtree background tasks without a transport.
+    ///
+    /// Use this when you handle unicast message delivery separately (e.g., via
+    /// memberlist's reliable send). For most use cases, prefer [`start()`](Self::start)
+    /// which handles unicast automatically.
+    ///
+    /// # Warning
+    ///
+    /// If you use this method, you MUST handle unicast messages manually by:
+    /// 1. Consuming messages from `plumtree().unicast_receiver()`
+    /// 2. Sending them to the target peer via your transport
+    ///
+    /// Failure to do so will break Graft/Prune messages and prevent tree self-healing.
+    #[cfg(feature = "tokio")]
+    pub fn start_without_transport(&self)
+    where
+        PD: 'static,
+    {
+        // Spawn the main Plumtree runner without unicast handling
+        let pm_runner = self.pm.clone();
+        tokio::spawn(async move {
+            pm_runner.run().await;
+        });
+
+        // Spawn the incoming message processor
+        let pm_incoming = self.pm.clone();
+        tokio::spawn(async move {
+            pm_incoming.run_incoming_processor().await;
+        });
+
+        tracing::info!("MemberlistStack background tasks started (without unicast transport)");
+    }
+
     /// Get Plumtree peer statistics.
     pub fn peer_stats(&self) -> crate::peer_state::PeerStats {
         self.pm.peer_stats()

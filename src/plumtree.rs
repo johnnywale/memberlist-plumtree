@@ -536,6 +536,10 @@ where
     /// - `config`: Plumtree configuration
     /// - `delegate`: Event handler
     pub fn new(local_id: I, config: PlumtreeConfig, delegate: D) -> (Self, PlumtreeHandle<I>) {
+        // Initialize metrics descriptions (safe to call multiple times)
+        #[cfg(feature = "metrics")]
+        crate::metrics::init_metrics();
+
         let (outgoing_tx, outgoing_rx) = async_channel::bounded(1024);
         let (incoming_tx, incoming_rx) = async_channel::bounded(1024);
 
@@ -742,11 +746,22 @@ where
             return AddPeerResult::AlreadyExists;
         }
 
-        self.inner.peers.add_peer_auto(
+        let result = self.inner.peers.add_peer_auto(
             peer,
             self.inner.config.max_peers,
             self.inner.config.eager_fanout,
-        )
+        );
+
+        // Record metric for successful peer additions
+        #[cfg(feature = "metrics")]
+        match &result {
+            AddPeerResult::AddedEager | AddPeerResult::AddedLazy => {
+                crate::metrics::record_peer_added();
+            }
+            _ => {}
+        }
+
+        result
     }
 
     /// Add a peer to the lazy set only (traditional behavior).
@@ -757,7 +772,10 @@ where
     /// This bypasses the `max_peers` limit check and auto-classification.
     pub fn add_peer_lazy(&self, peer: I) {
         if peer != self.inner.local_id {
-            self.inner.peers.add_peer(peer);
+            self.inner.peers.add_peer(peer.clone());
+
+            #[cfg(feature = "metrics")]
+            crate::metrics::record_peer_added();
         }
     }
 
@@ -771,6 +789,9 @@ where
             .remove_peer_auto(peer, self.inner.config.eager_fanout);
         // Clean up scoring data to free memory for departed peers
         self.inner.peer_scoring.remove_peer(peer);
+
+        #[cfg(feature = "metrics")]
+        crate::metrics::record_peer_removed();
     }
 
     /// Broadcast a message to all nodes.
@@ -880,6 +901,17 @@ where
             "broadcast complete, IHave queued for lazy peers"
         );
 
+        // Record metrics
+        #[cfg(feature = "metrics")]
+        {
+            crate::metrics::record_broadcast();
+            crate::metrics::record_message_size(payload_size);
+            // Record gossip sent for each eager peer we sent to
+            for _ in 0..(eager_count - dropped_count) {
+                crate::metrics::record_gossip_sent();
+            }
+        }
+
         Ok(msg_id)
     }
 
@@ -938,6 +970,9 @@ where
         if self.inner.graft_timer.message_received(&msg_id) {
             // Record graft success for adaptive batcher to adjust batch sizes
             self.inner.adaptive_batcher.record_graft_received();
+
+            #[cfg(feature = "metrics")]
+            crate::metrics::record_graft_success();
         }
 
         // Check if already seen and track parent atomically (single shard lock)
@@ -968,6 +1003,10 @@ where
                 receive_count,
                 "duplicate gossip received"
             );
+
+            #[cfg(feature = "metrics")]
+            crate::metrics::record_duplicate();
+
             // Optimization: prune redundant path after threshold
             if receive_count > self.inner.config.optimization_threshold {
                 // Only send Prune if the peer is in the eager set
@@ -990,9 +1029,15 @@ where
                         .await;
                     self.inner.delegate.on_prune_sent(&from);
 
+                    #[cfg(feature = "metrics")]
+                    crate::metrics::record_prune_sent();
+
                     // Demote to lazy
                     if self.inner.peers.demote_to_lazy(&from) {
                         self.inner.delegate.on_lazy_demotion(&from);
+
+                        #[cfg(feature = "metrics")]
+                        crate::metrics::record_peer_demotion();
                     }
                 }
             }
@@ -1012,6 +1057,14 @@ where
 
         // Deliver to application
         self.inner.delegate.on_deliver(msg_id, payload.clone());
+
+        // Record delivery metrics
+        #[cfg(feature = "metrics")]
+        {
+            crate::metrics::record_delivery();
+            crate::metrics::record_message_size(payload_size);
+            crate::metrics::record_message_hops(round);
+        }
 
         // Forward to eager peers (except sender) via unicast
         let eager_peers = self.inner.peers.random_eager_except(&from, usize::MAX);
@@ -1053,6 +1106,15 @@ where
             sent = forward_count - dropped,
             "forwarded gossip to eager peers"
         );
+
+        // Record gossip forwarding metrics
+        #[cfg(feature = "metrics")]
+        {
+            let sent_count = forward_count - dropped;
+            for _ in 0..sent_count {
+                crate::metrics::record_gossip_sent();
+            }
+        }
 
         Ok(())
     }
@@ -1103,6 +1165,9 @@ where
                 if self.inner.peers.promote_to_eager(&from) {
                     debug!("promoted peer to eager after IHave");
                     self.inner.delegate.on_eager_promotion(&from);
+
+                    #[cfg(feature = "metrics")]
+                    crate::metrics::record_peer_promotion();
                 }
 
                 // Send Graft to get the missing message
@@ -1119,6 +1184,9 @@ where
                     .await;
 
                 self.inner.delegate.on_graft_sent(&from, &msg_id);
+
+                #[cfg(feature = "metrics")]
+                crate::metrics::record_graft_sent();
             }
         }
 
@@ -1297,6 +1365,16 @@ where
         // Record IHaves sent for adaptive batcher feedback
         let ihaves_sent = (peer_count - ihave_dropped) * batch_size;
         self.inner.adaptive_batcher.record_ihave_sent(ihaves_sent);
+
+        // Record metrics
+        #[cfg(feature = "metrics")]
+        {
+            crate::metrics::record_ihave_batch_size(batch_size);
+            let sent_count = peer_count - ihave_dropped;
+            for _ in 0..sent_count {
+                crate::metrics::record_ihave_sent();
+            }
+        }
     }
 
     /// Run the Graft timer checker background task.
@@ -1338,6 +1416,9 @@ where
                 self.inner
                     .delegate
                     .on_graft_failed(&failed_graft.message_id, &failed_graft.original_peer);
+
+                #[cfg(feature = "metrics")]
+                crate::metrics::record_graft_failed();
             }
 
             for expired_graft in expired {
@@ -1348,6 +1429,12 @@ where
                     is_retry = expired_graft.retry_count > 0,
                     "sending Graft request"
                 );
+
+                // Record retry metric if this is a retry attempt
+                #[cfg(feature = "metrics")]
+                if expired_graft.retry_count > 0 {
+                    crate::metrics::record_graft_retry();
+                }
 
                 let _ = self
                     .inner
@@ -1568,6 +1655,12 @@ where
                 crate::metrics::set_eager_peers(stats.eager_count);
                 crate::metrics::set_lazy_peers(stats.lazy_count);
                 crate::metrics::set_total_peers(stats.eager_count + stats.lazy_count);
+
+                // Update cache, queue, and pending grafts gauges
+                let cache_stats = self.inner.cache.stats();
+                crate::metrics::set_cache_size(cache_stats.entries);
+                crate::metrics::set_ihave_queue_size(self.inner.scheduler.queue().len());
+                crate::metrics::set_pending_grafts(self.inner.graft_timer.pending_count());
             }
         }
     }

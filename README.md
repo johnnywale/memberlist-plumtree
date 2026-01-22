@@ -162,57 +162,104 @@ memberlist-plumtree = "0.1"
 
 ### Feature Flags
 
-| Feature | Description |
-|---------|-------------|
-| `tokio` | Enable Tokio runtime support (required for Lazarus background task) |
-| `metrics` | Enable metrics collection via the `metrics` crate |
-| `serde` | Enable serialization/deserialization for config |
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `tokio` | Yes | Tokio runtime support (required for `MemberlistStack::start()`) |
+| `metrics` | Yes | Prometheus-compatible metrics via the `metrics` crate |
+| `serde` | Yes | Serialization/deserialization for config |
+| `quic` | Yes | Native QUIC transport via quinn/rustls |
+
+To disable default features:
+
+```toml
+[dependencies]
+memberlist-plumtree = { version = "0.1", default-features = false, features = ["tokio"] }
+```
 
 ## Quick Start
 
 ```rust
-use memberlist_plumtree::{Plumtree, PlumtreeConfig, PlumtreeDelegate, MessageId};
+use memberlist_plumtree::{
+    MemberlistStack, PlumtreeMemberlist, PlumtreeConfig,
+    PlumtreeNodeDelegate, PlumtreeDelegate, MessageId,
+    NoopDelegate, ChannelTransport,
+};
 use bytes::Bytes;
 use std::sync::Arc;
 
 // Define a delegate to handle delivered messages
 struct MyDelegate;
 
-impl PlumtreeDelegate for MyDelegate {
+impl PlumtreeDelegate<u64> for MyDelegate {
     fn on_deliver(&self, msg_id: MessageId, payload: Bytes) {
         println!("Received message {}: {:?}", msg_id, payload);
     }
 }
 
 #[tokio::main]
-async fn main() {
-    // Create a Plumtree instance with LAN-optimized config
-    let (plumtree, handle) = Plumtree::new(
-        "node-1".to_string(),
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Create PlumtreeMemberlist with your delegate
+    let pm = Arc::new(PlumtreeMemberlist::new(
+        1u64,
         PlumtreeConfig::lan(),
-        Arc::new(MyDelegate),
-    );
+        MyDelegate,
+    ));
 
-    // Add peers discovered via memberlist
-    plumtree.add_peer("node-2".to_string());
-    plumtree.add_peer("node-3".to_string());
+    // 2. Create delegate for auto peer sync
+    let delegate = PlumtreeNodeDelegate::new(1u64, NoopDelegate, pm.clone());
 
-    // Broadcast a message to all nodes
-    let msg_id = plumtree.broadcast(b"Hello, cluster!").await.unwrap();
-    println!("Broadcast message: {}", msg_id);
+    // 3. Create memberlist and stack (see full example for transport setup)
+    // let memberlist = Memberlist::new(transport, delegate, options).await?;
+    // let stack = MemberlistStack::new(pm, memberlist, advertise_addr);
 
-    // Run background tasks (IHave scheduler, Graft timer, cleanup)
-    tokio::spawn({
-        let pt = plumtree.clone();
-        async move {
-            tokio::join!(
-                pt.run_ihave_scheduler(),
-                pt.run_graft_timer(),
-                pt.run_seen_cleanup(),
-            );
-        }
-    });
+    // 4. CRITICAL: Start background tasks
+    // let (transport, _rx) = ChannelTransport::bounded(1024);
+    // stack.start(transport);
+
+    // 5. Join cluster and broadcast
+    // stack.join(&seeds).await?;
+    // stack.broadcast(b"Hello, cluster!").await?;
+
+    Ok(())
 }
+```
+
+> **Important**: For the complete working example, see [docs/getting-started.md](docs/getting-started.md).
+
+### Using Low-Level API
+
+If you need fine-grained control, use `Plumtree` directly:
+
+```rust
+let (plumtree, handle) = Plumtree::new(
+    "node-1".to_string(),
+    PlumtreeConfig::lan(),
+    Arc::new(MyDelegate),
+);
+
+// Add peers manually
+plumtree.add_peer("node-2".to_string());
+
+// REQUIRED: Start background tasks
+tokio::spawn({
+    let pt = plumtree.clone();
+    async move { pt.run_ihave_scheduler().await }
+});
+tokio::spawn({
+    let pt = plumtree.clone();
+    async move { pt.run_graft_timer().await }
+});
+tokio::spawn({
+    let pt = plumtree.clone();
+    async move { pt.run_seen_cleanup().await }
+});
+tokio::spawn({
+    let pt = plumtree.clone();
+    async move { pt.run_maintenance_loop().await }
+});
+
+// Now broadcast
+let msg_id = plumtree.broadcast(b"Hello!").await?;
 ```
 
 ## Configuration
@@ -373,20 +420,78 @@ High-performance deduplication with configurable sharding:
 
 ```rust
 // Seen map is automatically managed by Plumtree
-// Configure capacity limits in PlumtreeConfig
-let config = PlumtreeConfig::default()
-    .with_seen_map_soft_cap(100_000)   // Soft limit for entries
-    .with_seen_map_hard_cap(150_000);  // Hard limit (emergency eviction)
-
 // Get seen map statistics
-let stats = plumtree.seen_map_stats();
-println!("Utilization: {:.1}%, Entries: {}",
-    stats.utilization * 100.0, stats.total_entries);
+if let Some(stats) = plumtree.seen_map_stats() {
+    println!("Utilization: {:.1}%, Entries: {}",
+        stats.utilization * 100.0, stats.size);
+}
+```
+
+### QUIC Transport
+
+Native QUIC transport for improved performance with TLS 1.3 encryption:
+
+```rust
+use memberlist_plumtree::{
+    QuicTransport, QuicConfig, MapPeerResolver, TlsConfig,
+};
+use std::sync::Arc;
+
+// Create peer resolver for address lookup
+let resolver = Arc::new(MapPeerResolver::new(local_addr));
+resolver.add_peer(2u64, "192.168.1.10:9000".parse()?);
+
+// Development: insecure self-signed certs
+let config = QuicConfig::insecure_dev();
+
+// Production: proper TLS configuration
+let config = QuicConfig::wan()
+    .with_tls(TlsConfig::new()
+        .with_cert_path("/path/to/server.crt")
+        .with_key_path("/path/to/server.key")
+        .with_ca_path("/path/to/ca.crt")
+        .with_mtls(true));
+
+// Create transport
+let transport = QuicTransport::new(local_addr, config, resolver).await?;
+
+// Use with PlumtreeMemberlist
+pm.run_with_transport(transport).await;
+```
+
+**QUIC Configuration Presets:**
+
+| Preset | Use Case |
+|--------|----------|
+| `QuicConfig::default()` | General purpose |
+| `QuicConfig::lan()` | Low latency LAN (BBR, shorter timeouts) |
+| `QuicConfig::wan()` | High latency WAN (Cubic, longer timeouts) |
+| `QuicConfig::large_cluster()` | 1000+ nodes (high connection limits) |
+| `QuicConfig::insecure_dev()` | Development only (self-signed certs) |
+
+### Health Monitoring
+
+Check protocol health for alerting and debugging:
+
+```rust
+let health = plumtree.health();
+
+match health.status {
+    HealthStatus::Healthy => println!("All systems operational"),
+    HealthStatus::Degraded => println!("Warning: {}", health.message),
+    HealthStatus::Unhealthy => eprintln!("Critical: {}", health.message),
+}
+
+// Detailed health information
+println!("Eager peers: {}", health.peer_health.eager_count);
+println!("Lazy peers: {}", health.peer_health.lazy_count);
+println!("Cache utilization: {:.1}%", health.cache_health.utilization * 100.0);
+println!("Pending grafts: {}", health.delivery_health.pending_grafts);
 ```
 
 ## Metrics
 
-When compiled with the `metrics` feature, comprehensive metrics are exposed:
+When compiled with the `metrics` feature (enabled by default), comprehensive Prometheus-compatible metrics are exposed:
 
 ### Counters
 - `plumtree_messages_broadcast_total` - Total broadcasts initiated
@@ -397,7 +502,12 @@ When compiled with the `metrics` feature, comprehensive metrics are exposed:
 - `plumtree_graft_sent_total` - Graft messages sent
 - `plumtree_prune_sent_total` - Prune messages sent
 - `plumtree_graft_success_total` - Successful Graft requests
-- `plumtree_graft_failed_total` - Failed Graft requests
+- `plumtree_graft_failed_total` - Failed Graft requests (after max retries)
+- `plumtree_graft_retries_total` - Graft retry attempts
+- `plumtree_peer_promotions_total` - Peers promoted to eager
+- `plumtree_peer_demotions_total` - Peers demoted to lazy
+- `plumtree_peer_added_total` - Peers added to topology
+- `plumtree_peer_removed_total` - Peers removed from topology
 
 ### Histograms
 - `plumtree_graft_latency_seconds` - Graft request to delivery latency
@@ -408,8 +518,13 @@ When compiled with the `metrics` feature, comprehensive metrics are exposed:
 ### Gauges
 - `plumtree_eager_peers` - Current eager peer count
 - `plumtree_lazy_peers` - Current lazy peer count
+- `plumtree_total_peers` - Total peer count
 - `plumtree_cache_size` - Messages in cache
+- `plumtree_seen_map_size` - Entries in deduplication map
+- `plumtree_ihave_queue_size` - Pending IHave announcements
 - `plumtree_pending_grafts` - Pending Graft requests
+
+See [docs/metrics.md](docs/metrics.md) for alerting examples and Grafana dashboard queries.
 
 ## Delegate Callbacks
 
@@ -503,49 +618,60 @@ The `MemberlistStack` struct provides the complete integration stack, combining 
 
 ```rust
 use memberlist_plumtree::{
-    MemberlistStack, PlumtreeConfig, PlumtreeNodeDelegate, NoopDelegate,
+    MemberlistStack, PlumtreeMemberlist, PlumtreeConfig,
+    PlumtreeNodeDelegate, NoopDelegate, ChannelTransport,
 };
-use memberlist_core::{
-    transport::net::NetTransport,
-    Options,
-};
+use memberlist_core::{Memberlist, Options};
+use std::sync::Arc;
 use std::net::SocketAddr;
 
-// Create your transport (e.g., NetTransport for real networking)
-let transport = NetTransport::new(transport_config).await?;
+// 1. Create PlumtreeMemberlist with your delegate
+let pm = Arc::new(PlumtreeMemberlist::new(
+    node_id,
+    PlumtreeConfig::default(),
+    MyDelegate,
+));
 
-// Create the stack with PlumtreeNodeDelegate wrapping your delegate
+// 2. Create PlumtreeNodeDelegate for auto peer sync
 let delegate = PlumtreeNodeDelegate::new(
     node_id.clone(),
-    NoopDelegate,  // Or your custom PlumtreeDelegate
-    pm.clone(),    // PlumtreeMemberlist reference for peer sync
+    NoopDelegate,  // Or your memberlist delegate
+    pm.clone(),
 );
 
-// Build the complete stack
-let stack = MemberlistStack::new(
-    pm,           // PlumtreeMemberlist
-    memberlist,   // Memberlist instance
-    advertise_addr,
-);
+// 3. Create memberlist with transport
+let memberlist = Memberlist::new(transport, delegate, Options::default()).await?;
 
-// Join the cluster - just pass seed addresses!
+// 4. Build the complete stack
+let stack = MemberlistStack::new(pm, memberlist, advertise_addr);
+
+// 5. CRITICAL: Start background tasks!
+let (unicast_tx, _rx) = ChannelTransport::bounded(1024);
+stack.start(unicast_tx);  // <-- Without this, Plumtree won't work!
+
+// 6. Join the cluster
 let seeds: Vec<SocketAddr> = vec![
     "192.168.1.10:7946".parse()?,
     "192.168.1.11:7946".parse()?,
 ];
 stack.join(&seeds).await?;
 
-// Broadcast messages - automatically routes via spanning tree
+// 7. Broadcast messages - automatically routes via spanning tree
 let msg_id = stack.broadcast(b"Hello cluster!").await?;
 
-// Get cluster status
-println!("Members: {}", stack.num_members());
+// 8. Get cluster status
+println!("Members: {}", stack.num_members().await);
 println!("Peers: {:?}", stack.peer_stats());
 
-// Graceful shutdown
-stack.leave().await?;
+// 9. Graceful shutdown
+stack.leave(Duration::from_secs(5)).await?;
 stack.shutdown().await?;
 ```
+
+> **Warning**: Always call `stack.start(transport)` after creating the stack! Without it:
+> - IHave messages won't be sent to lazy peers
+> - Graft retry logic won't work
+> - Tree self-healing will be broken
 
 **Key features of `MemberlistStack`**:
 - **Automatic peer discovery**: SWIM protocol discovers peers without manual `add_peer()` calls
@@ -789,6 +915,23 @@ This implementation includes several optimizations for large-scale deployments (
 - **Protocol versioning**: Backward-compatible protocol evolution
 - **Cluster-aware batching**: Batch size hints based on cluster topology
 - **Health-based peer selection**: Factor in peer health metrics for routing decisions
+
+## Documentation
+
+Comprehensive documentation is available in the [`docs/`](docs/) directory:
+
+| Document | Description |
+|----------|-------------|
+| [Getting Started](docs/getting-started.md) | Quick start guide with examples |
+| [Architecture](docs/architecture.md) | System architecture and message flow |
+| [Peer Topology](docs/peer-topology.md) | Eager/lazy management, hash ring, peer scoring |
+| [Adaptive Features](docs/adaptive-features.md) | Dynamic batch sizing and cleanup tuning |
+| [Configuration](docs/configuration.md) | Complete configuration reference |
+| [QUIC Transport](docs/quic.md) | QUIC transport setup and TLS configuration |
+| [Background Tasks](docs/background-tasks.md) | Required background tasks and troubleshooting |
+| [Metrics](docs/metrics.md) | Prometheus metrics reference and alerting |
+
+API documentation is available on [docs.rs](https://docs.rs/memberlist-plumtree).
 
 ## References
 
