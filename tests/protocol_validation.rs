@@ -307,6 +307,7 @@ impl SimulatedNetwork {
                 PlumtreeMessage::IHave { .. } => self.stats.record_ihave(),
                 PlumtreeMessage::Graft { .. } => self.stats.record_graft(),
                 PlumtreeMessage::Prune => self.stats.record_prune(),
+                PlumtreeMessage::Sync(_) => {} // Sync messages not tracked in basic tests
             }
 
             // Deliver the message

@@ -189,6 +189,96 @@ let config = BridgeConfig::new()
 // On startup, peers are loaded and used for bootstrapping
 ```
 
+## SyncConfig
+
+Configuration for anti-entropy synchronization. Requires the `sync` feature.
+
+```rust
+use memberlist_plumtree::{PlumtreeConfig, SyncConfig};
+use std::time::Duration;
+
+let config = PlumtreeConfig::default()
+    .with_sync(
+        SyncConfig::enabled()
+            .with_sync_interval(Duration::from_secs(30))
+            .with_sync_window(Duration::from_secs(90))
+            .with_max_batch_size(100)
+    );
+```
+
+### Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `enabled` | false | Enable anti-entropy sync |
+| `sync_interval` | 30s | Interval between sync rounds with random peer |
+| `sync_window` | 90s | Time window for checking missing messages |
+| `max_batch_size` | 100 | Maximum message IDs per sync response |
+
+### Tuning Guidelines
+
+**Fast recovery, higher overhead:**
+```rust
+SyncConfig::enabled()
+    .with_sync_interval(Duration::from_secs(10))
+    .with_sync_window(Duration::from_secs(30))
+```
+
+**Slower recovery, lower overhead:**
+```rust
+SyncConfig::enabled()
+    .with_sync_interval(Duration::from_secs(60))
+    .with_sync_window(Duration::from_secs(180))
+```
+
+## StorageConfig
+
+Configuration for message persistence. Required when sync is enabled.
+
+```rust
+use memberlist_plumtree::{PlumtreeConfig, StorageConfig};
+use std::time::Duration;
+
+let config = PlumtreeConfig::default()
+    .with_storage(
+        StorageConfig::enabled()
+            .with_max_messages(100_000)
+            .with_retention(Duration::from_secs(300))
+            // Optional: disk persistence (requires storage-sled feature)
+            // .with_path("/var/lib/myapp/messages")
+    );
+```
+
+### Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `enabled` | false | Enable message storage |
+| `max_messages` | 100,000 | Maximum stored messages (LRU eviction) |
+| `retention` | 300s | Message retention duration (auto-pruned) |
+| `path` | None | Sled database path (disk persistence) |
+
+### Storage Backends
+
+**In-Memory (Default):**
+- Fast O(1) operations
+- Lost on restart
+- Good for ephemeral messages
+
+**Sled (Persistent):**
+```rust
+use memberlist_plumtree::storage::SledStore;
+use std::sync::Arc;
+
+let store = Arc::new(SledStore::open("/var/lib/myapp/messages")?);
+let pm = PlumtreeDiscovery::with_storage(node_id, config, delegate, store);
+```
+- Persists across restarts
+- ACID transactions
+- Higher latency
+
+See [Anti-Entropy Sync & Persistence](sync-persistence.md) for detailed usage.
+
 ## QuicConfig
 
 See [QUIC Transport](quic.md) for detailed QUIC configuration.
@@ -308,5 +398,6 @@ if health.status.is_degraded() {
 ## See Also
 
 - [Architecture Overview](architecture.md) - Understanding the protocol
+- [Sync & Persistence](sync-persistence.md) - Anti-entropy sync and storage configuration
 - [Metrics Reference](metrics.md) - Monitoring and observability
 - [QUIC Transport](quic.md) - QUIC-specific configuration

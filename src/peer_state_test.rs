@@ -1517,4 +1517,112 @@ mod tests {
         assert_eq!(state.eager_count(), 2);
         assert_eq!(state.lazy_count(), 7);
     }
+
+    #[test]
+    fn test_max_eager_peers_limit() {
+        // Test that max_eager_peers hard cap is respected
+        let state = PeerStateBuilder::new()
+            .with_local_id(0u64)
+            .with_max_eager_peers(3)
+            .build();
+
+        // Add peers to lazy set
+        for i in 1..=10 {
+            state.add_peer(i);
+        }
+
+        // Promote peers to eager - should stop at max
+        for i in 1..=10 {
+            state.promote_to_eager(&i);
+        }
+
+        // Should be capped at 3 eager peers
+        assert_eq!(state.eager_count(), 3);
+        assert!(state.lazy_count() > 0);
+
+        // Verify can_promote_to_eager returns false when at limit
+        assert!(!state.can_promote_to_eager());
+    }
+
+    #[test]
+    fn test_max_lazy_peers_limit() {
+        // Test that max_lazy_peers hard cap is respected
+        let mut state = PeerState::new();
+        state.set_max_lazy_peers(Some(5));
+
+        // Try to add 10 peers
+        let mut added = 0;
+        for i in 1..=10 {
+            if state.add_peer(i) {
+                added += 1;
+            }
+        }
+
+        // Should be capped at 5 lazy peers
+        assert_eq!(added, 5);
+        assert_eq!(state.lazy_count(), 5);
+    }
+
+    #[test]
+    fn test_configurable_ring_neighbor_protection() {
+        // Test that max_protected_neighbors controls protection
+        let state = PeerStateBuilder::new()
+            .with_local_id(0u64)
+            .use_hash_ring(true)
+            .with_protect_ring_neighbors(true)
+            .with_max_protected_neighbors(2) // Only i±1, not i±2
+            .with_peers(1..20u64)
+            .with_eager_fanout(5)
+            .build();
+
+        // With max_protected_neighbors=2, only immediate neighbors should be protected
+        let ring_neighbors = state.ring_neighbors();
+        assert!(ring_neighbors.len() <= 2, "Should have at most 2 protected neighbors");
+    }
+
+    #[test]
+    fn test_disable_ring_neighbor_protection() {
+        // Test that protect_ring_neighbors=false disables all protection
+        let state = PeerStateBuilder::new()
+            .with_local_id(0u64)
+            .use_hash_ring(true)
+            .with_protect_ring_neighbors(false)
+            .with_peers(1..20u64)
+            .with_eager_fanout(5)
+            .build();
+
+        // With protection disabled, ring_neighbors should be empty
+        let ring_neighbors = state.ring_neighbors();
+        assert!(ring_neighbors.is_empty(), "No neighbors should be protected");
+
+        // All eager peers should be demotable
+        for peer in state.eager_peers() {
+            assert!(
+                state.demote_to_lazy(&peer),
+                "All peers should be demotable when protection is disabled"
+            );
+        }
+    }
+
+    #[test]
+    fn test_builder_with_all_new_options() {
+        // Test PeerStateBuilder with all new configuration options
+        let state = PeerStateBuilder::new()
+            .with_local_id(0u64)
+            .use_hash_ring(true)
+            .with_protect_ring_neighbors(true)
+            .with_max_protected_neighbors(4)
+            .with_max_eager_peers(5)
+            .with_max_lazy_peers(20)
+            .with_peers(1..30u64)
+            .with_eager_fanout(3)
+            .with_lazy_fanout(6)
+            .build();
+
+        // Verify limits are applied
+        assert!(state.eager_count() <= 5);
+        assert!(state.lazy_count() <= 20);
+        assert_eq!(state.max_eager_peers(), Some(5));
+        assert_eq!(state.max_lazy_peers(), Some(20));
+    }
 }

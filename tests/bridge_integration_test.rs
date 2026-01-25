@@ -5,7 +5,7 @@
 
 use memberlist_plumtree::{
     // Core protocol
-    NoopDelegate, PlumtreeConfig, PlumtreeMemberlist,
+    NoopDelegate, PlumtreeConfig, PlumtreeDiscovery,
     // Bridge types
     BridgeConfig, BridgeEventDelegate, PlumtreeBridge, PlumtreeStackBuilder,
     // Transport for testing
@@ -18,8 +18,8 @@ type NodeId = u64;
 /// Test that bridge correctly adds peers when notify_join is called.
 #[tokio::test]
 async fn test_bridge_notify_join_adds_peer() {
-    // Create PlumtreeMemberlist for node 1
-    let pm = Arc::new(PlumtreeMemberlist::new(
+    // Create PlumtreeDiscovery for node 1
+    let pm = Arc::new(PlumtreeDiscovery::new(
         1u64,
         PlumtreeConfig::lan(),
         NoopDelegate,
@@ -50,7 +50,7 @@ async fn test_bridge_notify_join_adds_peer() {
 /// Test that bridge correctly removes peers when notify_leave is called.
 #[tokio::test]
 async fn test_bridge_notify_leave_removes_peer() {
-    let pm = Arc::new(PlumtreeMemberlist::new(
+    let pm = Arc::new(PlumtreeDiscovery::new(
         1u64,
         PlumtreeConfig::lan(),
         NoopDelegate,
@@ -94,7 +94,7 @@ async fn test_bridge_config_options() {
     assert!(!config.log_changes);
     assert!(!config.auto_promote);
 
-    let pm = Arc::new(PlumtreeMemberlist::new(
+    let pm = Arc::new(PlumtreeDiscovery::new(
         1u64,
         PlumtreeConfig::default(),
         NoopDelegate,
@@ -110,7 +110,7 @@ async fn test_bridge_config_options() {
 /// Test PlumtreeStackBuilder API.
 #[tokio::test]
 async fn test_stack_builder_api() {
-    let pm = Arc::new(PlumtreeMemberlist::new(
+    let pm = Arc::new(PlumtreeDiscovery::new(
         1u64,
         PlumtreeConfig::lan(),
         NoopDelegate,
@@ -130,7 +130,7 @@ async fn test_stack_builder_api() {
 /// Test bridge broadcast functionality.
 #[tokio::test]
 async fn test_bridge_broadcast() {
-    let pm = Arc::new(PlumtreeMemberlist::new(
+    let pm = Arc::new(PlumtreeDiscovery::new(
         1u64,
         PlumtreeConfig::lan(),
         NoopDelegate,
@@ -149,7 +149,7 @@ async fn test_bridge_broadcast() {
 /// Test bridge shutdown.
 #[tokio::test]
 async fn test_bridge_shutdown() {
-    let pm = Arc::new(PlumtreeMemberlist::new(
+    let pm = Arc::new(PlumtreeDiscovery::new(
         1u64,
         PlumtreeConfig::lan(),
         NoopDelegate,
@@ -168,9 +168,9 @@ async fn test_bridge_shutdown() {
 #[tokio::test]
 async fn test_multi_node_topology_simulation() {
     // Simulate a 5-node cluster
-    let nodes: Vec<Arc<PlumtreeMemberlist<NodeId, NoopDelegate>>> = (1..=5)
+    let nodes: Vec<Arc<PlumtreeDiscovery<NodeId, NoopDelegate>>> = (1..=5)
         .map(|id| {
-            Arc::new(PlumtreeMemberlist::new(
+            Arc::new(PlumtreeDiscovery::new(
                 id as u64,
                 PlumtreeConfig::lan(),
                 NoopDelegate,
@@ -219,7 +219,7 @@ async fn test_multi_node_topology_simulation() {
 /// Test bridge with pooled transport setup (no actual network).
 #[tokio::test]
 async fn test_bridge_with_pooled_transport() {
-    let pm = Arc::new(PlumtreeMemberlist::new(
+    let pm = Arc::new(PlumtreeDiscovery::new(
         1u64,
         PlumtreeConfig::lan(),
         NoopDelegate,
@@ -248,7 +248,7 @@ async fn test_bridge_with_pooled_transport() {
 async fn test_bridge_event_delegate_clone() {
     use memberlist_plumtree::memberlist::delegate::VoidDelegate;
 
-    let pm = Arc::new(PlumtreeMemberlist::new(
+    let pm = Arc::new(PlumtreeDiscovery::new(
         1u64,
         PlumtreeConfig::lan(),
         NoopDelegate,
@@ -265,7 +265,7 @@ async fn test_bridge_event_delegate_clone() {
     // Clone the delegate
     let delegate_clone = delegate.clone();
 
-    // Both should reference the same underlying PlumtreeMemberlist
+    // Both should reference the same underlying PlumtreeDiscovery
     assert!(Arc::ptr_eq(
         delegate.bridge().plumtree(),
         delegate_clone.bridge().plumtree()
@@ -275,7 +275,7 @@ async fn test_bridge_event_delegate_clone() {
 /// Test that bridge handles rapid add/remove cycles.
 #[tokio::test]
 async fn test_rapid_topology_changes() {
-    let pm = Arc::new(PlumtreeMemberlist::new(
+    let pm = Arc::new(PlumtreeDiscovery::new(
         1u64,
         PlumtreeConfig::lan(),
         NoopDelegate,
@@ -304,7 +304,7 @@ async fn test_rapid_topology_changes() {
 /// Test topology snapshot consistency.
 #[tokio::test]
 async fn test_topology_snapshot_consistency() {
-    let pm = Arc::new(PlumtreeMemberlist::new(
+    let pm = Arc::new(PlumtreeDiscovery::new(
         1u64,
         PlumtreeConfig::lan(),
         NoopDelegate,
@@ -342,7 +342,7 @@ async fn test_topology_snapshot_consistency() {
 /// Test that bridge correctly delegates to inner delegate (via stack builder).
 #[tokio::test]
 async fn test_stack_builder_delegate_creation() {
-    let pm = Arc::new(PlumtreeMemberlist::new(
+    let pm = Arc::new(PlumtreeDiscovery::new(
         1u64,
         PlumtreeConfig::lan(),
         NoopDelegate,
@@ -415,7 +415,7 @@ async fn test_full_receive_integration() {
     let node_a_id = 1u64;
     let delegate = TrackingDelegate::new();
 
-    let pm_a = Arc::new(PlumtreeMemberlist::new(
+    let pm_a = Arc::new(PlumtreeDiscovery::new(
         node_a_id,
         PlumtreeConfig::lan(),
         delegate.clone(),
@@ -479,7 +479,7 @@ async fn test_full_receive_integration() {
 async fn test_full_receive_multiple_messages() {
     let delegate = TrackingDelegate::new();
 
-    let pm = Arc::new(PlumtreeMemberlist::new(
+    let pm = Arc::new(PlumtreeDiscovery::new(
         1u64,
         PlumtreeConfig::lan(),
         delegate.clone(),
@@ -547,7 +547,7 @@ async fn test_full_receive_multiple_messages() {
 async fn test_full_receive_duplicate_rejection() {
     let delegate = TrackingDelegate::new();
 
-    let pm = Arc::new(PlumtreeMemberlist::new(
+    let pm = Arc::new(PlumtreeDiscovery::new(
         1u64,
         PlumtreeConfig::lan(),
         delegate.clone(),
@@ -607,7 +607,7 @@ async fn test_full_receive_duplicate_rejection() {
 async fn test_full_receive_ihave_graft_cycle() {
     let delegate = TrackingDelegate::new();
 
-    let pm = Arc::new(PlumtreeMemberlist::new(
+    let pm = Arc::new(PlumtreeDiscovery::new(
         1u64,
         PlumtreeConfig::lan()
             .with_graft_timeout(Duration::from_millis(100))
@@ -660,12 +660,12 @@ async fn test_full_two_node_communication() {
     let delegate1 = TrackingDelegate::new();
     let delegate2 = TrackingDelegate::new();
 
-    let pm1 = Arc::new(PlumtreeMemberlist::new(
+    let pm1 = Arc::new(PlumtreeDiscovery::new(
         1u64,
         PlumtreeConfig::lan(),
         delegate1.clone(),
     ));
-    let pm2 = Arc::new(PlumtreeMemberlist::new(
+    let pm2 = Arc::new(PlumtreeDiscovery::new(
         2u64,
         PlumtreeConfig::lan(),
         delegate2.clone(),

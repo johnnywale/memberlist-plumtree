@@ -149,7 +149,7 @@ The peer scoring system tracks RTT (Round-Trip Time) and reliability to optimize
 
 ### How Scoring Works
 
-1. **RTT Measurement**: Samples collected during Graft → Gossip exchanges
+1. **RTT Measurement**: Samples recorded via `record_peer_rtt()` (must be called by user)
 2. **Exponential Moving Average**: Smooths RTT variations
 3. **Failure Tracking**: Timeouts and errors tracked with exponential decay
 4. **Score Calculation**:
@@ -158,6 +158,8 @@ The peer scoring system tracks RTT (Round-Trip Time) and reliability to optimize
 base_score = 1000 / (rtt_ema + floor)^exponent
 final_score = base_score / (1 + loss_rate × loss_penalty)
 ```
+
+**Note**: RTT is not automatically recorded by the protocol. You must call `record_peer_rtt()` when you have RTT measurements (e.g., from your transport layer, ping responses, or application-level timing).
 
 ### Configuration
 
@@ -179,17 +181,25 @@ let config = ScoringConfig::default()
 
 ### Recording RTT Samples
 
+RTT samples must be recorded manually by the user. The Plumtree struct provides convenience methods:
+
 ```rust
+// Via Plumtree instance (recommended)
+plumtree.record_peer_rtt(&peer_id, Duration::from_millis(15));
+plumtree.record_peer_failure(&peer_id);
+
+// Or directly via PeerScoring
 use memberlist_plumtree::PeerScoring;
 
 let scoring = PeerScoring::new(ScoringConfig::default());
-
-// Record successful RTT
 scoring.record_rtt(&peer_id, Duration::from_millis(15));
-
-// Record failure (timeout, error)
 scoring.record_failure(&peer_id);
 ```
+
+**When to record RTT:**
+- After receiving a response to a request (Graft → Gossip)
+- From transport-level RTT (QUIC connection stats, TCP RTT)
+- From application-level ping/pong timing
 
 ### Using Scores for Rebalancing
 

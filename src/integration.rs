@@ -16,28 +16,29 @@
 //! The envelope is transparent to users - encoding/decoding happens automatically.
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use memberlist_core::{
-    delegate::{
-        AliveDelegate, ConflictDelegate, Delegate, EventDelegate, MergeDelegate, NodeDelegate,
-        PingDelegate,
-    },
-    proto::{Meta, NodeState},
-};
-use nodecraft::{CheapClone, Id};
-use std::{borrow::Cow, fmt::Debug, hash::Hash, marker::PhantomData, sync::Arc};
+use nodecraft::Id;
+use smallvec::SmallVec;
+use std::{fmt::Debug, hash::Hash, sync::Arc};
+
 
 use crate::{
     config::PlumtreeConfig,
     error::Result,
-    message::{MessageId, PlumtreeMessage},
+    message::{MessageId, PlumtreeMessage, SyncMessage},
     peer_state::PeerState,
     plumtree::{Plumtree, PlumtreeDelegate, PlumtreeHandle},
+    storage::{current_time_ms, MemoryStore, MessageStore, StoredMessage},
+    sync::SyncHandler,
 };
+
+/// Storage type alias for convenience.
+/// Users can provide their own storage backend by implementing MessageStore.
+pub type DefaultStore = MemoryStore;
 
 /// Trait for encoding and decoding node IDs for network transmission.
 ///
 /// This trait must be implemented for any node ID type used with
-/// `PlumtreeMemberlist` to enable sender identity tracking.
+/// `PlumtreeDiscovery` to enable sender identity tracking.
 ///
 /// # Example
 ///
@@ -254,7 +255,7 @@ impl<I: IdCodec> UnicastEnvelope<I> {
 ///
 /// ```ignore
 /// use memberlist_plumtree::{
-///     PlumtreeMemberlist, PlumtreeConfig, NoopDelegate,
+///     PlumtreeDiscovery, PlumtreeConfig, NoopDelegate,
 ///     QuicTransport, QuicConfig, PooledTransport, PoolConfig,
 ///     MapPeerResolver, decode_plumtree_envelope
 /// };
@@ -271,8 +272,8 @@ impl<I: IdCodec> UnicastEnvelope<I> {
 ///     .with_max_queue_per_peer(512);
 /// let transport = PooledTransport::new(quic_transport, pool_config);
 ///
-/// // 3. Initialize PlumtreeMemberlist
-/// let pm = Arc::new(PlumtreeMemberlist::new(local_id, PlumtreeConfig::lan(), NoopDelegate));
+/// // 3. Initialize PlumtreeDiscovery
+/// let pm = Arc::new(PlumtreeDiscovery::new(local_id, PlumtreeConfig::lan(), NoopDelegate));
 ///
 /// // 4. Start the runners
 /// // run_with_transport automatically drives the internal PlumtreeRunner (runner.rs)
@@ -303,12 +304,25 @@ impl<I: IdCodec> UnicastEnvelope<I> {
 /// //     pm.incoming_sender().send((sender_id, message)).await.ok();
 /// // }
 /// ```
-pub struct PlumtreeMemberlist<I, PD>
+/// Combined Plumtree + Memberlist system with configurable storage.
+///
+/// # Type Parameters
+///
+/// - `I`: Node identifier type
+/// - `PD`: Plumtree delegate for message delivery callbacks
+/// - `S`: Storage backend implementing [`MessageStore`]
+///
+/// # Default Storage
+///
+/// Use [`PlumtreeDiscovery::new`] for in-memory storage (default).
+/// Use [`PlumtreeDiscovery::with_storage`] to provide a custom storage backend.
+pub struct PlumtreeDiscovery<I, PD, S = DefaultStore>
 where
     I: Id,
+    S: MessageStore,
 {
     /// Plumtree broadcast layer.
-    plumtree: Plumtree<I, PlumtreeEventHandler<I, PD>>,
+    plumtree: Plumtree<I, PlumtreeEventHandler<I, PD, S>>,
     /// Handle for message I/O.
     handle: PlumtreeHandle<I>,
     /// Channel for sending incoming Plumtree messages to be processed.
@@ -324,14 +338,18 @@ where
     unicast_rx: async_channel::Receiver<UnicastEnvelope<I>>,
     /// Sender for outgoing unicast messages.
     unicast_tx: async_channel::Sender<UnicastEnvelope<I>>,
+    /// Message storage for sync/persistence.
+    store: Arc<S>,
+    /// Sync handler for anti-entropy.
+    sync_handler: Arc<SyncHandler<S>>,
 }
 
-impl<I, PD> PlumtreeMemberlist<I, PD>
+impl<I, PD> PlumtreeDiscovery<I, PD, DefaultStore>
 where
     I: Id + IdCodec + Clone + Eq + Hash + Debug + Send + Sync + 'static,
     PD: PlumtreeDelegate<I>,
 {
-    /// Create a new PlumtreeMemberlist instance.
+    /// Create a new PlumtreeDiscovery instance with default in-memory storage.
     ///
     /// # Arguments
     ///
@@ -341,18 +359,100 @@ where
     ///
     /// # Note
     ///
-    /// Hash ring topology is automatically enabled for `PlumtreeMemberlist` to ensure
+    /// Hash ring topology is automatically enabled for `PlumtreeDiscovery` to ensure
     /// deterministic peer selection and Z≥2 redundancy guarantees.
+    ///
+    /// Use [`with_storage`](Self::with_storage) to provide a custom storage backend
+    /// (e.g., Sled for persistence).
     pub fn new(local_id: I, config: PlumtreeConfig, delegate: PD) -> Self {
+        // Create storage based on config
+        let max_messages = config
+            .storage
+            .as_ref()
+            .map(|s| s.max_messages)
+            .unwrap_or(100_000);
+        let store = Arc::new(MemoryStore::new(max_messages));
+
+        Self::with_storage(local_id, config, delegate, store)
+    }
+
+    /// Create a PlumtreeDiscovery from a PlumtreeStackConfig with MemberlistDiscovery.
+    ///
+    /// This is a convenience method for creating a PlumtreeDiscovery when using
+    /// the `with_discovery` pattern with `MemberlistDiscovery`.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Stack configuration with `MemberlistDiscovery`
+    /// * `delegate` - Application delegate for message delivery
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use memberlist_plumtree::{
+    ///     PlumtreeStackConfig, PlumtreeConfig, PlumtreeDiscovery, NoopDelegate,
+    ///     discovery::{MemberlistDiscovery, MemberlistDiscoveryConfig},
+    /// };
+    ///
+    /// // Create stack config with memberlist discovery
+    /// let discovery = MemberlistDiscovery::from_seeds(
+    ///     "0.0.0.0:7946".parse().unwrap(),
+    ///     vec!["192.168.1.10:7946".parse().unwrap()],
+    /// );
+    /// let stack_config = PlumtreeStackConfig::new(node_id, "0.0.0.0:9000".parse().unwrap())
+    ///     .with_discovery(discovery)
+    ///     .with_plumtree(PlumtreeConfig::default());
+    ///
+    /// // Create PlumtreeDiscovery from config
+    /// let pm = PlumtreeDiscovery::from_stack_config(&stack_config, NoopDelegate);
+    /// ```
+    pub fn from_stack_config<D>(
+        config: &crate::PlumtreeStackConfig<I, D>,
+        delegate: PD,
+    ) -> Self
+    where
+        D: crate::discovery::ClusterDiscovery<I>,
+    {
+        Self::new(config.local_id.clone(), config.plumtree.clone(), delegate)
+    }
+}
+
+impl<I, PD, S> PlumtreeDiscovery<I, PD, S>
+where
+    I: Id + IdCodec + Clone + Eq + Hash + Debug + Send + Sync + 'static,
+    PD: PlumtreeDelegate<I>,
+    S: MessageStore + 'static,
+{
+    /// Create a new PlumtreeDiscovery instance with a custom storage backend.
+    ///
+    /// # Arguments
+    ///
+    /// * `local_id` - The local node's identifier
+    /// * `config` - Plumtree configuration (hash ring is automatically enabled)
+    /// * `delegate` - Application delegate for message delivery
+    /// * `store` - Storage backend for message persistence
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use memberlist_plumtree::{PlumtreeDiscovery, SledStore};
+    ///
+    /// let store = Arc::new(SledStore::open("/tmp/plumtree")?);
+    /// let pm = PlumtreeDiscovery::with_storage(node_id, config, delegate, store);
+    /// ```
+    pub fn with_storage(local_id: I, config: PlumtreeConfig, delegate: PD, store: Arc<S>) -> Self {
         // Create channels for communication
         let (incoming_tx, incoming_rx) = async_channel::bounded(1024);
         let (outgoing_tx, outgoing_rx) = async_channel::bounded(1024);
         let (unicast_tx, unicast_rx) = async_channel::bounded(1024);
 
-        // Create the event handler that wraps the user delegate
-        let event_handler = PlumtreeEventHandler::new(delegate);
+        // Create sync handler
+        let sync_handler = Arc::new(SyncHandler::new(store.clone()));
 
-        // Force hash ring topology for PlumtreeMemberlist
+        // Create the event handler that wraps the user delegate and storage
+        let event_handler = PlumtreeEventHandler::new(delegate, store.clone(), sync_handler.clone());
+
+        // Force hash ring topology for PlumtreeDiscovery
         let config = config.with_hash_ring(true);
 
         // Create the Plumtree instance
@@ -367,6 +467,8 @@ where
             outgoing_tx,
             unicast_rx,
             unicast_tx,
+            store,
+            sync_handler,
         }
     }
 
@@ -386,8 +488,22 @@ where
     /// to get bytes for transmission.
     ///
     /// Pass this to `PlumtreeNodeDelegate` for memberlist broadcast.
-    #[allow(dead_code)]
-    pub(crate) fn outgoing_receiver_raw(&self) -> async_channel::Receiver<BroadcastEnvelope<I>> {
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use memberlist_plumtree::PlumtreeNodeDelegate;
+    ///
+    /// let plumtree_delegate = PlumtreeNodeDelegate::new(
+    ///     void_delegate,
+    ///     pm.incoming_sender(),
+    ///     pm.outgoing_receiver(),
+    ///     pm.peers().clone(),
+    ///     pm.config().eager_fanout,
+    ///     pm.config().max_peers,
+    /// );
+    /// ```
+    pub fn outgoing_receiver(&self) -> async_channel::Receiver<BroadcastEnvelope<I>> {
         self.outgoing_rx.clone()
     }
 
@@ -431,8 +547,22 @@ where
     /// Broadcast a message to all nodes in the cluster.
     ///
     /// Uses Plumtree's efficient O(n) spanning tree broadcast.
+    /// The message is also stored for sync/persistence.
     pub async fn broadcast(&self, payload: impl Into<Bytes>) -> Result<MessageId> {
-        self.plumtree.broadcast(payload).await
+        let payload = payload.into();
+
+        // Broadcast via Plumtree
+        let msg_id = self.plumtree.broadcast(payload.clone()).await?;
+
+        // Store for sync/persistence (same as on_deliver)
+        self.sync_handler.record_message(msg_id, &payload);
+
+        let msg = StoredMessage::new(msg_id, 0, payload);
+        if let Err(e) = self.store.insert(&msg).await {
+            tracing::warn!("failed to store broadcast message: {}", e);
+        }
+
+        Ok(msg_id)
     }
 
     /// Handle an incoming Plumtree message from the network.
@@ -443,7 +573,7 @@ where
     }
 
     /// Get a reference to the underlying Plumtree instance.
-    pub fn plumtree(&self) -> &Plumtree<I, PlumtreeEventHandler<I, PD>> {
+    pub fn plumtree(&self) -> &Plumtree<I, PlumtreeEventHandler<I, PD, S>> {
         &self.plumtree
     }
 
@@ -500,49 +630,6 @@ where
         self.plumtree.peers()
     }
 
-    /// Wrap a memberlist delegate with Plumtree integration.
-    ///
-    /// This creates a `PlumtreeNodeDelegate` that wraps your delegate and
-    /// automatically synchronizes peer state when nodes join or leave the cluster.
-    ///
-    /// The wrapped delegate should be passed to memberlist when creating it.
-    ///
-    /// # Arguments
-    ///
-    /// * `delegate` - Your memberlist delegate implementation
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// use memberlist_plumtree::{PlumtreeMemberlist, PlumtreeConfig};
-    ///
-    /// // Create PlumtreeMemberlist
-    /// let pm = PlumtreeMemberlist::new(node_id, PlumtreeConfig::default(), my_plumtree_delegate);
-    ///
-    /// // Wrap your memberlist delegate
-    /// let wrapped = pm.wrap_delegate(my_memberlist_delegate);
-    ///
-    /// // Create memberlist with the wrapped delegate
-    /// let memberlist = Memberlist::new(wrapped, memberlist_config).await?;
-    ///
-    /// // Run PlumtreeMemberlist with transport
-    /// pm.run_with_transport(transport).await;
-    /// ```
-    pub fn wrap_delegate<A, D>(&self, delegate: D) -> PlumtreeNodeDelegate<I, A, D>
-    where
-        A: Send + Sync + 'static,
-    {
-        let config = self.plumtree.config();
-        PlumtreeNodeDelegate::new(
-            delegate,
-            self.incoming_tx.clone(),
-            self.outgoing_rx.clone(),
-            self.plumtree.peers().clone(),
-            config.eager_fanout,
-            config.max_peers,
-        )
-    }
-
     /// Run the Plumtree background tasks (manual unicast handling).
     ///
     /// This runs the IHave scheduler, Graft timer, and outgoing processor.
@@ -565,7 +652,7 @@ where
 
     /// Run the Plumtree background tasks with automatic unicast handling.
     ///
-    /// This is the **recommended** way to run PlumtreeMemberlist. It handles
+    /// This is the **recommended** way to run PlumtreeDiscovery. It handles
     /// unicast message delivery automatically using the provided transport,
     /// preventing protocol failures from forgotten unicast handling.
     ///
@@ -576,7 +663,7 @@ where
     /// # Example
     ///
     /// ```ignore
-    /// use memberlist_plumtree::{PlumtreeMemberlist, Transport};
+    /// use memberlist_plumtree::{PlumtreeDiscovery, Transport};
     ///
     /// struct MyTransport { memberlist: Memberlist }
     ///
@@ -593,16 +680,92 @@ where
     /// ```
     pub async fn run_with_transport<T>(&self, transport: T)
     where
-        T: crate::Transport<I>,
+        T: crate::Transport<I> + Clone,
     {
-        futures::future::join5(
-            self.plumtree.run_ihave_scheduler(),
-            self.plumtree.run_graft_timer(),
-            self.plumtree.run_seen_cleanup(),
-            self.run_outgoing_processor(),
-            self.run_unicast_sender(transport),
+        // Clone transport for sync task
+        let sync_transport = transport.clone();
+
+        futures::future::join(
+            futures::future::join(
+                futures::future::join5(
+                    self.plumtree.run_ihave_scheduler(),
+                    self.plumtree.run_graft_timer(),
+                    self.plumtree.run_seen_cleanup(),
+                    self.run_outgoing_processor(),
+                    self.run_unicast_sender(transport),
+                ),
+                self.run_storage_prune(),
+            ),
+            self.run_anti_entropy_sync(sync_transport),
         )
         .await;
+    }
+
+    /// Run storage pruning background task.
+    ///
+    /// Periodically removes expired messages based on retention policy.
+    async fn run_storage_prune(&self) {
+        let Some(ref storage_config) = self.plumtree.config().storage else {
+            tracing::trace!("Storage not configured, skipping prune task");
+            return;
+        };
+
+        if !storage_config.enabled {
+            return;
+        }
+
+        // Default prune interval is 1/10 of retention, minimum 1 second
+        let prune_interval = std::cmp::max(
+            storage_config.retention / 10,
+            std::time::Duration::from_secs(1),
+        );
+
+        tracing::info!(
+            retention_s = storage_config.retention.as_secs(),
+            interval_s = prune_interval.as_secs(),
+            "Storage prune task started"
+        );
+
+        loop {
+            if self.plumtree.is_shutdown() {
+                tracing::info!("Storage prune task shutting down");
+                break;
+            }
+
+            futures_timer::Delay::new(prune_interval).await;
+
+            if self.plumtree.is_shutdown() {
+                break;
+            }
+
+            // Calculate cutoff timestamp
+            let cutoff = current_time_ms().saturating_sub(storage_config.retention.as_millis() as u64);
+
+            // Prune expired messages from storage
+            match self.store.prune(cutoff).await {
+                Ok(removed) if removed > 0 => {
+                    tracing::debug!(removed, "pruned expired messages from storage");
+
+                    // Also update sync state - rebuild from storage
+                    // This is O(n) but happens infrequently (every prune interval)
+                    if let Ok((ids, _)) = self.store.get_range(0, u64::MAX, usize::MAX, 0).await {
+                        let mut messages_to_rebuild = Vec::new();
+                        for id in ids {
+                            if let Ok(Some(msg)) = self.store.get(&id).await {
+                                messages_to_rebuild.push((id, msg.payload));
+                            }
+                        }
+                        self.sync_handler.rebuild_from_messages(
+                            messages_to_rebuild.iter().map(|(id, p)| (*id, p.as_ref())),
+                        );
+                    }
+                }
+                Ok(_) => {} // No messages pruned
+                Err(e) => {
+                    tracing::warn!("failed to prune storage: {}", e);
+                }
+            }
+        }
     }
 
     /// Internal task that sends unicast messages via the provided transport.
@@ -666,12 +829,201 @@ where
     /// Process incoming messages from the incoming channel.
     ///
     /// Should be spawned as a background task if using channels.
+    /// Handles both regular Plumtree messages and sync messages.
     pub async fn run_incoming_processor(&self) {
         while let Ok((from, message)) = self.incoming_rx.recv().await {
-            if let Err(e) = self.plumtree.handle_message(from, message).await {
-                tracing::warn!("failed to handle plumtree message: {}", e);
+            // Handle sync messages specially
+            if let PlumtreeMessage::Sync(sync_msg) = &message {
+                if let Err(e) = self.handle_sync_message(from.clone(), sync_msg.clone()).await {
+                    tracing::warn!("failed to handle sync message: {}", e);
+                }
+            } else {
+                // Regular Plumtree messages
+                if let Err(e) = self.plumtree.handle_message(from, message).await {
+                    tracing::warn!("failed to handle plumtree message: {}", e);
+                }
             }
         }
+    }
+
+    /// Handle a sync protocol message.
+    async fn handle_sync_message(&self, from: I, sync_msg: SyncMessage) -> Result<()> {
+        let local_id = self.plumtree.local_id().clone();
+
+        match sync_msg {
+            SyncMessage::Request {
+                root_hash,
+                time_start,
+                time_end,
+            } => {
+                tracing::debug!(?from, "handling sync request");
+                let response = self
+                    .sync_handler
+                    .handle_sync_request(root_hash, (time_start, time_end))
+                    .await;
+
+                // Send response back to requester
+                let response_msg = PlumtreeMessage::Sync(SyncMessage::Response {
+                    matches: response.matches,
+                    message_ids: SmallVec::from_vec(response.message_ids),
+                    has_more: response.has_more,
+                });
+                let envelope = UnicastEnvelope {
+                    sender: local_id,
+                    target: from,
+                    message: response_msg,
+                };
+                let _ = self.unicast_tx.send(envelope).await;
+            }
+
+            SyncMessage::Response {
+                matches,
+                message_ids,
+                has_more: _,
+            } => {
+                if matches {
+                    tracing::debug!(?from, "sync complete - hashes match");
+                    return Ok(());
+                }
+
+                tracing::debug!(?from, ids = message_ids.len(), "sync response - checking for missing");
+
+                // Check which messages we're missing
+                if let Some(pull) = self
+                    .sync_handler
+                    .handle_sync_response(message_ids.to_vec())
+                    .await
+                {
+                    // Request missing messages
+                    let pull_msg = PlumtreeMessage::Sync(SyncMessage::Pull {
+                        message_ids: SmallVec::from_vec(pull.message_ids),
+                    });
+                    let envelope = UnicastEnvelope {
+                        sender: local_id,
+                        target: from,
+                        message: pull_msg,
+                    };
+                    let _ = self.unicast_tx.send(envelope).await;
+                }
+            }
+
+            SyncMessage::Pull { message_ids } => {
+                tracing::debug!(?from, ids = message_ids.len(), "handling sync pull");
+
+                // Get requested messages from storage
+                let push = self
+                    .sync_handler
+                    .handle_sync_pull(message_ids.to_vec())
+                    .await;
+
+                // Send messages back
+                let messages: Vec<(MessageId, u32, Bytes)> = push
+                    .messages
+                    .into_iter()
+                    .map(|m| (m.id, m.round, m.payload))
+                    .collect();
+
+                let push_msg = PlumtreeMessage::Sync(SyncMessage::Push { messages });
+                let envelope = UnicastEnvelope {
+                    sender: local_id,
+                    target: from,
+                    message: push_msg,
+                };
+                let _ = self.unicast_tx.send(envelope).await;
+            }
+
+            SyncMessage::Push { messages } => {
+                tracing::debug!(?from, count = messages.len(), "received sync push");
+
+                // Deliver each message through the normal Plumtree path
+                for (id, round, payload) in messages {
+                    // Create a Gossip message and process it
+                    let gossip = PlumtreeMessage::Gossip { id, round, payload };
+                    if let Err(e) = self.plumtree.handle_message(from.clone(), gossip).await {
+                        tracing::warn!("failed to deliver synced message {:?}: {}", id, e);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Run anti-entropy sync background task.
+    ///
+    /// Periodically initiates sync with random peers to recover missed messages.
+    async fn run_anti_entropy_sync<T>(&self, transport: T)
+    where
+        T: crate::Transport<I>,
+    {
+        let Some(ref sync_config) = self.plumtree.config().sync else {
+            tracing::info!("Anti-entropy sync not configured");
+            return;
+        };
+
+        if !sync_config.enabled {
+            tracing::info!("Anti-entropy sync disabled");
+            return;
+        }
+
+        tracing::info!(
+            interval_s = sync_config.sync_interval.as_secs(),
+            window_s = sync_config.sync_window.as_secs(),
+            "Anti-entropy sync started"
+        );
+
+        let local_id = self.plumtree.local_id().clone();
+
+        loop {
+            if self.plumtree.is_shutdown() {
+                tracing::info!("Anti-entropy sync shutting down");
+                break;
+            }
+
+            // Wait for sync interval
+            futures_timer::Delay::new(sync_config.sync_interval).await;
+
+            // Check for shutdown after waking
+            if self.plumtree.is_shutdown() {
+                break;
+            }
+
+            // Pick a random peer
+            if let Some(peer) = self.plumtree.peers().random_peer() {
+                tracing::debug!(?peer, "initiating sync with peer");
+
+                // Calculate time range for sync
+                let now = current_time_ms();
+                let start = now.saturating_sub(sync_config.sync_window.as_millis() as u64);
+
+                // Get our root hash
+                let root_hash = self.sync_handler.root_hash();
+
+                // Send sync request
+                let request = PlumtreeMessage::Sync(SyncMessage::Request {
+                    root_hash,
+                    time_start: start,
+                    time_end: now,
+                });
+
+                let encoded = encode_plumtree_envelope(&local_id, &request);
+                if let Err(e) = transport.send_to(&peer, encoded).await {
+                    tracing::warn!(?peer, "failed to send sync request: {}", e);
+                }
+            } else {
+                tracing::trace!("no peers available for sync");
+            }
+        }
+    }
+
+    /// Get a reference to the sync handler.
+    pub fn sync_handler(&self) -> &Arc<SyncHandler<S>> {
+        &self.sync_handler
+    }
+
+    /// Get a reference to the message store.
+    pub fn store(&self) -> &Arc<S> {
+        &self.store
     }
 
     /// Shutdown the Plumtree layer.
@@ -687,376 +1039,66 @@ where
     }
 }
 
-/// Callback for handling peer promotion events during rebalancing.
-pub type PromotionCallback<I> = Arc<dyn Fn(&I) + Send + Sync>;
-
-/// Callback for handling peer demotion events during rebalancing.
-pub type DemotionCallback<I> = Arc<dyn Fn(&I) + Send + Sync>;
-
-/// Delegate that intercepts messages for Plumtree protocol.
-///
-/// Wraps a user delegate and handles Plumtree message routing.
-/// Use this when creating a memberlist to integrate Plumtree.
-pub struct PlumtreeNodeDelegate<I, A, D> {
-    /// Inner user delegate.
-    inner: D,
-    /// Channel to send received Plumtree messages to PlumtreeMemberlist.
-    plumtree_tx: async_channel::Sender<(I, PlumtreeMessage)>,
-    /// Outgoing Plumtree messages to broadcast via memberlist (unencooded).
-    /// Serialization is deferred until messages are sent over the network.
-    outgoing_rx: async_channel::Receiver<BroadcastEnvelope<I>>,
-    /// Shared peer state for synchronizing membership changes.
-    /// When memberlist detects a node join/leave, this is updated to keep
-    /// Plumtree's peer state in sync.
-    peers: Arc<PeerState<I>>,
-    /// Target number of eager peers for auto-classification.
-    eager_fanout: usize,
-    /// Maximum total peers allowed (None = unlimited).
-    max_peers: Option<usize>,
-    /// Optional callback for peer promotion events during rebalancing.
-    on_promotion: Option<PromotionCallback<I>>,
-    /// Optional callback for peer demotion events during rebalancing.
-    on_demotion: Option<DemotionCallback<I>>,
-    /// Marker.
-    _marker: PhantomData<A>,
-}
-
-impl<I, A, D> PlumtreeNodeDelegate<I, A, D> {
-    /// Create a new Plumtree node delegate.
-    ///
-    /// This wraps a user's memberlist delegate to automatically synchronize
-    /// peer state when nodes join or leave the cluster.
-    ///
-    /// # Arguments
-    ///
-    /// * `inner` - The user's delegate implementation
-    /// * `plumtree_tx` - Sender for forwarding received Plumtree messages
-    /// * `outgoing_rx` - Receiver for outgoing Plumtree messages to broadcast
-    /// * `peers` - Shared peer state for synchronizing membership changes
-    /// * `eager_fanout` - Target number of eager peers
-    /// * `max_peers` - Maximum total peers allowed (None = unlimited)
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// // Create PlumtreeMemberlist first
-    /// let pm = PlumtreeMemberlist::new(node_id, config, delegate);
-    ///
-    /// // Wrap your memberlist delegate with PlumtreeNodeDelegate
-    /// let wrapped_delegate = pm.wrap_delegate(your_memberlist_delegate);
-    ///
-    /// // Use wrapped_delegate when creating memberlist
-    /// let memberlist = Memberlist::new(wrapped_delegate, memberlist_config).await?;
-    /// ```
-    pub fn new(
-        inner: D,
-        plumtree_tx: async_channel::Sender<(I, PlumtreeMessage)>,
-        outgoing_rx: async_channel::Receiver<BroadcastEnvelope<I>>,
-        peers: Arc<PeerState<I>>,
-        eager_fanout: usize,
-        max_peers: Option<usize>,
-    ) -> Self {
-        Self {
-            inner,
-            plumtree_tx,
-            outgoing_rx,
-            peers,
-            eager_fanout,
-            max_peers,
-            on_promotion: None,
-            on_demotion: None,
-            _marker: PhantomData,
-        }
-    }
-
-    /// Set the callback for peer promotion events during rebalancing.
-    ///
-    /// This callback is invoked when a lazy peer is promoted to eager
-    /// during rebalancing (e.g., when an eager peer leaves the cluster).
-    pub fn with_promotion_callback(mut self, callback: PromotionCallback<I>) -> Self {
-        self.on_promotion = Some(callback);
-        self
-    }
-
-    /// Set the callback for peer demotion events during rebalancing.
-    ///
-    /// This callback is invoked when an eager peer is demoted to lazy
-    /// during rebalancing (e.g., when too many eager peers exist).
-    pub fn with_demotion_callback(mut self, callback: DemotionCallback<I>) -> Self {
-        self.on_demotion = Some(callback);
-        self
-    }
-
-    /// Get a reference to the inner delegate.
-    pub fn inner(&self) -> &D {
-        &self.inner
-    }
-
-    /// Get a clone of the plumtree message sender.
-    ///
-    /// This can be used to forward Plumtree messages from external sources.
-    pub fn plumtree_sender(&self) -> async_channel::Sender<(I, PlumtreeMessage)> {
-        self.plumtree_tx.clone()
-    }
-
-    /// Get a clone of the outgoing envelope receiver.
-    ///
-    /// This can be used to receive outgoing Plumtree messages from external sources.
-    /// Messages are unencooded - call `.encode()` on the envelope to get bytes.
-    #[allow(dead_code)]
-    pub(crate) fn outgoing_receiver(&self) -> async_channel::Receiver<BroadcastEnvelope<I>> {
-        self.outgoing_rx.clone()
-    }
-}
-
-impl<I, A, D> NodeDelegate for PlumtreeNodeDelegate<I, A, D>
-where
-    I: Id + IdCodec + Clone + Send + Sync + 'static,
-    A: CheapClone + Send + Sync + 'static,
-    D: NodeDelegate,
-{
-    async fn node_meta(&self, limit: usize) -> Meta {
-        self.inner.node_meta(limit).await
-    }
-
-    async fn notify_message(&self, msg: Cow<'_, [u8]>) {
-        // Check if this is a Plumtree message
-        if msg.len() > 1 && msg[0] == PLUMTREE_MAGIC {
-            // Decode Plumtree envelope (sender_id + message)
-            if let Some((sender, plumtree_msg)) = decode_plumtree_envelope::<I>(&msg) {
-                tracing::trace!(
-                    "received plumtree {:?} from {:?}",
-                    plumtree_msg.tag(),
-                    sender
-                );
-                // Forward to Plumtree for proper handling with sender identity
-                if self.plumtree_tx.send((sender, plumtree_msg)).await.is_err() {
-                    tracing::warn!("plumtree channel closed, cannot forward message");
-                }
-            } else {
-                tracing::warn!("failed to decode plumtree envelope");
-            }
-        } else {
-            // Forward non-Plumtree messages to inner delegate
-            self.inner.notify_message(msg).await;
-        }
-    }
-
-    async fn broadcast_messages<F>(
-        &self,
-        limit: usize,
-        encoded_len: F,
-    ) -> impl Iterator<Item = Bytes> + Send
-    where
-        F: Fn(Bytes) -> (usize, Bytes) + Send + Sync + 'static,
-    {
-        // Use proportional limiting to prevent Plumtree from starving user messages.
-        // Reserve at least 30% of bandwidth for user messages to ensure they always
-        // have a chance to be sent, even under heavy Plumtree control traffic.
-        const PLUMTREE_MAX_RATIO: usize = 70;
-        let plumtree_limit = (limit * PLUMTREE_MAX_RATIO) / 100;
-        let user_reserved = limit - plumtree_limit;
-
-        // Collect Plumtree outgoing messages up to proportional limit
-        // Serialization is deferred to here - encode just before network transmission
-        let mut plumtree_msgs = Vec::new();
-        let mut plumtree_used = 0;
-
-        while let Ok(envelope) = self.outgoing_rx.try_recv() {
-            // Encode at the last moment before network transmission
-            let encoded = envelope.encode();
-            let (len, msg) = encoded_len(encoded);
-            if plumtree_used + len <= plumtree_limit {
-                plumtree_used += len;
-                plumtree_msgs.push(msg);
-            } else {
-                // Plumtree hit its proportional limit, stop collecting
-                break;
-            }
-        }
-
-        // User gets reserved space plus any unused Plumtree quota
-        let user_limit = user_reserved + (plumtree_limit - plumtree_used);
-        let user_msgs = self.inner.broadcast_messages(user_limit, encoded_len).await;
-
-        // Combine both iterators
-        plumtree_msgs.into_iter().chain(user_msgs)
-    }
-
-    async fn local_state(&self, join: bool) -> Bytes {
-        self.inner.local_state(join).await
-    }
-
-    async fn merge_remote_state(&self, buf: &[u8], join: bool) {
-        self.inner.merge_remote_state(buf, join).await
-    }
-}
-
-impl<I, A, D> PingDelegate for PlumtreeNodeDelegate<I, A, D>
-where
-    I: Id + IdCodec + Clone + Send + Sync + 'static,
-    A: CheapClone + Send + Sync + 'static,
-    D: PingDelegate<Id = I, Address = A>,
-{
-    type Id = I;
-    type Address = A;
-
-    async fn ack_payload(&self) -> Bytes {
-        self.inner.ack_payload().await
-    }
-
-    async fn notify_ping_complete(
-        &self,
-        node: Arc<NodeState<Self::Id, Self::Address>>,
-        rtt: std::time::Duration,
-        payload: Bytes,
-    ) {
-        self.inner.notify_ping_complete(node, rtt, payload).await
-    }
-
-    fn disable_reliable_pings(&self, target: &Self::Id) -> bool {
-        self.inner.disable_reliable_pings(target)
-    }
-}
-
-impl<I, A, D> EventDelegate for PlumtreeNodeDelegate<I, A, D>
-where
-    I: Id + IdCodec + Clone + Ord + Send + Sync + 'static,
-    A: CheapClone + Send + Sync + 'static,
-    D: EventDelegate<Id = I, Address = A>,
-{
-    type Id = I;
-    type Address = A;
-
-    async fn notify_join(&self, node: Arc<NodeState<Self::Id, Self::Address>>) {
-        // Sync: Add to Plumtree peers with hash ring-based auto-classification
-        // This ensures new peers are placed correctly in the topology
-        self.peers
-            .add_peer_auto(node.id().clone(), self.max_peers, self.eager_fanout);
-
-        self.inner.notify_join(node).await;
-    }
-
-    async fn notify_leave(&self, node: Arc<NodeState<Self::Id, Self::Address>>) {
-        // Sync: Remove from Plumtree peers immediately to stop sending to dead node
-        let result = self.peers.remove_peer(node.id());
-
-        // If an eager peer was removed, rebalance to promote a lazy peer
-        // This maintains tree connectivity when eager peers leave
-        if result.was_eager() {
-            let rebalance_result = self.peers.rebalance(self.eager_fanout);
-
-            // Trigger callbacks for any peers that were promoted or demoted
-            if let Some(ref on_promotion) = self.on_promotion {
-                for peer in &rebalance_result.promoted {
-                    on_promotion(peer);
-                }
-            }
-            if let Some(ref on_demotion) = self.on_demotion {
-                for peer in &rebalance_result.demoted {
-                    on_demotion(peer);
-                }
-            }
-        }
-
-        self.inner.notify_leave(node).await;
-    }
-
-    async fn notify_update(&self, node: Arc<NodeState<Self::Id, Self::Address>>) {
-        self.inner.notify_update(node).await;
-    }
-}
-
-impl<I, A, D> ConflictDelegate for PlumtreeNodeDelegate<I, A, D>
-where
-    I: Id + IdCodec + Clone + Send + Sync + 'static,
-    A: CheapClone + Send + Sync + 'static,
-    D: ConflictDelegate<Id = I, Address = A>,
-{
-    type Id = I;
-    type Address = A;
-
-    async fn notify_conflict(
-        &self,
-        existing: Arc<NodeState<Self::Id, Self::Address>>,
-        other: Arc<NodeState<Self::Id, Self::Address>>,
-    ) {
-        self.inner.notify_conflict(existing, other).await;
-    }
-}
-
-impl<I, A, D> AliveDelegate for PlumtreeNodeDelegate<I, A, D>
-where
-    I: Id + IdCodec + Clone + Send + Sync + 'static,
-    A: CheapClone + Send + Sync + 'static,
-    D: AliveDelegate<Id = I, Address = A>,
-{
-    type Error = D::Error;
-    type Id = I;
-    type Address = A;
-
-    async fn notify_alive(
-        &self,
-        peer: Arc<NodeState<Self::Id, Self::Address>>,
-    ) -> std::result::Result<(), Self::Error> {
-        self.inner.notify_alive(peer).await
-    }
-}
-
-impl<I, A, D> MergeDelegate for PlumtreeNodeDelegate<I, A, D>
-where
-    I: Id + IdCodec + Clone + Send + Sync + 'static,
-    A: CheapClone + Send + Sync + 'static,
-    D: MergeDelegate<Id = I, Address = A>,
-{
-    type Error = D::Error;
-    type Id = I;
-    type Address = A;
-
-    async fn notify_merge(
-        &self,
-        peers: Arc<[NodeState<Self::Id, Self::Address>]>,
-    ) -> std::result::Result<(), Self::Error> {
-        self.inner.notify_merge(peers).await
-    }
-}
-
-impl<I, A, D> Delegate for PlumtreeNodeDelegate<I, A, D>
-where
-    I: Id + IdCodec + Clone + Send + Sync + 'static,
-    A: CheapClone + Send + Sync + 'static,
-    D: Delegate<Id = I, Address = A>,
-{
-    type Id = I;
-    type Address = A;
-}
-
 /// Event handler that synchronizes memberlist events to Plumtree.
 ///
-/// Wraps a user's PlumtreeDelegate to forward events.
-pub struct PlumtreeEventHandler<I, PD> {
+/// Wraps a user's PlumtreeDelegate to forward events and handles
+/// message storage for sync/persistence.
+///
+/// # Type Parameters
+///
+/// - `I`: Node identifier type
+/// - `PD`: Plumtree delegate for message delivery callbacks
+/// - `S`: Storage backend implementing [`MessageStore`]
+pub struct PlumtreeEventHandler<I, PD, S: MessageStore = DefaultStore> {
     /// Inner Plumtree delegate for application events.
     inner: PD,
+    /// Message storage for sync/persistence.
+    store: Arc<S>,
+    /// Sync handler for anti-entropy.
+    sync_handler: Arc<SyncHandler<S>>,
     /// Marker for I type parameter.
     _marker: std::marker::PhantomData<I>,
 }
 
-impl<I, PD> PlumtreeEventHandler<I, PD> {
-    /// Create a new event handler.
-    pub fn new(inner: PD) -> Self {
+impl<I, PD, S: MessageStore> PlumtreeEventHandler<I, PD, S> {
+    /// Create a new event handler with storage integration.
+    pub fn new(inner: PD, store: Arc<S>, sync_handler: Arc<SyncHandler<S>>) -> Self {
         Self {
             inner,
+            store,
+            sync_handler,
             _marker: std::marker::PhantomData,
         }
     }
 }
 
-impl<I, PD> PlumtreeDelegate<I> for PlumtreeEventHandler<I, PD>
+impl<I, PD, S> PlumtreeDelegate<I> for PlumtreeEventHandler<I, PD, S>
 where
     I: Clone + Eq + Hash + Send + Sync + 'static,
     PD: PlumtreeDelegate<I>,
+    S: MessageStore + 'static,
 {
     fn on_deliver(&self, message_id: MessageId, payload: Bytes) {
+        // Record in sync state for hash comparison (O(1), synchronous)
+        self.sync_handler.record_message(message_id, &payload);
+
+        // Store message for sync/persistence
+        // Since on_deliver is synchronous but storage may be async, we spawn a task
+        let msg = StoredMessage::new(message_id, 0, payload.clone());
+        let store = self.store.clone();
+
+        // Fire-and-forget storage write - spawn a background task
+        // This is safe because the sync state is already updated (for hash comparison)
+        // and the message is already in the Plumtree cache (for Graft requests)
+        std::thread::spawn(move || {
+            futures::executor::block_on(async {
+                if let Err(e) = store.insert(&msg).await {
+                    tracing::warn!("failed to store message: {}", e);
+                }
+            });
+        });
+
+        // Forward to user delegate
         self.inner.on_deliver(message_id, payload);
     }
 
@@ -1295,8 +1337,8 @@ mod tests {
 
     #[test]
     fn test_plumtree_memberlist_creation() {
-        let pm: PlumtreeMemberlist<u64, NoopDelegate> =
-            PlumtreeMemberlist::new(1u64, PlumtreeConfig::default(), NoopDelegate);
+        let pm: PlumtreeDiscovery<u64, NoopDelegate> =
+            PlumtreeDiscovery::new(1u64, PlumtreeConfig::default(), NoopDelegate);
 
         assert_eq!(*pm.plumtree().local_id(), 1u64);
         assert!(!pm.is_shutdown());
@@ -1304,8 +1346,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_plumtree_memberlist_broadcast() {
-        let pm: PlumtreeMemberlist<u64, NoopDelegate> =
-            PlumtreeMemberlist::new(1u64, PlumtreeConfig::default(), NoopDelegate);
+        let pm: PlumtreeDiscovery<u64, NoopDelegate> =
+            PlumtreeDiscovery::new(1u64, PlumtreeConfig::default(), NoopDelegate);
 
         // Add a peer
         pm.add_peer(2u64);
@@ -1321,8 +1363,8 @@ mod tests {
 
     #[test]
     fn test_plumtree_memberlist_peer_management() {
-        let pm: PlumtreeMemberlist<u64, NoopDelegate> =
-            PlumtreeMemberlist::new(1u64, PlumtreeConfig::default(), NoopDelegate);
+        let pm: PlumtreeDiscovery<u64, NoopDelegate> =
+            PlumtreeDiscovery::new(1u64, PlumtreeConfig::default(), NoopDelegate);
 
         assert_eq!(pm.peer_stats().total(), 0);
 

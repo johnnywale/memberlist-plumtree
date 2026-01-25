@@ -489,6 +489,346 @@ where
     }
 }
 
+// ============================================================================
+// Incoming Message Handling (Bidirectional Support)
+// ============================================================================
+
+/// Configuration for incoming message handling.
+#[derive(Debug, Clone)]
+pub struct IncomingConfig {
+    /// Maximum message size to accept (default: 64KB).
+    pub max_message_size: usize,
+    /// Channel buffer size for incoming messages (default: 1024).
+    pub channel_buffer: usize,
+    /// Maximum concurrent connections to accept (default: 1000).
+    pub max_concurrent_connections: usize,
+    /// Maximum concurrent streams per connection (default: 100).
+    pub max_streams_per_connection: usize,
+}
+
+impl Default for IncomingConfig {
+    fn default() -> Self {
+        Self {
+            max_message_size: 64 * 1024, // 64KB
+            channel_buffer: 1024,
+            max_concurrent_connections: 1000,
+            max_streams_per_connection: 100,
+        }
+    }
+}
+
+/// Handle for the incoming message acceptor.
+///
+/// When dropped, the acceptor task will be signaled to stop.
+pub struct IncomingHandle {
+    running: Arc<std::sync::atomic::AtomicBool>,
+    stats: Arc<IncomingStatsInner>,
+    _handle: tokio::task::JoinHandle<()>,
+}
+
+impl IncomingHandle {
+    /// Check if the acceptor is still running.
+    pub fn is_running(&self) -> bool {
+        self.running.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Stop the acceptor.
+    pub fn stop(&self) {
+        self.running
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Get current statistics for incoming connections.
+    pub fn stats(&self) -> IncomingStats {
+        self.stats.snapshot()
+    }
+}
+
+impl Drop for IncomingHandle {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Statistics for incoming connections.
+#[derive(Debug, Clone, Default)]
+pub struct IncomingStats {
+    /// Total connections accepted.
+    pub connections_accepted: u64,
+    /// Total messages received.
+    pub messages_received: u64,
+    /// Total bytes received.
+    pub bytes_received: u64,
+    /// Messages that failed to decode.
+    pub decode_errors: u64,
+    /// Active connections.
+    pub active_connections: usize,
+}
+
+/// Internal stats tracking for incoming.
+#[derive(Debug, Default)]
+struct IncomingStatsInner {
+    connections_accepted: AtomicU64,
+    messages_received: AtomicU64,
+    bytes_received: AtomicU64,
+    decode_errors: AtomicU64,
+    active_connections: AtomicU64,
+}
+
+impl IncomingStatsInner {
+    fn snapshot(&self) -> IncomingStats {
+        IncomingStats {
+            connections_accepted: self.connections_accepted.load(Ordering::Relaxed),
+            messages_received: self.messages_received.load(Ordering::Relaxed),
+            bytes_received: self.bytes_received.load(Ordering::Relaxed),
+            decode_errors: self.decode_errors.load(Ordering::Relaxed),
+            active_connections: self.active_connections.load(Ordering::Relaxed) as usize,
+        }
+    }
+}
+
+impl<I, R> QuicTransport<I, R>
+where
+    I: Clone + Eq + Hash + Debug + Send + Sync + 'static,
+    R: PeerResolver<I>,
+{
+    /// Start the incoming message acceptor.
+    ///
+    /// This enables bidirectional communication by accepting incoming QUIC
+    /// connections and routing received messages to the returned channel.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Configuration for incoming message handling
+    ///
+    /// # Returns
+    ///
+    /// A tuple of:
+    /// - `Receiver<(I, PlumtreeMessage)>` - Channel for incoming messages
+    /// - `IncomingHandle` - Handle to control the acceptor lifecycle
+    /// - `Arc<IncomingStatsInner>` - Shared stats (internal)
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use memberlist_plumtree::transport::quic::{QuicTransport, IncomingConfig};
+    ///
+    /// let transport = QuicTransport::new(addr, config, resolver).await?;
+    /// let (rx, handle) = transport.start_incoming::<u64>(IncomingConfig::default());
+    ///
+    /// // Process incoming messages
+    /// while let Ok((sender, msg)) = rx.recv().await {
+    ///     println!("Received from {:?}: {:?}", sender, msg);
+    /// }
+    ///
+    /// // Stop the acceptor
+    /// handle.stop();
+    /// ```
+    pub fn start_incoming<NodeId>(
+        &self,
+        config: IncomingConfig,
+    ) -> (
+        async_channel::Receiver<(NodeId, crate::PlumtreeMessage)>,
+        IncomingHandle,
+    )
+    where
+        NodeId: crate::IdCodec + Clone + Send + Sync + 'static,
+    {
+        let (tx, rx) = async_channel::bounded(config.channel_buffer);
+        let endpoint = self.endpoint.clone();
+        let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let running_clone = running.clone();
+        let stats = Arc::new(IncomingStatsInner::default());
+        let stats_clone = stats.clone();
+
+        let handle = tokio::spawn(async move {
+            Self::run_acceptor::<NodeId>(endpoint, tx, config, running_clone, stats_clone).await;
+        });
+
+        (
+            rx,
+            IncomingHandle {
+                running,
+                stats,
+                _handle: handle,
+            },
+        )
+    }
+
+    /// Internal: Run the connection acceptor loop.
+    async fn run_acceptor<NodeId>(
+        endpoint: Endpoint,
+        tx: async_channel::Sender<(NodeId, crate::PlumtreeMessage)>,
+        config: IncomingConfig,
+        running: Arc<std::sync::atomic::AtomicBool>,
+        stats: Arc<IncomingStatsInner>,
+    ) where
+        NodeId: crate::IdCodec + Clone + Send + Sync + 'static,
+    {
+        tracing::info!("QUIC incoming acceptor started");
+
+        // Semaphore to limit concurrent connections
+        let connection_semaphore = Arc::new(tokio::sync::Semaphore::new(
+            config.max_concurrent_connections,
+        ));
+
+        while running.load(std::sync::atomic::Ordering::Acquire) {
+            // Use select to check for shutdown while waiting for connections
+            tokio::select! {
+                incoming = endpoint.accept() => {
+                    match incoming {
+                        Some(incoming_conn) => {
+                            // Try to acquire permit
+                            let permit = match connection_semaphore.clone().try_acquire_owned() {
+                                Ok(permit) => permit,
+                                Err(_) => {
+                                    tracing::warn!("max concurrent connections reached, rejecting");
+                                    continue;
+                                }
+                            };
+
+                            stats.connections_accepted.fetch_add(1, Ordering::Relaxed);
+                            stats.active_connections.fetch_add(1, Ordering::Relaxed);
+
+                            let tx = tx.clone();
+                            let config = config.clone();
+                            let running = running.clone();
+                            let stats = stats.clone();
+
+                            tokio::spawn(async move {
+                                match incoming_conn.await {
+                                    Ok(conn) => {
+                                        Self::handle_connection::<NodeId>(
+                                            conn, tx, &config, &running, &stats,
+                                        )
+                                        .await;
+                                    }
+                                    Err(e) => {
+                                        tracing::debug!("incoming connection failed: {}", e);
+                                    }
+                                }
+                                stats.active_connections.fetch_sub(1, Ordering::Relaxed);
+                                drop(permit); // Release semaphore permit
+                            });
+                        }
+                        None => {
+                            // Endpoint closed
+                            tracing::info!("QUIC endpoint closed");
+                            break;
+                        }
+                    }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                    // Periodic check for shutdown
+                    if !running.load(std::sync::atomic::Ordering::Acquire) {
+                        break;
+                    }
+                }
+            }
+        }
+
+        tracing::info!("QUIC incoming acceptor stopped");
+    }
+
+    /// Internal: Handle a single connection.
+    async fn handle_connection<NodeId>(
+        conn: quinn::Connection,
+        tx: async_channel::Sender<(NodeId, crate::PlumtreeMessage)>,
+        config: &IncomingConfig,
+        running: &Arc<std::sync::atomic::AtomicBool>,
+        stats: &Arc<IncomingStatsInner>,
+    ) where
+        NodeId: crate::IdCodec + Clone + Send + Sync + 'static,
+    {
+        let remote_addr = conn.remote_address();
+        tracing::debug!(?remote_addr, "accepted connection");
+
+        // Semaphore to limit streams per connection
+        let stream_semaphore = Arc::new(tokio::sync::Semaphore::new(
+            config.max_streams_per_connection,
+        ));
+
+        loop {
+            if !running.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+
+            match conn.accept_uni().await {
+                Ok(stream) => {
+                    // Try to acquire stream permit
+                    let permit = match stream_semaphore.clone().try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            tracing::warn!("max streams per connection reached");
+                            continue;
+                        }
+                    };
+
+                    let tx = tx.clone();
+                    let max_size = config.max_message_size;
+                    let stats = stats.clone();
+
+                    tokio::spawn(async move {
+                        Self::handle_stream::<NodeId>(stream, tx, max_size, &stats).await;
+                        drop(permit);
+                    });
+                }
+                Err(quinn::ConnectionError::ApplicationClosed(reason)) => {
+                    tracing::debug!(?remote_addr, ?reason, "connection closed by peer");
+                    break;
+                }
+                Err(quinn::ConnectionError::LocallyClosed) => {
+                    tracing::debug!(?remote_addr, "connection closed locally");
+                    break;
+                }
+                Err(e) => {
+                    tracing::debug!(?remote_addr, "connection error: {}", e);
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Internal: Handle a single stream (one message).
+    async fn handle_stream<NodeId>(
+        mut stream: quinn::RecvStream,
+        tx: async_channel::Sender<(NodeId, crate::PlumtreeMessage)>,
+        max_size: usize,
+        stats: &Arc<IncomingStatsInner>,
+    ) where
+        NodeId: crate::IdCodec + Clone + Send + Sync + 'static,
+    {
+        match stream.read_to_end(max_size).await {
+            Ok(data) => {
+                stats
+                    .bytes_received
+                    .fetch_add(data.len() as u64, Ordering::Relaxed);
+
+                // Decode the Plumtree envelope
+                match crate::decode_plumtree_envelope::<NodeId>(&data) {
+                    Some((sender, msg)) => {
+                        stats.messages_received.fetch_add(1, Ordering::Relaxed);
+
+                        if tx.send((sender, msg)).await.is_err() {
+                            tracing::debug!("incoming channel closed");
+                        }
+                    }
+                    None => {
+                        stats.decode_errors.fetch_add(1, Ordering::Relaxed);
+                        tracing::debug!("failed to decode plumtree envelope");
+                    }
+                }
+            }
+            Err(quinn::ReadToEndError::TooLong) => {
+                tracing::warn!("message too large, dropping");
+            }
+            Err(e) => {
+                tracing::debug!("failed to read stream: {}", e);
+            }
+        }
+    }
+}
+
 impl<I, R> Clone for QuicTransport<I, R>
 where
     I: Clone + Eq + Hash + Debug + Send + Sync + 'static,

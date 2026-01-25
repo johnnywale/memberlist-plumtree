@@ -60,6 +60,10 @@ mod pooled_transport;
 mod rate_limiter;
 mod runner;
 mod scheduler;
+mod stack;
+pub mod discovery;
+pub mod storage;
+pub mod sync;
 pub mod testing;
 mod transport;
 
@@ -79,7 +83,7 @@ pub use cleanup_tuner::{
 };
 
 // Re-export config types
-pub use config::PlumtreeConfig;
+pub use config::{PlumtreeConfig, StorageConfig, SyncConfig};
 
 // Re-export error types
 pub use error::{Error, ErrorKind, Result};
@@ -92,6 +96,7 @@ pub use health::{
 // Re-export message types
 pub use message::{
     CacheStats, MessageCache, MessageId, MessageTag, PlumtreeMessage, PlumtreeMessageRef,
+    SyncMessage,
 };
 
 // Re-export peer state types
@@ -120,9 +125,14 @@ pub use runner::{PlumtreeRunner, PlumtreeRunnerBuilder};
 pub use integration::{
     decode_plumtree_envelope, decode_plumtree_message, encode_plumtree_envelope,
     encode_plumtree_envelope_into, encode_plumtree_message, envelope_encoded_len,
-    is_plumtree_message, BroadcastEnvelope, DemotionCallback, IdCodec, PlumtreeEventHandler,
-    PlumtreeMemberlist, PlumtreeNodeDelegate, PromotionCallback,
+    is_plumtree_message, BroadcastEnvelope, IdCodec, PlumtreeEventHandler,
+    PlumtreeDiscovery,
 };
+
+// Re-export memberlist-specific integration types (requires memberlist feature)
+#[cfg(feature = "memberlist")]
+#[cfg_attr(docsrs, doc(cfg(feature = "memberlist")))]
+pub use discovery::{DemotionCallback, PlumtreeNodeDelegate, PromotionCallback};
 
 // Re-export scheduler types
 pub use scheduler::{ExpiredGraft, GraftTimer, IHaveQueue, IHaveScheduler, PendingIHave};
@@ -137,27 +147,43 @@ pub use transport::{ChannelTransport, ChannelTransportError, NoopTransport, Tran
 #[cfg(feature = "quic")]
 #[cfg_attr(docsrs, doc(cfg(feature = "quic")))]
 pub use transport::quic::{
-    CongestionConfig, CongestionController, ConnectionConfig, ConnectionStats, MapPeerResolver,
-    MessagePriorities, MigrationConfig, PeerResolver, PlumtreeQuicConfig, QuicConfig, QuicError,
-    QuicStats, QuicTransport, StreamConfig, TlsConfig, ZeroRttConfig,
+    CongestionConfig, CongestionController, ConnectionConfig, ConnectionStats, IncomingConfig,
+    IncomingHandle, IncomingStats, MapPeerResolver, MessagePriorities, MigrationConfig,
+    PeerResolver, PlumtreeQuicConfig, QuicConfig, QuicError, QuicStats, QuicTransport,
+    StreamConfig, TlsConfig, ZeroRttConfig,
 };
 
 // Re-export pooled transport types
 pub use pooled_transport::{PoolConfig, PoolStats, PooledTransport, PooledTransportError};
 
+// Re-export standalone stack config
+pub use stack::PlumtreeStackConfig;
+
 // Re-export scheduler failure types
 pub use scheduler::FailedGraft;
 
-// Re-export bridge types for Plumtree-Memberlist integration
-pub use bridge::{
-    AddressExtractor, BridgeConfig, BridgeEventDelegate, LazarusHandle, LazarusStats,
-    MemberlistStack, MemberlistStackError, PlumtreeBridge, PlumtreeStackBuilder,
-};
+// Re-export bridge types (memberlist-independent)
+pub use bridge::{BridgeConfig, LazarusHandle, LazarusStats, PlumtreeBridge};
 
 // Re-export persistence module for peer state recovery
 pub use bridge::persistence;
 
-/// Re-export memberlist-core types for convenience
+// Re-export memberlist-specific bridge types (requires memberlist feature)
+#[cfg(feature = "memberlist")]
+#[cfg_attr(docsrs, doc(cfg(feature = "memberlist")))]
+pub use bridge::AddressExtractor;
+
+// Re-export memberlist integration types from discovery module (requires memberlist feature)
+#[cfg(feature = "memberlist")]
+#[cfg_attr(docsrs, doc(cfg(feature = "memberlist")))]
+pub use discovery::{
+    BridgeEventDelegate, MemberlistDiscovery, MemberlistDiscoveryConfig,
+    MemberlistDiscoveryHandle, MemberlistStack, MemberlistStackError, PlumtreeStackBuilder,
+};
+
+/// Re-export memberlist-core types for convenience (requires memberlist feature)
+#[cfg(feature = "memberlist")]
+#[cfg_attr(docsrs, doc(cfg(feature = "memberlist")))]
 pub mod memberlist {
     pub use memberlist_core::*;
 }

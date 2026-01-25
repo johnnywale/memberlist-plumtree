@@ -551,21 +551,21 @@ where
 
         // Create peer state with or without hash ring topology
         // Always set local_id for diverse peer selection even without hash ring
-        let peers = if config.use_hash_ring {
-            Arc::new(
-                PeerStateBuilder::new()
-                    .use_hash_ring(true)
-                    .with_local_id(local_id.clone())
-                    .build(),
-            )
-        } else {
-            Arc::new(
-                PeerStateBuilder::new()
-                    .use_hash_ring(false)
-                    .with_local_id(local_id.clone())
-                    .build(),
-            )
-        };
+        let mut peer_builder = PeerStateBuilder::new()
+            .with_local_id(local_id.clone())
+            .use_hash_ring(config.use_hash_ring)
+            .with_protect_ring_neighbors(config.protect_ring_neighbors)
+            .with_max_protected_neighbors(config.max_protected_neighbors);
+
+        // Apply hard caps if configured
+        if let Some(max) = config.max_eager_peers {
+            peer_builder = peer_builder.with_max_eager_peers(max);
+        }
+        if let Some(max) = config.max_lazy_peers {
+            peer_builder = peer_builder.with_max_lazy_peers(max);
+        }
+
+        let peers = Arc::new(peer_builder.build());
 
         let inner = Arc::new(PlumtreeInner {
             peers,
@@ -938,6 +938,12 @@ where
                     self.handle_graft(from, message_id, round).await
                 }
                 PlumtreeMessage::Prune => self.handle_prune(from).await,
+                PlumtreeMessage::Sync(sync_msg) => {
+                    // Sync message handling is not implemented in this module.
+                    // Use the sync module for anti-entropy synchronization.
+                    trace!("received sync message: {:?}", sync_msg.type_name());
+                    Ok(())
+                }
             }
         }
         .instrument(span)
@@ -1211,10 +1217,13 @@ where
             return Ok(());
         }
 
-        // Promote requester to eager
+        // Promote requester to eager (may be rejected if at max_eager_peers limit)
         if self.inner.peers.promote_to_eager(&from) {
             debug!("promoted peer to eager after Graft request");
             self.inner.delegate.on_eager_promotion(&from);
+        } else if !self.inner.peers.is_eager(&from) {
+            // Promotion was rejected (likely due to max_eager_peers limit)
+            debug!("could not promote peer to eager (at capacity or unknown peer)");
         }
 
         // Send the requested message unicast to the requester
@@ -1661,6 +1670,66 @@ where
                 crate::metrics::set_cache_size(cache_stats.entries);
                 crate::metrics::set_ihave_queue_size(self.inner.scheduler.queue().len());
                 crate::metrics::set_pending_grafts(self.inner.graft_timer.pending_count());
+            }
+        }
+    }
+
+    /// Run anti-entropy sync background task.
+    ///
+    /// This task periodically compares message state with random peers
+    /// and requests any missing messages. This enables recovery from:
+    /// - Network partitions
+    /// - Node crashes
+    /// - Long disconnects (> cache TTL)
+    ///
+    /// This should be spawned as a background task when sync is enabled.
+    ///
+    /// # Note
+    ///
+    /// This is a no-op if sync is not configured. Check `config.sync` before
+    /// spawning this task to avoid unnecessary work.
+    #[instrument(skip(self), name = "anti_entropy_sync")]
+    pub async fn run_anti_entropy_sync(&self) {
+        let Some(ref sync_config) = self.inner.config.sync else {
+            info!("Anti-entropy sync not configured, skipping");
+            return;
+        };
+
+        if !sync_config.enabled {
+            info!("Anti-entropy sync disabled");
+            return;
+        }
+
+        info!(
+            interval_s = sync_config.sync_interval.as_secs(),
+            window_s = sync_config.sync_window.as_secs(),
+            "Anti-entropy sync started"
+        );
+
+        loop {
+            if self.inner.shutdown.load(Ordering::Acquire) {
+                info!("Anti-entropy sync shutting down");
+                break;
+            }
+
+            // Wait for sync interval
+            Delay::new(sync_config.sync_interval).await;
+
+            // Check for shutdown after waking
+            if self.inner.shutdown.load(Ordering::Acquire) {
+                break;
+            }
+
+            // Pick a random peer
+            if let Some(peer) = self.inner.peers.random_peer() {
+                debug!(?peer, "Initiating sync with peer");
+
+                // For now, we just log that sync would happen
+                // Full implementation requires storage integration
+                // which is done in the PlumtreeDiscovery layer
+                trace!("Sync protocol not fully integrated at Plumtree layer");
+            } else {
+                trace!("No peers available for sync");
             }
         }
     }

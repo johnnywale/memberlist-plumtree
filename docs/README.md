@@ -17,6 +17,10 @@ Welcome to the memberlist-plumtree documentation. This library provides a Rust i
 
 - **[Adaptive Features](adaptive-features.md)** - Dynamic IHave batch sizing and cache cleanup tuning based on runtime conditions
 
+### Reliability
+
+- **[Anti-Entropy Sync & Persistence](sync-persistence.md)** - Message recovery after partitions, crash recovery with Sled storage, and state synchronization
+
 ### Configuration
 
 - **[Configuration Guide](configuration.md)** - Complete reference for `PlumtreeConfig`, `BridgeConfig`, and tuning recommendations for different environments
@@ -37,7 +41,7 @@ Welcome to the memberlist-plumtree documentation. This library provides a Rust i
 | API | Use Case |
 |-----|----------|
 | `MemberlistStack` | Production deployment with full SWIM-based peer discovery |
-| `PlumtreeMemberlist` | Manual peer management, custom integration |
+| `PlumtreeDiscovery` | Manual peer management, custom integration |
 | `Plumtree` | Core protocol only, bring your own transport |
 
 ### Configuration Presets
@@ -57,20 +61,22 @@ PlumtreeConfig::large_cluster() // 1000+ nodes
 | `metrics` | Yes | Prometheus metrics |
 | `serde` | Yes | Serialization support |
 | `quic` | Yes | QUIC transport |
+| `sync` | No | Anti-entropy synchronization |
+| `storage-sled` | No | Sled persistent storage backend |
 
 ## Example
 
 ```rust
 use memberlist_plumtree::{
-    MemberlistStack, PlumtreeMemberlist, PlumtreeConfig,
+    MemberlistStack, PlumtreeDiscovery, PlumtreeConfig,
     PlumtreeNodeDelegate, NoopDelegate, ChannelTransport,
 };
 use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Create PlumtreeMemberlist
-    let pm = Arc::new(PlumtreeMemberlist::new(
+    // Create PlumtreeDiscovery
+    let pm = Arc::new(PlumtreeDiscovery::new(
         1u64,
         PlumtreeConfig::default(),
         MyDelegate,

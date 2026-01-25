@@ -114,7 +114,7 @@ For production use, `MemberlistStack` handles all integration automatically:
 
 ```rust
 use memberlist_plumtree::{
-    MemberlistStack, PlumtreeMemberlist, PlumtreeConfig,
+    MemberlistStack, PlumtreeDiscovery, PlumtreeConfig,
     PlumtreeNodeDelegate, NoopDelegate, ChannelTransport,
 };
 use memberlist_core::{Memberlist, Options};
@@ -126,8 +126,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let node_id = 1u64;
     let bind_addr: SocketAddr = "127.0.0.1:7946".parse()?;
 
-    // 1. Create PlumtreeMemberlist with your delegate
-    let pm = Arc::new(PlumtreeMemberlist::new(
+    // 1. Create PlumtreeDiscovery with your delegate
+    let pm = Arc::new(PlumtreeDiscovery::new(
         node_id,
         PlumtreeConfig::default(),
         MyDelegate,
@@ -173,7 +173,7 @@ For better performance, use the QUIC transport:
 ```rust
 use memberlist_plumtree::{
     QuicTransport, QuicConfig, MapPeerResolver,
-    PlumtreeMemberlist, PlumtreeConfig, NoopDelegate,
+    PlumtreeDiscovery, PlumtreeConfig, NoopDelegate,
 };
 use std::sync::Arc;
 
@@ -192,8 +192,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = QuicConfig::insecure_dev();
     let transport = QuicTransport::new(local_addr, config, resolver.clone()).await?;
 
-    // Create PlumtreeMemberlist
-    let pm = Arc::new(PlumtreeMemberlist::new(
+    // Create PlumtreeDiscovery
+    let pm = Arc::new(PlumtreeDiscovery::new(
         1u64,
         PlumtreeConfig::default(),
         MyDelegate,

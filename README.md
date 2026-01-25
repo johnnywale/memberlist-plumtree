@@ -194,66 +194,8 @@ This creates a naturally optimized tree where messages flow through the fastest,
 - **Dynamic Cleanup Tuning**: Lock-free rate tracking with adaptive cleanup intervals
 - **Lazarus Seed Recovery**: Automatic reconnection to restarted seed nodes
 - **Peer Persistence**: Save known peers to disk for crash recovery
-
-## How Plumtree Works
-
-### Key Concept: Each Node Has Its Own View
-
-Every node maintains its own classification of peers as "eager" or "lazy". There is no global tree - the spanning tree **emerges** from each node's local decisions.
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Node A's Local View                          │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│                         [Node A]                                │
-│                        /    |    \                              │
-│                       /     |     \                             │
-│                  eager   eager   lazy                           │
-│                     /       |       \                           │
-│                 [B]       [C]       [D]                         │
-│                                                                 │
-│  A sends GOSSIP (full message) to B and C                       │
-│  A sends IHAVE (just message ID) to D                           │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────┐
-│                    Node B's Local View                          │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│                         [Node B]                                │
-│                        /    |    \                              │
-│                       /     |     \                             │
-│                  eager   lazy    eager                          │
-│                     /       |       \                           │
-│                 [A]       [C]       [E]                         │
-│                                                                 │
-│  B has its OWN classification - different from A's view!        │
-│  B sends GOSSIP to A and E, IHAVE to C                          │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### Message Propagation Example
-
-When Node A broadcasts a message, here's how it flows:
-
-```
-Step 1: A originates message
-        A ──GOSSIP──> B (A's eager peer)
-        A ──GOSSIP──> C (A's eager peer)
-        A ──IHAVE───> D (A's lazy peer)
-
-Step 2: B receives, forwards to its eager peers
-        B ──GOSSIP──> E (B's eager peer)
-        B ──IHAVE───> C (B's lazy peer, but C already has it)
-
-Step 3: Tree optimization
-        C received from both A and B (redundant!)
-        C sends PRUNE to B → B demotes C to lazy
-        Result: More efficient tree for next message
-```
+- **Anti-Entropy Sync**: Automatic message recovery after network partitions or long disconnections
+- **Message Persistence**: Optional Sled-based storage for crash recovery
 
 ### Lazy Peer Behavior: Wait, Don't Pull Immediately
 
@@ -312,13 +254,6 @@ The IHAVE/GRAFT mechanism is a **backup path**, not the primary delivery. This i
 | **GRAFT** | When missing message | "Send me message X, add me as eager" |
 | **PRUNE** | On duplicate receipt | "I got this already, demote me to lazy" |
 
-### Why This Works
-
-1. **Eager Push**: Full messages flow through spanning tree edges (eager peers)
-2. **Lazy Push**: IHave announcements provide redundant paths for reliability
-3. **Graft**: Lazy peers can request messages they missed → repairs tree
-4. **Prune**: Redundant paths are removed → tree converges to efficient structure
-
 ## Installation
 
 Add to your `Cargo.toml`:
@@ -336,6 +271,8 @@ memberlist-plumtree = "0.1"
 | `metrics` | Yes | Prometheus-compatible metrics via the `metrics` crate |
 | `serde` | Yes | Serialization/deserialization for config |
 | `quic` | Yes | Native QUIC transport via quinn/rustls |
+| `sync` | No | Anti-entropy synchronization for message recovery |
+| `storage-sled` | No | Sled persistent storage backend |
 
 To disable default features:
 
@@ -348,7 +285,7 @@ memberlist-plumtree = { version = "0.1", default-features = false, features = ["
 
 ```rust
 use memberlist_plumtree::{
-    MemberlistStack, PlumtreeMemberlist, PlumtreeConfig,
+    MemberlistStack, PlumtreeDiscovery, PlumtreeConfig,
     PlumtreeNodeDelegate, PlumtreeDelegate, MessageId,
     NoopDelegate, ChannelTransport,
 };
@@ -366,8 +303,8 @@ impl PlumtreeDelegate<u64> for MyDelegate {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Create PlumtreeMemberlist with your delegate
-    let pm = Arc::new(PlumtreeMemberlist::new(
+    // 1. Create PlumtreeDiscovery with your delegate
+    let pm = Arc::new(PlumtreeDiscovery::new(
         1u64,
         PlumtreeConfig::lan(),
         MyDelegate,
@@ -451,8 +388,8 @@ let config = PlumtreeConfig::large_cluster();
 use std::time::Duration;
 
 let config = PlumtreeConfig::default()
-    .with_eager_fanout(4)           // Number of eager peers
-    .with_lazy_fanout(8)            // Number of lazy peers for IHave
+    .with_eager_fanout(4)           // Target eager peers (also forwarding limit)
+    .with_lazy_fanout(8)            // Lazy peers to send IHave announcements to
     .with_ihave_interval(Duration::from_millis(100))
     .with_graft_timeout(Duration::from_millis(500))
     .with_message_cache_ttl(Duration::from_secs(60))
@@ -461,15 +398,21 @@ let config = PlumtreeConfig::default()
     .with_max_message_size(64 * 1024)
     .with_graft_rate_limit_per_second(10.0)
     .with_graft_rate_limit_burst(20)
-    .with_graft_max_retries(5);
+    .with_graft_max_retries(5)
+    // Peer limit and ring protection settings
+    .with_hash_ring(true)           // Enable hash ring topology
+    .with_protect_ring_neighbors(true)
+    .with_max_protected_neighbors(4) // Protect i±1 and i±2
+    .with_max_eager_peers(6)        // Hard cap on eager peers
+    .with_max_lazy_peers(20);       // Hard cap on lazy peers
 ```
 
 ### Configuration Parameters
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `eager_fanout` | 3 | Number of peers receiving full messages immediately |
-| `lazy_fanout` | 6 | Number of peers receiving IHave announcements |
+| `eager_fanout` | 3 | Target number of eager peers (and forwarding limit per message) |
+| `lazy_fanout` | 6 | Number of lazy peers to send IHave announcements to per message |
 | `ihave_interval` | 100ms | Interval for batched IHave announcements |
 | `message_cache_ttl` | 60s | How long to cache messages for Graft requests |
 | `message_cache_max_size` | 10000 | Maximum number of cached messages |
@@ -479,6 +422,41 @@ let config = PlumtreeConfig::default()
 | `graft_rate_limit_per_second` | 10.0 | Rate limit for Graft requests per peer |
 | `graft_rate_limit_burst` | 20 | Burst capacity for Graft rate limiting |
 | `graft_max_retries` | 5 | Maximum Graft retry attempts with backoff |
+| `use_hash_ring` | false | Enable hash ring topology for deterministic peer selection |
+| `protect_ring_neighbors` | true | Protect ring neighbors from demotion (requires `use_hash_ring`) |
+| `max_protected_neighbors` | 4 | Number of ring neighbors to protect: 2=i±1, 4=i±1,i±2 |
+| `max_eager_peers` | None | Hard cap on eager peers (rejects GRAFT when at limit) |
+| `max_lazy_peers` | None | Hard cap on lazy peers (rejects new peers when at limit) |
+
+### Peer Limit Configuration
+
+Control the maximum number of eager and lazy peers for bandwidth and memory constraints:
+
+```rust
+use memberlist_plumtree::PlumtreeConfig;
+
+let config = PlumtreeConfig::default()
+    // Target 3 eager peers, but allow up to 5 via GRAFT
+    .with_eager_fanout(3)
+    .with_max_eager_peers(5)
+
+    // Limit lazy peers to reduce IHAVE tracking overhead
+    .with_max_lazy_peers(20)
+
+    // Ring neighbor protection settings
+    .with_hash_ring(true)
+    .with_protect_ring_neighbors(true)
+    .with_max_protected_neighbors(2);  // Only protect i±1
+```
+
+**Preset differences:**
+
+| Preset | `protect_ring_neighbors` | `max_eager_peers` | `max_lazy_peers` |
+|--------|--------------------------|-------------------|------------------|
+| `default()` | true | None | None |
+| `lan()` | false | None | None |
+| `wan()` | true | None | None |
+| `large_cluster()` | true | 8 | 50 |
 
 ## Advanced Features
 
@@ -623,7 +601,7 @@ let config = QuicConfig::wan()
 // Create transport
 let transport = QuicTransport::new(local_addr, config, resolver).await?;
 
-// Use with PlumtreeMemberlist
+// Use with PlumtreeDiscovery
 pm.run_with_transport(transport).await;
 ```
 
@@ -656,6 +634,64 @@ println!("Lazy peers: {}", health.peer_health.lazy_count);
 println!("Cache utilization: {:.1}%", health.cache_health.utilization * 100.0);
 println!("Pending grafts: {}", health.delivery_health.pending_grafts);
 ```
+
+### Anti-Entropy Sync
+
+Automatic message recovery after network partitions, long disconnections, or node restarts. Requires the `sync` feature.
+
+```rust
+use memberlist_plumtree::{PlumtreeConfig, SyncConfig, StorageConfig};
+use std::time::Duration;
+
+let config = PlumtreeConfig::default()
+    // Enable anti-entropy sync
+    .with_sync(
+        SyncConfig::enabled()
+            .with_sync_interval(Duration::from_secs(30))  // Sync every 30s
+            .with_sync_window(Duration::from_secs(90))    // Check last 90s
+            .with_max_batch_size(100)                     // Max IDs per response
+    )
+    // Enable storage (required for sync)
+    .with_storage(
+        StorageConfig::enabled()
+            .with_max_messages(100_000)                   // Max stored messages
+            .with_retention(Duration::from_secs(300))     // 5 minute retention
+    );
+```
+
+**How it works:**
+
+1. Nodes periodically compare state using an XOR-based hash (O(1) comparison)
+2. If hashes differ, nodes exchange message IDs to identify missing messages
+3. Missing messages are requested and delivered via SyncPull/SyncPush
+
+**Use cases:**
+- Late joiner needs historical messages
+- Node recovers after network partition
+- Node restarts and needs to catch up
+
+### Persistent Storage (Sled)
+
+For crash recovery, use the Sled backend to persist messages to disk. Requires the `storage-sled` feature.
+
+```rust
+use memberlist_plumtree::{PlumtreeDiscovery, StorageConfig};
+use memberlist_plumtree::storage::SledStore;
+use std::sync::Arc;
+
+// Create Sled store
+let store = Arc::new(SledStore::open("/var/lib/myapp/messages")?);
+
+// Use with_storage constructor
+let pm = PlumtreeDiscovery::with_storage(
+    node_id,
+    config,
+    delegate,
+    store,
+);
+```
+
+See [docs/sync-persistence.md](docs/sync-persistence.md) for detailed configuration and best practices.
 
 ## Metrics
 
@@ -727,7 +763,7 @@ impl PlumtreeDelegate for MyDelegate {
 }
 ```
 
-## Plumtree vs PlumtreeMemberlist
+## Plumtree vs PlumtreeDiscovery
 
 This crate provides two main APIs:
 
@@ -745,19 +781,19 @@ let (plumtree, handle) = Plumtree::new(node_id, config, delegate);
 plumtree.handle_message(from_peer, message); // Manual message handling
 ```
 
-### `PlumtreeMemberlist` - Simplified Integration
+### `PlumtreeDiscovery` - Simplified Integration
 
-The `PlumtreeMemberlist` struct wraps `Plumtree` with a simpler API designed for integration with SWIM. Use this when:
+The `PlumtreeDiscovery` struct wraps `Plumtree` with a simpler API designed for integration with SWIM. Use this when:
 
 - You want a simpler broadcast API without manual message handling
 - You're using SWIM for cluster membership and peer discovery
 - You want automatic peer management based on SWIM membership events
 
 ```rust
-use memberlist_plumtree::{PlumtreeMemberlist, PlumtreeConfig, NoopDelegate};
+use memberlist_plumtree::{PlumtreeDiscovery, PlumtreeConfig, NoopDelegate};
 
 // High-level API - simpler to use
-let plumtree_ml = PlumtreeMemberlist::new(
+let plumtree_ml = PlumtreeDiscovery::new(
     node_id,
     PlumtreeConfig::default(),
     NoopDelegate,
@@ -774,7 +810,7 @@ let peer_stats = plumtree_ml.peer_stats();
 let cache_stats = plumtree_ml.cache_stats();
 ```
 
-**Key difference**: `PlumtreeMemberlist` is a convenience wrapper that provides:
+**Key difference**: `PlumtreeDiscovery` is a convenience wrapper that provides:
 - Simplified broadcast API (just call `broadcast()`)
 - Built-in statistics (peer counts, cache stats)
 - Easy peer management (`add_peer`, `remove_peer`)
@@ -786,15 +822,15 @@ The `MemberlistStack` struct provides the complete integration stack, combining 
 
 ```rust
 use memberlist_plumtree::{
-    MemberlistStack, PlumtreeMemberlist, PlumtreeConfig,
+    MemberlistStack, PlumtreeDiscovery, PlumtreeConfig,
     PlumtreeNodeDelegate, NoopDelegate, ChannelTransport,
 };
 use memberlist_core::{Memberlist, Options};
 use std::sync::Arc;
 use std::net::SocketAddr;
 
-// 1. Create PlumtreeMemberlist with your delegate
-let pm = Arc::new(PlumtreeMemberlist::new(
+// 1. Create PlumtreeDiscovery with your delegate
+let pm = Arc::new(PlumtreeDiscovery::new(
     node_id,
     PlumtreeConfig::default(),
     MyDelegate,
@@ -944,7 +980,7 @@ let path = PathBuf::from(format!("/var/lib/myapp/{}/peers.txt", node_id));
 | API | Use Case |
 |-----|----------|
 | `Plumtree` | Custom transport, fine-grained control |
-| `PlumtreeMemberlist` | Manual peer management, testing |
+| `PlumtreeDiscovery` | Manual peer management, testing |
 | `MemberlistStack` | **Production** - full SWIM + Plumtree integration (recommended) |
 
 ## Examples
@@ -1004,14 +1040,14 @@ cargo run --example web-chat
 
 ### Pub/Sub Example
 
-A topic-based publish/subscribe system using `PlumtreeMemberlist`:
+A topic-based publish/subscribe system using `PlumtreeDiscovery`:
 
 ```bash
 cargo run --example pubsub
 ```
 
 This demonstrates:
-- Using `PlumtreeMemberlist` for simplified broadcasting
+- Using `PlumtreeDiscovery` for simplified broadcasting
 - Topic-based message routing
 - Dynamic subscriptions (subscribe/unsubscribe at runtime)
 - Message serialization/deserialization
@@ -1044,7 +1080,7 @@ This demonstrates:
 - This is simple but means all nodes see all traffic
 
 For true per-topic routing (separate spanning tree per topic), you would need to:
-1. Create multiple `PlumtreeMemberlist` instances (one per topic), or
+1. Create multiple `PlumtreeDiscovery` instances (one per topic), or
 2. Implement topic-aware routing at the protocol level
 
 The application-layer approach is suitable for:
@@ -1073,11 +1109,17 @@ This implementation includes several optimizations for large-scale deployments (
 
 ## Roadmap
 
-### Phase 3: Protocol Extensions (Planned)
+### Completed Features
+
+- **Anti-Entropy Sync**: Automatic message recovery after partitions (Phase 3)
+- **Message Persistence**: Sled backend for crash recovery (Phase 3)
+- **QUIC Transport**: Native QUIC with TLS 1.3 (Phase 2)
+- **RTT-Based Topology**: Latency-optimized peer selection (Phase 2)
+
+### Phase 4: Protocol Extensions (Planned)
 
 - **Priority-based message routing**: Support for message priorities affecting delivery order
 - **Topic-based spanning trees**: Separate spanning trees per topic for efficient pub/sub
-- **Persistence layer**: Optional WAL for message durability across restarts
 - **Compression**: Optional message compression for bandwidth reduction
 - **Encryption**: End-to-end encryption support for secure clusters
 - **Protocol versioning**: Backward-compatible protocol evolution
@@ -1094,6 +1136,7 @@ Comprehensive documentation is available in the [`docs/`](docs/) directory:
 | [Architecture](docs/architecture.md) | System architecture and message flow |
 | [Peer Topology](docs/peer-topology.md) | Eager/lazy management, hash ring, peer scoring |
 | [Adaptive Features](docs/adaptive-features.md) | Dynamic batch sizing and cleanup tuning |
+| [Sync & Persistence](docs/sync-persistence.md) | Anti-entropy sync, message storage, crash recovery |
 | [Configuration](docs/configuration.md) | Complete configuration reference |
 | [QUIC Transport](docs/quic.md) | QUIC transport setup and TLS configuration |
 | [Background Tasks](docs/background-tasks.md) | Required background tasks and troubleshooting |

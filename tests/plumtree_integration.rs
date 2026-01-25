@@ -5,7 +5,7 @@
 
 use bytes::Bytes;
 use memberlist_plumtree::{
-    MessageId, PeerTopology, Plumtree, PlumtreeConfig, PlumtreeDelegate, PlumtreeMemberlist,
+    MessageId, PeerTopology, Plumtree, PlumtreeConfig, PlumtreeDelegate, PlumtreeDiscovery,
     PlumtreeMessage,
 };
 use nodecraft::CheapClone;
@@ -843,10 +843,10 @@ fn test_peer_topology_struct_methods() {
 }
 
 // =============================================================================
-// PlumtreeMemberlist Integration Tests
+// PlumtreeDiscovery Integration Tests
 // =============================================================================
 
-/// Simple node ID type for PlumtreeMemberlist tests (implements IdCodec + Id).
+/// Simple node ID type for PlumtreeDiscovery tests (implements IdCodec + Id).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct MemberlistNodeId(u64);
 
@@ -876,7 +876,7 @@ impl memberlist_plumtree::IdCodec for MemberlistNodeId {
     }
 }
 
-/// Delegate for PlumtreeMemberlist tests
+/// Delegate for PlumtreeDiscovery tests
 #[derive(Debug, Default, Clone)]
 struct MemberlistTestDelegate(Arc<MemberlistTestDelegateInner>);
 
@@ -936,6 +936,7 @@ type RoutingTable = Arc<
 >;
 
 /// In-memory transport that routes messages between nodes via their incoming channels.
+#[derive(Clone)]
 struct IntegrationTestTransport {
     routes: RoutingTable,
 }
@@ -956,17 +957,17 @@ impl Transport<MemberlistNodeId> for IntegrationTestTransport {
     }
 }
 
-/// A test node wrapping PlumtreeMemberlist with its delegate and background task handles.
+/// A test node wrapping PlumtreeDiscovery with its delegate and background task handles.
 struct TestNode {
     id: MemberlistNodeId,
-    pm: Arc<PlumtreeMemberlist<MemberlistNodeId, MemberlistTestDelegate>>,
+    pm: Arc<PlumtreeDiscovery<MemberlistNodeId, MemberlistTestDelegate>>,
     delegate: MemberlistTestDelegate,
 }
 
 impl TestNode {
     fn new(id: MemberlistNodeId, config: PlumtreeConfig, routes: RoutingTable) -> Self {
         let delegate = MemberlistTestDelegate::new();
-        let pm = Arc::new(PlumtreeMemberlist::new(id, config, delegate.clone()));
+        let pm = Arc::new(PlumtreeDiscovery::new(id, config, delegate.clone()));
 
         // Register in routing table
         {

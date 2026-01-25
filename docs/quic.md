@@ -19,7 +19,7 @@ memberlist-plumtree includes a native QUIC transport implementation using quinn 
 ```rust
 use memberlist_plumtree::{
     QuicTransport, QuicConfig, MapPeerResolver,
-    PlumtreeMemberlist, PlumtreeConfig, NoopDelegate,
+    PlumtreeDiscovery, PlumtreeConfig, NoopDelegate,
 };
 use std::sync::Arc;
 
@@ -37,7 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let transport = QuicTransport::new(local_addr, config, resolver.clone()).await?;
 
     // Use with Plumtree
-    let pm = Arc::new(PlumtreeMemberlist::new(1u64, PlumtreeConfig::default(), NoopDelegate));
+    let pm = Arc::new(PlumtreeDiscovery::new(1u64, PlumtreeConfig::default(), NoopDelegate));
     pm.run_with_transport(transport).await;
 
     Ok(())

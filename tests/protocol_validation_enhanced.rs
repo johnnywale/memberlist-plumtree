@@ -671,6 +671,7 @@ impl EnhancedSimulatedNetwork {
                 PlumtreeMessage::IHave { .. } => self.stats.record_ihave(),
                 PlumtreeMessage::Graft { .. } => self.stats.record_graft(),
                 PlumtreeMessage::Prune => self.stats.record_prune(),
+                PlumtreeMessage::Sync(_) => {} // Sync messages not tracked in tests
             }
 
             if let Some((plumtree, _)) = self.nodes.get(&msg.to) {

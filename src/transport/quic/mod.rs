@@ -134,7 +134,9 @@ pub use connection::ConnectionStats;
 pub use error::QuicError;
 pub use resolver::{MapPeerResolver, PeerResolver};
 #[allow(unused_imports)]
-pub use transport::{CleanupTaskHandle, QuicStats, QuicTransport};
+pub use transport::{
+    CleanupTaskHandle, IncomingConfig, IncomingHandle, IncomingStats, QuicStats, QuicTransport,
+};
 
 // Re-export TLS utilities (used by consumers who want lower-level control)
 #[allow(unused_imports)]

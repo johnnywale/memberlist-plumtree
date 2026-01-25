@@ -1,7 +1,7 @@
-//! Pub/Sub example using PlumtreeMemberlist.
+//! Pub/Sub example using PlumtreeDiscovery.
 //!
 //! This example demonstrates a topic-based publish/subscribe system
-//! built on top of PlumtreeMemberlist for efficient O(n) message broadcast.
+//! built on top of PlumtreeDiscovery for efficient O(n) message broadcast.
 //!
 //! Features demonstrated:
 //! - Topic-based message routing
@@ -14,7 +14,7 @@
 
 use bytes::Bytes;
 use memberlist_plumtree::{
-    CacheStats, MessageId, PeerStats, PlumtreeConfig, PlumtreeDelegate, PlumtreeMemberlist,
+    CacheStats, MessageId, PeerStats, PlumtreeConfig, PlumtreeDelegate, PlumtreeDiscovery,
 };
 use std::{
     collections::HashSet,
@@ -329,12 +329,12 @@ impl PlumtreeDelegate<NodeId> for PubSubDelegate {
 // Pub/Sub Node
 // ============================================================================
 
-/// A pub/sub node using PlumtreeMemberlist.
+/// A pub/sub node using PlumtreeDiscovery.
 struct PubSubNode {
     /// Node identifier.
     id: NodeId,
-    /// PlumtreeMemberlist instance.
-    memberlist: PlumtreeMemberlist<NodeId, Arc<PubSubDelegate>>,
+    /// PlumtreeDiscovery instance.
+    memberlist: PlumtreeDiscovery<NodeId, Arc<PubSubDelegate>>,
     /// Delegate for message handling.
     delegate: Arc<PubSubDelegate>,
     /// Sequence number for published messages.
@@ -346,7 +346,7 @@ impl PubSubNode {
     /// Create a new pub/sub node.
     fn new(id: NodeId, config: PlumtreeConfig) -> Self {
         let delegate = Arc::new(PubSubDelegate::new(id));
-        let memberlist = PlumtreeMemberlist::new(id, config, delegate.clone());
+        let memberlist = PlumtreeDiscovery::new(id, config, delegate.clone());
 
         Self {
             id,
@@ -432,7 +432,7 @@ impl PubSubNode {
 
 #[tokio::main]
 async fn main() {
-    println!("using PlumtreeMemberlist for efficient O(n) broadcast.\n");
+    println!("using PlumtreeDiscovery for efficient O(n) broadcast.\n");
 
     // Create configuration
     let config = PlumtreeConfig::default()
@@ -440,7 +440,11 @@ async fn main() {
         .with_lazy_fanout(4)
         .with_ihave_interval(Duration::from_millis(50))
         .with_graft_timeout(Duration::from_millis(100))
-        .with_message_cache_ttl(Duration::from_secs(30));
+        .with_message_cache_ttl(Duration::from_secs(30))
+        // New: Peer limit configuration
+        .with_protect_ring_neighbors(false)   // Small cluster, no need for protection
+        .with_max_eager_peers(3)              // Cap eager peers for this demo
+        .with_max_lazy_peers(10);             // Cap lazy peers
 
     // Create pub/sub nodes
     // IDs: 1=broker-1, 2=broker-2, 3=broker-3, 4=client-a, 5=client-b

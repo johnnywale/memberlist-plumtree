@@ -38,8 +38,9 @@ use memberlist::net::NetTransportOptions;
 use memberlist::tokio::{TokioRuntime, TokioSocketAddrResolver, TokioTcp};
 use memberlist::{Memberlist, Options as MemberlistOptions};
 use memberlist_plumtree::{
-    decode_plumtree_envelope, ChannelTransport, IdCodec, MessageId, PeerStats, PeerTopology,
-    PlumtreeConfig, PlumtreeDelegate, PlumtreeMemberlist, PlumtreeMessage,
+    decode_plumtree_envelope, ChannelTransport, IdCodec, MessageId, PeerStats,
+    PeerTopology, PlumtreeConfig, PlumtreeDelegate, PlumtreeDiscovery, PlumtreeMessage,
+    PlumtreeNodeDelegate,
 };
 use nodecraft::resolver::socket_addr::SocketAddrResolver;
 use nodecraft::CheapClone;
@@ -441,8 +442,8 @@ struct ChatPlumtreeDelegate {
     pending_context: Arc<RwLock<HashMap<MessageId, (String, u32)>>>,
     start_time: Instant,
     node_idx: usize,
-    /// Reference to the PlumtreeMemberlist (set after construction)
-    pm: Arc<RwLock<Option<Arc<PlumtreeMemberlist<NodeId, Arc<ChatPlumtreeDelegate>>>>>>,
+    /// Reference to the PlumtreeDiscovery (set after construction)
+    pm: Arc<RwLock<Option<Arc<PlumtreeDiscovery<NodeId, Arc<ChatPlumtreeDelegate>>>>>>,
 }
 
 impl ChatPlumtreeDelegate {
@@ -460,12 +461,12 @@ impl ChatPlumtreeDelegate {
         }
     }
 
-    /// Set the PlumtreeMemberlist reference (called after construction)
-    async fn set_pm(&self, pm: Arc<PlumtreeMemberlist<NodeId, Arc<ChatPlumtreeDelegate>>>) {
+    /// Set the PlumtreeDiscovery reference (called after construction)
+    async fn set_pm(&self, pm: Arc<PlumtreeDiscovery<NodeId, Arc<ChatPlumtreeDelegate>>>) {
         *self.pm.write().await = Some(pm);
     }
 
-    /// Clear the PlumtreeMemberlist reference (called on shutdown)
+    /// Clear the PlumtreeDiscovery reference (called on shutdown)
     async fn clear_pm(&self) {
         *self.pm.write().await = None;
     }
@@ -561,7 +562,7 @@ impl PlumtreeDelegate<NodeId> for ChatPlumtreeDelegate {
 
                 messages.write().await.push(received.clone());
 
-                // Get peer topology from PlumtreeMemberlist
+                // Get peer topology from PlumtreeDiscovery
                 let peers_json = {
                     let pm_guard = pm_ref.read().await;
                     if let Some(ref pm) = *pm_guard {
@@ -829,16 +830,32 @@ impl ChatNode {
             .map_err(|e| format!("Invalid address: {}", e))?;
 
         // Create PlumtreeConfig
+        //
+        // NOTE on GRAFT visibility:
+        // GRAFTs are triggered when a node receives IHave for an unknown message.
+        // With ring topology (protect_ring_neighbors=true), all nodes are connected
+        // via a linear eager chain, so GOSSIP reaches all nodes before IHave arrives.
+        // To see GRAFTs in action:
+        // 1. Toggle some nodes offline to break the eager chain
+        // 2. Use the "Reset Eager" button to demote all peers to lazy
+        // 3. Reduce max_peers to create sparse connectivity
+        //
+        // The current config uses small ihave_interval to increase GRAFT chances.
         let config = PlumtreeConfig::default()
             .with_eager_fanout(2)
-            .with_max_peers(6)
-            .with_lazy_fanout(4)
-            .with_ihave_interval(Duration::from_millis(100))
-            .with_graft_timeout(Duration::from_millis(200))
-            .with_message_cache_ttl(Duration::from_secs(60));
+            .with_max_peers(6)                 // Sparse connectivity for GRAFT demos
+            .with_lazy_fanout(3)
+            .with_ihave_interval(Duration::from_millis(10))  // Fast IHave for GRAFT demos
+            .with_graft_timeout(Duration::from_millis(100))  // Retry timeout
+            .with_message_cache_ttl(Duration::from_secs(60))
+            // Disable ring protection for more random topology
+            .with_hash_ring(true)             // No ring-based eager selection
+            .with_protect_ring_neighbors(true) // Allow any peer to be demoted
+            .with_max_eager_peers(3)           // Hard cap on eager peers
+            .with_max_lazy_peers(8);           // Hard cap on lazy peers
 
-        // Create PlumtreeMemberlist
-        let pm = Arc::new(PlumtreeMemberlist::new(
+        // Create PlumtreeDiscovery
+        let pm = Arc::new(PlumtreeDiscovery::new(
             node_id.clone(),
             config,
             self.delegate.clone(),
@@ -878,23 +895,29 @@ impl ChatNode {
         let delegate_for_promotion = self.delegate.clone();
         let delegate_for_demotion = self.delegate.clone();
 
-        let plumtree_delegate = pm
-            .wrap_delegate(void_delegate)
-            .with_promotion_callback(std::sync::Arc::new(move |peer: &NodeId| {
-                // Clone delegate and peer for the spawned task
-                let delegate = delegate_for_promotion.clone();
-                let peer = peer.clone();
-                tokio::spawn(async move {
-                    delegate.on_eager_promotion(&peer);
-                });
-            }))
-            .with_demotion_callback(std::sync::Arc::new(move |peer: &NodeId| {
-                let delegate = delegate_for_demotion.clone();
-                let peer = peer.clone();
-                tokio::spawn(async move {
-                    delegate.on_lazy_demotion(&peer);
-                });
-            }));
+        let plumtree_delegate = PlumtreeNodeDelegate::new(
+            void_delegate,
+            pm.incoming_sender(),
+            pm.outgoing_receiver(),
+            pm.peers().clone(),
+            pm.config().eager_fanout,
+            pm.config().max_peers,
+        )
+        .with_promotion_callback(std::sync::Arc::new(move |peer: &NodeId| {
+            // Clone delegate and peer for the spawned task
+            let delegate = delegate_for_promotion.clone();
+            let peer = peer.clone();
+            tokio::spawn(async move {
+                delegate.on_eager_promotion(&peer);
+            });
+        }))
+        .with_demotion_callback(std::sync::Arc::new(move |peer: &NodeId| {
+            let delegate = delegate_for_demotion.clone();
+            let peer = peer.clone();
+            tokio::spawn(async move {
+                delegate.on_lazy_demotion(&peer);
+            });
+        }));
 
         // Create NetTransport options
         let mut transport_opts = NetTransportOptions::<
@@ -990,6 +1013,18 @@ impl ChatNode {
         }
     }
 
+    /// Demote all eager peers to lazy.
+    /// This is useful for demonstrating GRAFT flow - when all peers are lazy,
+    /// the next message will trigger IHave→GRAFT→Gossip instead of direct Gossip.
+    async fn demote_all_to_lazy(&self) {
+        if let Some(ref stack) = self.stack {
+            let topology = stack.plumtree().peers().topology();
+            for peer in topology.eager.clone() {
+                stack.plumtree().peers().demote_to_lazy(&peer);
+            }
+        }
+    }
+
     #[allow(dead_code)]
     fn memberlist_addr(&self) -> SocketAddr {
         format!("127.0.0.1:{}", self.port).parse().unwrap()
@@ -1013,6 +1048,7 @@ struct AppState {
 #[derive(Debug, Clone)]
 enum NodeCommand {
     PromoteAllEager,
+    DemoteAllToLazy,  // Reset all eager peers to lazy (to trigger GRAFTs)
     GoOffline,
     GoOnline,
 }
@@ -1119,6 +1155,15 @@ async fn handle_ws_message(state: &AppState, data: &Value) {
             if user < state.control_txs.len() {
                 let _ = state.control_txs[user]
                     .send(NodeCommand::PromoteAllEager)
+                    .await;
+            }
+        }
+        "demote_lazy" => {
+            // Demote all eager peers to lazy - useful for testing GRAFT flow
+            let user = data["user"].as_u64().unwrap_or(0) as usize;
+            if user < state.control_txs.len() {
+                let _ = state.control_txs[user]
+                    .send(NodeCommand::DemoteAllToLazy)
                     .await;
             }
         }
@@ -1365,6 +1410,10 @@ async fn main() {
                             NodeCommand::PromoteAllEager => {
                                 let node_guard = node.read().await;
                                 node_guard.promote_all_to_eager().await;
+                            }
+                            NodeCommand::DemoteAllToLazy => {
+                                let node_guard = node.read().await;
+                                node_guard.demote_all_to_lazy().await;
                             }
                             NodeCommand::GoOffline => {
                                 let mut node_guard = node.write().await;

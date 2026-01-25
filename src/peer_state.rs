@@ -207,6 +207,7 @@ impl<I> Default for PeerTopology<I> {
 ///
 /// Adjacent neighbors (i±1, i±2) are protected from demotion to maintain Z≥2 redundancy.
 /// They can only be removed when the peer leaves the cluster entirely.
+/// Protection can be configured via `protect_ring_neighbors` and `max_protected_neighbors`.
 #[derive(Debug)]
 pub struct PeerState<I> {
     inner: RwLock<PeerStateInner<I>>,
@@ -216,6 +217,14 @@ pub struct PeerState<I> {
     /// Whether to use hash ring topology with ring neighbor protection.
     /// When false, local_id is only used for diverse peer ordering.
     use_hash_ring: bool,
+    /// Whether to protect ring neighbors from demotion.
+    protect_ring_neighbors: bool,
+    /// Maximum number of ring neighbors to protect (default: 4 for i±1, i±2).
+    max_protected_neighbors: usize,
+    /// Hard cap on eager peers. If set, promotion is rejected when at this limit.
+    max_eager_peers: Option<usize>,
+    /// Hard cap on lazy peers. If set, new peers are rejected when at this limit.
+    max_lazy_peers: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -296,6 +305,10 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
             }),
             local_id: None,
             use_hash_ring: false,
+            protect_ring_neighbors: true,
+            max_protected_neighbors: 4,
+            max_eager_peers: None,
+            max_lazy_peers: None,
         }
     }
 
@@ -319,7 +332,53 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
             }),
             local_id: Some(local_id),
             use_hash_ring: true, // Full hash ring features when local_id is explicitly set
+            protect_ring_neighbors: true,
+            max_protected_neighbors: 4,
+            max_eager_peers: None,
+            max_lazy_peers: None,
         }
+    }
+
+    /// Set whether to protect ring neighbors from demotion.
+    pub fn set_protect_ring_neighbors(&mut self, protect: bool) {
+        self.protect_ring_neighbors = protect;
+        if self.use_hash_ring {
+            let mut inner = self.inner.write();
+            self.update_ring_neighbors(&mut inner);
+        }
+    }
+
+    /// Set the maximum number of protected ring neighbors.
+    ///
+    /// - 2: Only immediate neighbors (i±1)
+    /// - 4: Immediate + second-nearest (i±1, i±2)
+    /// - 0: No protection
+    pub fn set_max_protected_neighbors(&mut self, count: usize) {
+        self.max_protected_neighbors = count;
+        if self.use_hash_ring {
+            let mut inner = self.inner.write();
+            self.update_ring_neighbors(&mut inner);
+        }
+    }
+
+    /// Set the hard cap on eager peers.
+    pub fn set_max_eager_peers(&mut self, max: Option<usize>) {
+        self.max_eager_peers = max;
+    }
+
+    /// Set the hard cap on lazy peers.
+    pub fn set_max_lazy_peers(&mut self, max: Option<usize>) {
+        self.max_lazy_peers = max;
+    }
+
+    /// Get the current max_eager_peers setting.
+    pub fn max_eager_peers(&self) -> Option<usize> {
+        self.max_eager_peers
+    }
+
+    /// Get the current max_lazy_peers setting.
+    pub fn max_lazy_peers(&self) -> Option<usize> {
+        self.max_lazy_peers
     }
 
     /// Get the local node ID if set.
@@ -346,10 +405,15 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
     }
 
     /// Compute ring neighbors for the local node.
-    /// Returns (adjacent: i±1, second_nearest: i±2, long_range: i±X/4).
+    /// Returns protected neighbors based on `max_protected_neighbors`:
+    /// - 0: No protection
+    /// - 2: Adjacent (i±1)
+    /// - 4: Adjacent + second-nearest (i±1, i±2)
     fn compute_ring_neighbors(&self, inner: &PeerStateInner<I>) -> HashSet<I> {
         // Only compute ring neighbors when hash ring is explicitly enabled
-        if !self.use_hash_ring {
+        // and protection is enabled
+        if !self.use_hash_ring || !self.protect_ring_neighbors || self.max_protected_neighbors == 0
+        {
             return HashSet::new();
         }
 
@@ -370,18 +434,20 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
 
         let mut neighbors = HashSet::new();
 
-        // Adjacent (i±1) - always protected
-        let pred = (local_pos + ring_size - 1) % ring_size;
-        let succ = (local_pos + 1) % ring_size;
-        if sorted_ring[pred] != *local_id {
-            neighbors.insert(sorted_ring[pred].clone());
-        }
-        if sorted_ring[succ] != *local_id {
-            neighbors.insert(sorted_ring[succ].clone());
+        // Adjacent (i±1) - protected if max_protected_neighbors >= 2
+        if self.max_protected_neighbors >= 2 {
+            let pred = (local_pos + ring_size - 1) % ring_size;
+            let succ = (local_pos + 1) % ring_size;
+            if sorted_ring[pred] != *local_id {
+                neighbors.insert(sorted_ring[pred].clone());
+            }
+            if sorted_ring[succ] != *local_id {
+                neighbors.insert(sorted_ring[succ].clone());
+            }
         }
 
-        // Second-nearest (i±2) - protected for Z≥2
-        if ring_size > 3 {
+        // Second-nearest (i±2) - protected if max_protected_neighbors >= 4
+        if self.max_protected_neighbors >= 4 && ring_size > 3 {
             let pred2 = (local_pos + ring_size - 2) % ring_size;
             let succ2 = (local_pos + 2) % ring_size;
             if sorted_ring[pred2] != *local_id {
@@ -434,6 +500,10 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
             }),
             local_id: None,
             use_hash_ring: false,
+            protect_ring_neighbors: true,
+            max_protected_neighbors: 4,
+            max_eager_peers: None,
+            max_lazy_peers: None,
         }
     }
 
@@ -568,6 +638,10 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
             }),
             local_id: Some(local_id),
             use_hash_ring: true, // Full hash ring features
+            protect_ring_neighbors: true,
+            max_protected_neighbors: 4,
+            max_eager_peers: None,
+            max_lazy_peers: None,
         }
     }
 
@@ -659,12 +733,21 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
     ///
     /// New peers always start as lazy. They are promoted to eager
     /// via the Graft mechanism if needed.
-    pub fn add_peer(&self, peer: I) {
+    ///
+    /// Returns `false` if the peer cannot be added due to `max_lazy_peers` limit.
+    pub fn add_peer(&self, peer: I) -> bool {
         let mut inner = self.inner.write();
 
         // Don't add if already known
         if inner.known_peers.contains(&peer) {
-            return;
+            return true; // Already exists, considered success
+        }
+
+        // Check max_lazy_peers limit
+        if let Some(max) = self.max_lazy_peers {
+            if inner.lazy.len() >= max {
+                return false; // At capacity
+            }
         }
 
         // Add to known_peers and invalidate ring cache
@@ -677,6 +760,7 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
         // Add to lazy set
         inner.lazy.insert(peer.clone());
         inner.lazy_vec.push(peer);
+        true
     }
 
     /// Add a new peer with automatic classification based on config limits.
@@ -990,6 +1074,11 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
     /// Promote a peer from lazy to eager set.
     ///
     /// Called when we receive a Graft or need to establish tree connection.
+    ///
+    /// Returns `false` if:
+    /// - The peer is already eager
+    /// - The peer is not known
+    /// - The eager peer count is at `max_eager_peers` limit
     pub fn promote_to_eager(&self, peer: &I) -> bool {
         let mut inner = self.inner.write();
 
@@ -1003,6 +1092,13 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
             return false;
         }
 
+        // Check max_eager_peers hard cap
+        if let Some(max) = self.max_eager_peers {
+            if inner.eager.len() >= max {
+                return false; // At capacity, cannot promote
+            }
+        }
+
         // Remove from lazy if present (update both set and cache)
         if inner.lazy.remove(peer) {
             inner.lazy_vec.retain(|p| p != peer);
@@ -1013,6 +1109,15 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
         inner.eager_vec.push(peer.clone());
 
         true
+    }
+
+    /// Check if promotion to eager is allowed (not at max_eager_peers limit).
+    pub fn can_promote_to_eager(&self) -> bool {
+        if let Some(max) = self.max_eager_peers {
+            self.inner.read().eager.len() < max
+        } else {
+            true
+        }
     }
 
     /// Demote a peer from eager to lazy set.
@@ -1150,6 +1255,30 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
         // Read-only path - cache is always up to date
         let inner = self.inner.read();
         Self::reservoir_sample_except(&inner.lazy_vec, exclude, count)
+    }
+
+    /// Get a random peer (from either eager or lazy set).
+    ///
+    /// Returns `None` if there are no peers.
+    /// This is useful for anti-entropy sync which needs to pick a random peer
+    /// for state comparison.
+    pub fn random_peer(&self) -> Option<I> {
+        let inner = self.inner.read();
+
+        // Combine both sets
+        let total = inner.eager_vec.len() + inner.lazy_vec.len();
+        if total == 0 {
+            return None;
+        }
+
+        let mut rng = rand::rng();
+        let idx = rand::Rng::random_range(&mut rng, 0..total);
+
+        if idx < inner.eager_vec.len() {
+            Some(inner.eager_vec[idx].clone())
+        } else {
+            Some(inner.lazy_vec[idx - inner.eager_vec.len()].clone())
+        }
     }
 
     /// Get the number of eager peers.
@@ -1704,6 +1833,10 @@ pub struct PeerStateBuilder<I> {
     eager_fanout: usize,
     lazy_fanout: usize,
     use_hash_ring: bool,
+    protect_ring_neighbors: bool,
+    max_protected_neighbors: usize,
+    max_eager_peers: Option<usize>,
+    max_lazy_peers: Option<usize>,
 }
 
 impl<I: Clone + Eq + Hash + Ord> PeerStateBuilder<I> {
@@ -1716,6 +1849,10 @@ impl<I: Clone + Eq + Hash + Ord> PeerStateBuilder<I> {
             eager_fanout: 3,
             lazy_fanout: 6,
             use_hash_ring: false,
+            protect_ring_neighbors: true,
+            max_protected_neighbors: 4,
+            max_eager_peers: None,
+            max_lazy_peers: None,
         }
     }
 
@@ -1772,6 +1909,40 @@ impl<I: Clone + Eq + Hash + Ord> PeerStateBuilder<I> {
         self
     }
 
+    /// Enable or disable ring neighbor protection.
+    ///
+    /// When enabled, adjacent ring neighbors cannot be demoted from eager to lazy.
+    pub fn with_protect_ring_neighbors(mut self, protect: bool) -> Self {
+        self.protect_ring_neighbors = protect;
+        self
+    }
+
+    /// Set the maximum number of protected ring neighbors.
+    ///
+    /// - 2: Only immediate neighbors (i±1)
+    /// - 4: Immediate + second-nearest (i±1, i±2)
+    /// - 0: No protection
+    pub fn with_max_protected_neighbors(mut self, count: usize) -> Self {
+        self.max_protected_neighbors = count;
+        self
+    }
+
+    /// Set a hard cap on eager peers.
+    ///
+    /// When set, promotion to eager is rejected if at this limit.
+    pub fn with_max_eager_peers(mut self, max: usize) -> Self {
+        self.max_eager_peers = Some(max);
+        self
+    }
+
+    /// Set a hard cap on lazy peers.
+    ///
+    /// When set, new peers are rejected if at this limit.
+    pub fn with_max_lazy_peers(mut self, max: usize) -> Self {
+        self.max_lazy_peers = Some(max);
+        self
+    }
+
     /// Build the PeerState.
     ///
     /// If `max_peers` is set and fewer peers are provided than the limit,
@@ -1788,12 +1959,22 @@ impl<I: Clone + Eq + Hash + Ord> PeerStateBuilder<I> {
         // Use hash ring topology if local_id is set and use_hash_ring is enabled
         if let Some(local_id) = self.local_id {
             if self.use_hash_ring {
-                return PeerState::with_initial_peers_hash_ring(
+                let mut state = PeerState::with_initial_peers_hash_ring(
                     local_id,
                     peers,
                     self.eager_fanout,
                     self.lazy_fanout,
                 );
+                // Apply configuration
+                state.protect_ring_neighbors = self.protect_ring_neighbors;
+                state.max_protected_neighbors = self.max_protected_neighbors;
+                state.max_eager_peers = self.max_eager_peers;
+                state.max_lazy_peers = self.max_lazy_peers;
+                // Recompute ring neighbors with new settings
+                let mut inner = state.inner.write();
+                state.update_ring_neighbors(&mut inner);
+                drop(inner);
+                return state;
             }
 
             // local_id set but not using hash ring for initial classification
@@ -1810,6 +1991,10 @@ impl<I: Clone + Eq + Hash + Ord> PeerStateBuilder<I> {
                 }),
                 local_id: Some(local_id),
                 use_hash_ring: false, // No ring neighbor protection
+                protect_ring_neighbors: self.protect_ring_neighbors,
+                max_protected_neighbors: self.max_protected_neighbors,
+                max_eager_peers: self.max_eager_peers,
+                max_lazy_peers: self.max_lazy_peers,
             };
             for peer in peers {
                 state.add_peer_auto(peer, self.max_peers, self.eager_fanout);
@@ -1818,7 +2003,11 @@ impl<I: Clone + Eq + Hash + Ord> PeerStateBuilder<I> {
         }
 
         // No local_id: use standard initialization
-        let state = PeerState::new();
+        let mut state = PeerState::new();
+        state.protect_ring_neighbors = self.protect_ring_neighbors;
+        state.max_protected_neighbors = self.max_protected_neighbors;
+        state.max_eager_peers = self.max_eager_peers;
+        state.max_lazy_peers = self.max_lazy_peers;
         for peer in peers {
             state.add_peer_auto(peer, self.max_peers, self.eager_fanout);
         }

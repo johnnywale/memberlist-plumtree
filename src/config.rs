@@ -161,10 +161,77 @@ pub struct PlumtreeConfig {
     /// - Ring neighbors are protected from demotion
     /// - Eviction uses fingerprint-based selection to preserve topological diversity
     ///
-    /// This is automatically enabled when using `PlumtreeMemberlist`.
+    /// This is automatically enabled when using `PlumtreeDiscovery`.
     ///
     /// Default: false
     pub use_hash_ring: bool,
+
+    /// Enable protection of ring neighbors from demotion.
+    ///
+    /// When enabled, adjacent ring neighbors (determined by `max_protected_neighbors`)
+    /// cannot be demoted from eager to lazy. They can only be removed when
+    /// the peer leaves the cluster entirely.
+    ///
+    /// This ensures Z≥2 redundancy for message delivery even under churn.
+    ///
+    /// Only effective when `use_hash_ring` is true.
+    ///
+    /// Default: true
+    pub protect_ring_neighbors: bool,
+
+    /// Maximum number of ring neighbors to protect from demotion.
+    ///
+    /// Controls how many adjacent peers on the hash ring are protected:
+    /// - 2: Only immediate neighbors (i±1)
+    /// - 4: Immediate + second-nearest (i±1, i±2) - provides Z≥2 redundancy
+    /// - 0: No protection (all peers can be demoted)
+    ///
+    /// Only effective when `use_hash_ring` and `protect_ring_neighbors` are true.
+    ///
+    /// Default: 4
+    pub max_protected_neighbors: usize,
+
+    /// Hard cap on the number of eager peers.
+    ///
+    /// When set, the node will reject GRAFT requests that would push the
+    /// eager peer count above this limit. The peer remains lazy instead.
+    ///
+    /// This is useful for bandwidth-constrained environments where you want
+    /// to strictly limit the number of full message streams.
+    ///
+    /// Note: This may cause some peers to rely more heavily on IHAVE/GRAFT
+    /// for message recovery if they cannot join the eager set.
+    ///
+    /// Default: None (limited only by `eager_fanout` during rebalancing)
+    pub max_eager_peers: Option<usize>,
+
+    /// Hard cap on the number of lazy peers.
+    ///
+    /// When set, the node will reject new peers that would push the
+    /// lazy peer count above this limit (after eager slots are full).
+    ///
+    /// This is useful for memory-constrained environments where you want
+    /// to limit the IHAVE tracking overhead.
+    ///
+    /// Default: None (unlimited lazy peers)
+    pub max_lazy_peers: Option<usize>,
+
+    /// Anti-entropy sync configuration.
+    ///
+    /// Enables recovery of missed messages after network partitions
+    /// or node restarts.
+    ///
+    /// Default: None (disabled)
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub sync: Option<SyncConfig>,
+
+    /// Storage configuration for message persistence.
+    ///
+    /// Enables message persistence for crash recovery and anti-entropy sync.
+    ///
+    /// Default: None (disabled)
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub storage: Option<StorageConfig>,
 }
 
 impl Default for PlumtreeConfig {
@@ -188,6 +255,12 @@ impl Default for PlumtreeConfig {
             #[cfg(feature = "metrics")]
             enable_metrics: true,
             use_hash_ring: false,
+            protect_ring_neighbors: true,
+            max_protected_neighbors: 4,
+            max_eager_peers: None,
+            max_lazy_peers: None,
+            sync: None,
+            storage: None,
         }
     }
 }
@@ -203,6 +276,7 @@ impl PlumtreeConfig {
     /// - Lower latency settings
     /// - Smaller cache TTL
     /// - More aggressive optimization
+    /// - Minimal ring neighbor protection (small clusters don't need it)
     pub fn lan() -> Self {
         Self {
             max_peers: None,
@@ -223,6 +297,12 @@ impl PlumtreeConfig {
             #[cfg(feature = "metrics")]
             enable_metrics: true,
             use_hash_ring: false,
+            protect_ring_neighbors: false, // Small LAN clusters don't need protection
+            max_protected_neighbors: 2,
+            max_eager_peers: None,
+            max_lazy_peers: None,
+            sync: None,
+            storage: None,
         }
     }
 
@@ -231,6 +311,7 @@ impl PlumtreeConfig {
     /// - Higher latency tolerance
     /// - Longer cache TTL
     /// - More conservative optimization
+    /// - Ring neighbor protection enabled for reliability
     pub fn wan() -> Self {
         Self {
             max_peers: None,
@@ -250,7 +331,13 @@ impl PlumtreeConfig {
             maintenance_jitter: Duration::from_secs(1),
             #[cfg(feature = "metrics")]
             enable_metrics: true,
-            use_hash_ring: false,
+            use_hash_ring: true,
+            protect_ring_neighbors: true,
+            max_protected_neighbors: 4,
+            max_eager_peers: None,
+            max_lazy_peers: None,
+            sync: None,
+            storage: None,
         }
     }
 
@@ -259,6 +346,8 @@ impl PlumtreeConfig {
     /// - Higher fanout for better coverage
     /// - Larger cache for more redundancy
     /// - Conservative optimization to maintain reliability
+    /// - Full ring neighbor protection for stability
+    /// - Hard cap on eager peers to prevent runaway growth
     pub fn large_cluster() -> Self {
         Self {
             max_peers: None,
@@ -279,6 +368,12 @@ impl PlumtreeConfig {
             #[cfg(feature = "metrics")]
             enable_metrics: true,
             use_hash_ring: true,
+            protect_ring_neighbors: true,
+            max_protected_neighbors: 4,
+            max_eager_peers: Some(8),  // Hard cap to prevent unbounded growth
+            max_lazy_peers: Some(50),  // Limit IHAVE tracking overhead
+            sync: None,
+            storage: None,
         }
     }
 
@@ -402,9 +497,298 @@ impl PlumtreeConfig {
     /// - Long-range jump links (i±N/4) optimize message propagation
     /// - Ring neighbors are protected from demotion
     ///
-    /// This is automatically enabled when using `PlumtreeMemberlist`.
+    /// This is automatically enabled when using `PlumtreeDiscovery`.
     pub const fn with_hash_ring(mut self, enable: bool) -> Self {
         self.use_hash_ring = enable;
+        self
+    }
+
+    /// Enable or disable ring neighbor protection (builder pattern).
+    ///
+    /// When enabled, adjacent ring neighbors cannot be demoted from eager to lazy.
+    /// This ensures Z≥2 redundancy for message delivery.
+    ///
+    /// Only effective when `use_hash_ring` is true.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use memberlist_plumtree::PlumtreeConfig;
+    ///
+    /// // Disable ring neighbor protection for small clusters
+    /// let config = PlumtreeConfig::default()
+    ///     .with_hash_ring(true)
+    ///     .with_protect_ring_neighbors(false);
+    /// ```
+    pub const fn with_protect_ring_neighbors(mut self, enable: bool) -> Self {
+        self.protect_ring_neighbors = enable;
+        self
+    }
+
+    /// Set the maximum number of protected ring neighbors (builder pattern).
+    ///
+    /// Controls how many adjacent hash ring peers are protected from demotion:
+    /// - 2: Only immediate neighbors (i±1)
+    /// - 4: Immediate + second-nearest (i±1, i±2) - provides Z≥2 redundancy
+    /// - 0: No protection (same as `with_protect_ring_neighbors(false)`)
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use memberlist_plumtree::PlumtreeConfig;
+    ///
+    /// // Only protect immediate neighbors, not second-nearest
+    /// let config = PlumtreeConfig::default()
+    ///     .with_hash_ring(true)
+    ///     .with_max_protected_neighbors(2);
+    /// ```
+    pub const fn with_max_protected_neighbors(mut self, count: usize) -> Self {
+        self.max_protected_neighbors = count;
+        self
+    }
+
+    /// Set a hard cap on eager peers (builder pattern).
+    ///
+    /// When set, GRAFT requests that would exceed this limit are rejected.
+    /// The peer remains lazy instead of being promoted to eager.
+    ///
+    /// This is useful for bandwidth-constrained environments.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use memberlist_plumtree::PlumtreeConfig;
+    ///
+    /// // Hard limit of 5 eager peers, regardless of GRAFT requests
+    /// let config = PlumtreeConfig::default()
+    ///     .with_eager_fanout(3)      // Target 3 eager peers
+    ///     .with_max_eager_peers(5);  // But allow up to 5
+    /// ```
+    pub const fn with_max_eager_peers(mut self, max: usize) -> Self {
+        self.max_eager_peers = Some(max);
+        self
+    }
+
+    /// Set a hard cap on lazy peers (builder pattern).
+    ///
+    /// When set, new peers that would exceed this limit are rejected
+    /// if there are no eager slots available.
+    ///
+    /// This is useful for memory-constrained environments.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use memberlist_plumtree::PlumtreeConfig;
+    ///
+    /// // Limit lazy peers to reduce IHAVE tracking overhead
+    /// let config = PlumtreeConfig::default()
+    ///     .with_max_lazy_peers(20);
+    /// ```
+    pub const fn with_max_lazy_peers(mut self, max: usize) -> Self {
+        self.max_lazy_peers = Some(max);
+        self
+    }
+
+    /// Enable anti-entropy sync with the given configuration (builder pattern).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use memberlist_plumtree::{PlumtreeConfig, SyncConfig};
+    ///
+    /// let config = PlumtreeConfig::default()
+    ///     .with_sync(SyncConfig::enabled());
+    /// ```
+    pub fn with_sync(mut self, sync: SyncConfig) -> Self {
+        self.sync = Some(sync);
+        self
+    }
+
+    /// Enable storage with the given configuration (builder pattern).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use memberlist_plumtree::{PlumtreeConfig, StorageConfig};
+    ///
+    /// let config = PlumtreeConfig::default()
+    ///     .with_storage(StorageConfig::enabled());
+    /// ```
+    pub fn with_storage(mut self, storage: StorageConfig) -> Self {
+        self.storage = Some(storage);
+        self
+    }
+}
+
+/// Anti-entropy synchronization configuration.
+///
+/// Anti-entropy sync enables recovery of missed messages after network partitions
+/// or node restarts by periodically comparing message state with peers.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct SyncConfig {
+    /// Enable anti-entropy sync.
+    ///
+    /// Default: false
+    pub enabled: bool,
+
+    /// Interval between sync rounds.
+    ///
+    /// Lower values increase sync frequency but also network overhead.
+    ///
+    /// Default: 30s
+    #[cfg_attr(feature = "serde", serde(with = "humantime_serde_impl"))]
+    pub sync_interval: Duration,
+
+    /// Time window for sync (how far back to check).
+    ///
+    /// Messages older than this window are not included in sync comparisons.
+    /// Should be >= message_cache_ttl for effective recovery.
+    ///
+    /// Default: 90s
+    #[cfg_attr(feature = "serde", serde(with = "humantime_serde_impl"))]
+    pub sync_window: Duration,
+
+    /// Maximum message IDs per sync response.
+    ///
+    /// Limits response size to prevent MTU overflow.
+    ///
+    /// Default: 100
+    pub max_batch_size: usize,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sync_interval: Duration::from_secs(30),
+            sync_window: Duration::from_secs(90),
+            max_batch_size: 100,
+        }
+    }
+}
+
+impl SyncConfig {
+    /// Create a new sync configuration with default values.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Enable sync with default settings.
+    pub fn enabled() -> Self {
+        Self {
+            enabled: true,
+            ..Self::default()
+        }
+    }
+
+    /// Set enabled state (builder pattern).
+    pub const fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    /// Set sync interval (builder pattern).
+    pub const fn with_sync_interval(mut self, interval: Duration) -> Self {
+        self.sync_interval = interval;
+        self
+    }
+
+    /// Set sync window (builder pattern).
+    pub const fn with_sync_window(mut self, window: Duration) -> Self {
+        self.sync_window = window;
+        self
+    }
+
+    /// Set max batch size (builder pattern).
+    pub const fn with_max_batch_size(mut self, size: usize) -> Self {
+        self.max_batch_size = size;
+        self
+    }
+}
+
+/// Storage configuration for message persistence.
+///
+/// Enables message persistence for crash recovery and anti-entropy sync.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct StorageConfig {
+    /// Enable message persistence.
+    ///
+    /// Default: false
+    pub enabled: bool,
+
+    /// Maximum messages to store.
+    ///
+    /// When exceeded, oldest messages are evicted.
+    ///
+    /// Default: 100,000
+    pub max_messages: usize,
+
+    /// Message retention duration.
+    ///
+    /// Messages older than this are garbage collected.
+    ///
+    /// Default: 300s (5 minutes)
+    #[cfg_attr(feature = "serde", serde(with = "humantime_serde_impl"))]
+    pub retention: Duration,
+
+    /// Storage path for disk backends (e.g., Sled).
+    ///
+    /// Only used by persistent storage backends.
+    ///
+    /// Default: None
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub path: Option<std::path::PathBuf>,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_messages: 100_000,
+            retention: Duration::from_secs(300),
+            path: None,
+        }
+    }
+}
+
+impl StorageConfig {
+    /// Create a new storage configuration with default values.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Enable storage with default settings.
+    pub fn enabled() -> Self {
+        Self {
+            enabled: true,
+            ..Self::default()
+        }
+    }
+
+    /// Set enabled state (builder pattern).
+    pub const fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    /// Set max messages (builder pattern).
+    pub const fn with_max_messages(mut self, max: usize) -> Self {
+        self.max_messages = max;
+        self
+    }
+
+    /// Set retention duration (builder pattern).
+    pub const fn with_retention(mut self, retention: Duration) -> Self {
+        self.retention = retention;
+        self
+    }
+
+    /// Set storage path (builder pattern).
+    pub fn with_path(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.path = Some(path.into());
         self
     }
 }
@@ -465,5 +849,122 @@ mod tests {
         assert_eq!(config.eager_fanout, 5);
         assert_eq!(config.lazy_fanout, 10);
         assert_eq!(config.ihave_interval, Duration::from_millis(200));
+    }
+
+    #[test]
+    fn test_ring_neighbor_protection_config() {
+        // Default config has protection enabled
+        let config = PlumtreeConfig::default();
+        assert!(config.protect_ring_neighbors);
+        assert_eq!(config.max_protected_neighbors, 4);
+
+        // Can disable protection
+        let config = PlumtreeConfig::default().with_protect_ring_neighbors(false);
+        assert!(!config.protect_ring_neighbors);
+
+        // Can reduce protected neighbors
+        let config = PlumtreeConfig::default().with_max_protected_neighbors(2);
+        assert_eq!(config.max_protected_neighbors, 2);
+    }
+
+    #[test]
+    fn test_peer_limits_config() {
+        // Default config has no limits
+        let config = PlumtreeConfig::default();
+        assert!(config.max_eager_peers.is_none());
+        assert!(config.max_lazy_peers.is_none());
+
+        // Can set eager limit
+        let config = PlumtreeConfig::default().with_max_eager_peers(5);
+        assert_eq!(config.max_eager_peers, Some(5));
+
+        // Can set lazy limit
+        let config = PlumtreeConfig::default().with_max_lazy_peers(20);
+        assert_eq!(config.max_lazy_peers, Some(20));
+
+        // Can set both
+        let config = PlumtreeConfig::default()
+            .with_max_eager_peers(5)
+            .with_max_lazy_peers(20);
+        assert_eq!(config.max_eager_peers, Some(5));
+        assert_eq!(config.max_lazy_peers, Some(20));
+    }
+
+    #[test]
+    fn test_lan_preset_no_ring_protection() {
+        let config = PlumtreeConfig::lan();
+        assert!(!config.protect_ring_neighbors);
+        assert!(!config.use_hash_ring);
+    }
+
+    #[test]
+    fn test_wan_preset_with_ring_protection() {
+        let config = PlumtreeConfig::wan();
+        assert!(config.protect_ring_neighbors);
+        assert!(config.use_hash_ring);
+    }
+
+    #[test]
+    fn test_large_cluster_preset_with_limits() {
+        let config = PlumtreeConfig::large_cluster();
+        assert!(config.protect_ring_neighbors);
+        assert!(config.use_hash_ring);
+        assert_eq!(config.max_eager_peers, Some(8));
+        assert_eq!(config.max_lazy_peers, Some(50));
+    }
+
+    #[test]
+    fn test_sync_config_default() {
+        let config = SyncConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.sync_interval, Duration::from_secs(30));
+        assert_eq!(config.sync_window, Duration::from_secs(90));
+        assert_eq!(config.max_batch_size, 100);
+    }
+
+    #[test]
+    fn test_sync_config_builder() {
+        let config = SyncConfig::new()
+            .with_enabled(true)
+            .with_sync_interval(Duration::from_secs(60))
+            .with_sync_window(Duration::from_secs(180))
+            .with_max_batch_size(200);
+
+        assert!(config.enabled);
+        assert_eq!(config.sync_interval, Duration::from_secs(60));
+        assert_eq!(config.sync_window, Duration::from_secs(180));
+        assert_eq!(config.max_batch_size, 200);
+    }
+
+    #[test]
+    fn test_sync_config_enabled_preset() {
+        let config = SyncConfig::enabled();
+        assert!(config.enabled);
+    }
+
+    #[test]
+    fn test_storage_config_default() {
+        let config = StorageConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.max_messages, 100_000);
+        assert_eq!(config.retention, Duration::from_secs(300));
+        assert!(config.path.is_none());
+    }
+
+    #[test]
+    fn test_storage_config_builder() {
+        let config = StorageConfig::new()
+            .with_enabled(true)
+            .with_max_messages(50_000)
+            .with_retention(Duration::from_secs(600))
+            .with_path("/tmp/plumtree");
+
+        assert!(config.enabled);
+        assert_eq!(config.max_messages, 50_000);
+        assert_eq!(config.retention, Duration::from_secs(600));
+        assert_eq!(
+            config.path,
+            Some(std::path::PathBuf::from("/tmp/plumtree"))
+        );
     }
 }

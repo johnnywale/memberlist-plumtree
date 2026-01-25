@@ -1,4 +1,4 @@
-//! High-performance integration tests for PlumtreeMemberlist.
+//! High-performance integration tests for PlumtreeDiscovery.
 //!
 //! These tests demonstrate the recommended usage pattern for production deployments:
 //! - PooledTransport for concurrency control and backpressure
@@ -13,7 +13,7 @@
 use bytes::{Buf, BufMut, Bytes};
 use memberlist_plumtree::{
     decode_plumtree_envelope, encode_plumtree_envelope, ChannelTransport, IdCodec, MessageId,
-    PlumtreeConfig, PlumtreeDelegate, PlumtreeMemberlist, PlumtreeMessage, PoolConfig,
+    PlumtreeConfig, PlumtreeDelegate, PlumtreeDiscovery, PlumtreeMessage, PoolConfig,
     PooledTransport,
 };
 use nodecraft::CheapClone;
@@ -122,7 +122,7 @@ impl PlumtreeDelegate<NodeId> for TestDelegate {
     }
 }
 
-/// A simulated network that routes messages between PlumtreeMemberlist nodes.
+/// A simulated network that routes messages between PlumtreeDiscovery nodes.
 #[allow(dead_code)]
 struct SimulatedNetwork {
     /// Map from NodeId to the incoming sender for that node
@@ -191,7 +191,7 @@ async fn test_high_performance_basic_broadcast() {
 
     // Create nodes and network
     let mut network = SimulatedNetwork::new();
-    let mut nodes: Vec<Arc<PlumtreeMemberlist<NodeId, TestDelegate>>> = Vec::new();
+    let mut nodes: Vec<Arc<PlumtreeDiscovery<NodeId, TestDelegate>>> = Vec::new();
     let mut delegates: Vec<TestDelegate> = Vec::new();
     let mut transports: Vec<Arc<PooledTransport<ChannelTransport<NodeId>, NodeId>>> = Vec::new();
 
@@ -200,7 +200,7 @@ async fn test_high_performance_basic_broadcast() {
         let delegate = TestDelegate::new();
         delegates.push(delegate.clone());
 
-        let pm = Arc::new(PlumtreeMemberlist::new(node_id, config.clone(), delegate));
+        let pm = Arc::new(PlumtreeDiscovery::new(node_id, config.clone(), delegate));
 
         // Create channel transport for unicast messages
         let (transport, unicast_rx) = ChannelTransport::bounded(1000);
@@ -304,7 +304,7 @@ async fn test_pooled_transport_concurrency() {
     };
 
     let delegate = TestDelegate::new();
-    let pm = Arc::new(PlumtreeMemberlist::new(
+    let pm = Arc::new(PlumtreeDiscovery::new(
         NodeId(0),
         config,
         delegate.clone(),
@@ -337,12 +337,12 @@ async fn test_ihave_graft_cycle() {
     let delegate1 = TestDelegate::new();
     let delegate2 = TestDelegate::new();
 
-    let pm1 = Arc::new(PlumtreeMemberlist::new(
+    let pm1 = Arc::new(PlumtreeDiscovery::new(
         NodeId(1),
         config.clone(),
         delegate1.clone(),
     ));
-    let pm2 = Arc::new(PlumtreeMemberlist::new(
+    let pm2 = Arc::new(PlumtreeDiscovery::new(
         NodeId(2),
         config,
         delegate2.clone(),
@@ -423,7 +423,7 @@ async fn test_duplicate_handling() {
     let config = PlumtreeConfig::default();
     let delegate = TestDelegate::new();
 
-    let pm = Arc::new(PlumtreeMemberlist::new(
+    let pm = Arc::new(PlumtreeDiscovery::new(
         NodeId(0),
         config,
         delegate.clone(),
@@ -462,7 +462,7 @@ async fn test_peer_topology_management() {
         .with_max_peers(10);
 
     let delegate = TestDelegate::new();
-    let pm = Arc::new(PlumtreeMemberlist::new(
+    let pm = Arc::new(PlumtreeDiscovery::new(
         NodeId(0),
         config,
         delegate,
@@ -495,7 +495,7 @@ async fn test_graceful_shutdown() {
     let config = PlumtreeConfig::default();
     let delegate = TestDelegate::new();
 
-    let pm = Arc::new(PlumtreeMemberlist::new(
+    let pm = Arc::new(PlumtreeDiscovery::new(
         NodeId(0),
         config,
         delegate,
@@ -599,13 +599,13 @@ async fn test_high_throughput_broadcast() {
 
     let _pool_config = PoolConfig::high_throughput();
 
-    let mut nodes: Vec<Arc<PlumtreeMemberlist<NodeId, TestDelegate>>> = Vec::new();
+    let mut nodes: Vec<Arc<PlumtreeDiscovery<NodeId, TestDelegate>>> = Vec::new();
     let mut delegates: Vec<TestDelegate> = Vec::new();
 
     for i in 0..NUM_NODES {
         let delegate = TestDelegate::new();
         delegates.push(delegate.clone());
-        let pm = Arc::new(PlumtreeMemberlist::new(
+        let pm = Arc::new(PlumtreeDiscovery::new(
             NodeId(i),
             config.clone(),
             delegate,

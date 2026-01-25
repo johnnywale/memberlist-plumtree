@@ -24,7 +24,7 @@ Plumtree is a gossip protocol that achieves O(n) message complexity while mainta
 │                     MemberlistStack                              │
 │  (Full integration - Plumtree + Memberlist + auto peer sync)    │
 ├─────────────────────────────────────────────────────────────────┤
-│                    PlumtreeMemberlist                           │
+│                    PlumtreeDiscovery                           │
 │      (Integration layer - message encoding/routing)             │
 ├─────────────────────────────────────────────────────────────────┤
 │                         Plumtree                                 │
@@ -145,7 +145,7 @@ High-level API combining all components:
 
 ```
 1. Network delivers Gossip/IHave/Graft/Prune
-2. PlumtreeMemberlist decodes NetworkEnvelope
+2. PlumtreeDiscovery decodes NetworkEnvelope
 3. Plumtree.handle_message() dispatches by type:
 
    Gossip (new):
@@ -183,7 +183,7 @@ The protocol requires several background tasks for correct operation:
 | `run_outgoing_processor` | Routes unicast messages to transport | `run_with_transport()` |
 | `run_incoming_processor` | Processes messages from network | `run_incoming_processor()` |
 
-**IMPORTANT**: Always call `MemberlistStack::start()` or `PlumtreeMemberlist::run_with_transport()` to start these tasks. Without them, the protocol will not function correctly.
+**IMPORTANT**: Always call `MemberlistStack::start()` or `PlumtreeDiscovery::run_with_transport()` to start these tasks. Without them, the protocol will not function correctly.
 
 ## Transport Abstraction
 

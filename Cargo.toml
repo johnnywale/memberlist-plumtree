@@ -16,15 +16,22 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
-default = ["tokio", "metrics", "serde", "quic"]
-tokio = ["agnostic-io/tokio", "memberlist-core/tokio", "dep:tokio"]
+default = ["tokio", "metrics", "serde", "quic", "memberlist"]
+# Memberlist integration (optional - disable for standalone QUIC-only mode)
+memberlist = ["dep:memberlist-core"]
+tokio = ["agnostic-io/tokio", "memberlist-core?/tokio", "dep:tokio"]
 metrics = ["dep:metrics"]
 serde = ["dep:serde"]
 quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:webpki-roots", "dep:rustls-pemfile", "dep:thiserror", "dep:tokio"]
+# Sync and storage features
+sync = ["sha2"]
+storage = []
+storage-sled = ["storage", "sled", "bincode"]
 
 [dependencies]
 
-memberlist-core = "0.7.0"
+# Memberlist integration (optional)
+memberlist-core = { version = "0.7.0", optional = true }
 tracing = "0.1"
 
 auto_impl = "1"
@@ -52,8 +59,13 @@ rcgen = { version = "0.14", optional = true }
 webpki-roots = { version = "1", optional = true }
 rustls-pemfile = { version = "2", optional = true }
 thiserror = { version = "2", optional = true }
-# Tokio is used directly for QUIC transport (spawn_blocking, background tasks)
-tokio = { version = "1", optional = true, default-features = false, features = ["rt", "time", "sync"] }
+# Tokio is used directly for QUIC transport (spawn_blocking, background tasks, select)
+tokio = { version = "1", optional = true, default-features = false, features = ["rt", "time", "sync", "macros"] }
+
+# Sync and storage dependencies
+sha2 = { version = "0.10", optional = true }
+sled = { version = "0.34", optional = true }
+bincode = { version = "1.3", optional = true }
 
 
 # Runtime-agnostic timer

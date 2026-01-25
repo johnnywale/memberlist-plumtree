@@ -1,6 +1,6 @@
 //! End-to-End (E2E) Tests for Automated Plumtree-Memberlist Bridge.
 //!
-//! These tests verify the `PlumtreeMemberlist` correctly orchestrates the lifecycle
+//! These tests verify the `PlumtreeDiscovery` correctly orchestrates the lifecycle
 //! of a distributed cluster—from node discovery via SWIM Gossip to Plumtree
 //! topology management—without manual intervention.
 //!
@@ -46,7 +46,7 @@ use memberlist::tokio::{TokioRuntime, TokioSocketAddrResolver, TokioTcp};
 use memberlist::{Memberlist, Options as MemberlistOptions};
 use memberlist_plumtree::{
     persistence, BridgeConfig, IdCodec, LazarusHandle, MessageId, PeerTopology, PlumtreeConfig,
-    PlumtreeDelegate, PlumtreeMemberlist,
+    PlumtreeDelegate, PlumtreeDiscovery, PlumtreeNodeDelegate,
 };
 use nodecraft::resolver::socket_addr::SocketAddrResolver;
 use nodecraft::CheapClone;
@@ -273,7 +273,7 @@ impl RealStack {
 
         let delegate = TrackingDelegate::new();
 
-        let pm = Arc::new(PlumtreeMemberlist::new(
+        let pm = Arc::new(PlumtreeDiscovery::new(
             node_id.clone(),
             config,
             delegate.clone(),
@@ -282,7 +282,14 @@ impl RealStack {
         // Wrap VoidDelegate with PlumtreeNodeDelegate
         // This automatically syncs Plumtree's peer state when memberlist discovers peers
         let void_delegate = memberlist::delegate::VoidDelegate::<TestNodeId, SocketAddr>::default();
-        let plumtree_delegate = pm.wrap_delegate(void_delegate);
+        let plumtree_delegate = PlumtreeNodeDelegate::new(
+            void_delegate,
+            pm.incoming_sender(),
+            pm.outgoing_receiver(),
+            pm.peers().clone(),
+            pm.config().eager_fanout,
+            pm.config().max_peers,
+        );
 
         // Create NetTransport options
         let mut transport_opts =
@@ -1036,7 +1043,13 @@ async fn test_e2e_peer_topology_after_node_restart() {
         .chain(restarted_nodes.iter().map(|n| n.node_id()))
         .collect();
 
+    // Check original nodes (skip shutdown indices 4 and 5)
     for i in 0..total {
+        // Skip shutdown nodes - they are checked via restarted_nodes below
+        if i == shutdown_index_1 || i == shutdown_index_2 {
+            continue;
+        }
+
         let node_id = nodes[i].node_id();
         let stats = nodes[i].peer_stats();
         let topology = nodes[i].topology();
@@ -1199,8 +1212,41 @@ async fn test_e2e_network_aware_rebalancing() {
         sleep(Duration::from_millis(50)).await;
     }
 
-    // Wait for cluster to stabilize
-    sleep(Duration::from_secs(3)).await;
+    // Wait for cluster to stabilize - both memberlist AND plumtree topology
+    let max_wait = Duration::from_secs(10);
+    let start = std::time::Instant::now();
+    loop {
+        let mut all_stable = true;
+
+        // Check memberlist has all 6 members
+        let member_count = nodes[0].num_members().await;
+        if member_count < 6 {
+            all_stable = false;
+        }
+
+        // Check each node has at least 3 peers in Plumtree topology
+        if all_stable {
+            for node in &nodes {
+                let stats = node.peer_stats();
+                let total = stats.eager_count + stats.lazy_count;
+                if total < 3 {
+                    all_stable = false;
+                    break;
+                }
+            }
+        }
+
+        if all_stable {
+            break;
+        }
+
+        if start.elapsed() > max_wait {
+            println!("Warning: Timeout waiting for cluster to stabilize");
+            break;
+        }
+
+        sleep(Duration::from_millis(200)).await;
+    }
 
     // Verify cluster formed with all 6 nodes
     let member_count = nodes[0].num_members().await;
@@ -1302,7 +1348,7 @@ async fn test_e2e_network_aware_rebalancing() {
     }
 
     // Small delay to let any async operations complete
-    sleep(Duration::from_millis(100)).await;
+    sleep(Duration::from_millis(500)).await;
 
     // 6. Verify topology after rebalance
     println!("\n=== Topology After Network-Aware Rebalance ===");

@@ -11,4 +11,4 @@ mod types;
 
 pub use cache::{CacheStats, MessageCache};
 pub use id::MessageId;
-pub use types::{MessageTag, PlumtreeMessage, PlumtreeMessageRef};
+pub use types::{MessageTag, PlumtreeMessage, PlumtreeMessageRef, SyncMessage};

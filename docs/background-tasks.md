@@ -26,12 +26,12 @@ let stack = MemberlistStack::new(pm, memberlist, advertise_addr);
 stack.start(transport);
 ```
 
-### Using PlumtreeMemberlist
+### Using PlumtreeDiscovery
 
 `run_with_transport()` starts all tasks with automatic unicast handling:
 
 ```rust
-let pm = PlumtreeMemberlist::new(node_id, config, delegate);
+let pm = PlumtreeDiscovery::new(node_id, config, delegate);
 
 // This spawns all background tasks including unicast sender
 pm.run_with_transport(transport).await;
