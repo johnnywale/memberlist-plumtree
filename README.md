@@ -5,11 +5,179 @@
 [![CI](https://github.com/johnnywale/memberlist-plumtree/actions/workflows/ci.yml/badge.svg)](https://github.com/johnnywale/memberlist-plumtree/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
 
-Plumtree (Epidemic Broadcast Trees) implementation built on top of [memberlist](https://crates.io/crates/memberlist-core) for efficient **O(n)** message broadcast in distributed systems.
+Plumtree (Epidemic Broadcast Trees) implementation built on top of SWIM for efficient **O(n)** message broadcast in distributed systems. Uses [memberlist](https://crates.io/crates/memberlist-core) as the SWIM implementation.
 
 ## Overview
 
 Plumtree combines the efficiency of tree-based broadcast with the reliability of gossip protocols through a hybrid push/lazy-push approach. This makes it ideal for applications requiring reliable message dissemination across large clusters with minimal network overhead.
+
+## Why SWIM Instead of HyParView?
+
+The original [Plumtree paper](https://www.dpss.inesc-id.pt/~ler/reports/srds07.pdf) uses [HyParView](https://asc.di.fct.unl.pt/~jleitao/pdf/dsn07-leitao.pdf) as the underlying peer sampling and membership protocol. HyParView maintains a small "active view" and larger "passive view" of peers, with random shuffling to keep the overlay connected.
+
+This implementation takes a different approach by building Plumtree on top of **SWIM** (Scalable Weakly-consistent Infection-style Membership protocol) via [memberlist](https://crates.io/crates/memberlist-core).
+
+### Comparison
+
+| Aspect | HyParView | SWIM |
+|--------|-----------|-------------------|
+| **Primary Purpose** | Peer sampling for gossip | Failure detection & membership |
+| **Failure Detection** | Reactive (timeout-based) | Proactive (ping/ping-req/suspect) |
+| **Membership View** | Partial (active + passive views) | Full (all alive members) |
+| **Scalability** | ~log(n) active view | O(1) failure detection |
+| **Ecosystem** | Academic implementations | Battle-tested (HashiCorp Consul, Serf) |
+
+### Benefits of Using SWIM
+
+1. **Proven at Scale**: SWIM (via memberlist) powers HashiCorp's Consul and Serf, running in production clusters with thousands of nodes
+2. **Fast Failure Detection**: SWIM detects failures in O(log n) time with high probability
+3. **Full Membership View**: Every node knows all alive members, simplifying Plumtree's peer selection
+4. **Built-in Protocol**: No need to implement a separate membership layer - SWIM handles it
+
+### How SWIM and Plumtree Work Together
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                          SWIM Layer                              │
+│                    (cluster membership)                          │
+│                                                                 │
+│  Responsibilities:                                              │
+│  • Discover and track cluster members                           │
+│  • Detect node failures via ping/ping-req/suspect               │
+│  • Propagate membership changes (join/leave/fail)               │
+│  • Maintain full membership list                                │
+└────────────────────────────┬────────────────────────────────────┘
+                             │ Membership events (NodeJoin, NodeLeave)
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                        Plumtree Layer                            │
+│              (Epidemic Broadcast Trees)                          │
+│                                                                 │
+│  Responsibilities:                                              │
+│  • Classify peers as eager or lazy                              │
+│  • Build spanning tree for O(n) message broadcast               │
+│  • Self-heal tree when nodes fail                               │
+│  • Optimize tree topology via Graft/Prune                       │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+SWIM handles **who** is in the cluster; Plumtree manages **how** messages flow between them.
+
+## How Eager and Lazy Peers Are Maintained
+
+Each node independently classifies its peers into two sets:
+
+| Set | Purpose | Message Type | Default Count |
+|-----|---------|--------------|---------------|
+| **Eager** | Spanning tree links | GOSSIP (full payload) | 3 (`eager_fanout`) |
+| **Lazy** | Backup/repair links | IHAVE (message IDs only) | 6 (`lazy_fanout`) |
+
+### Peer Lifecycle
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                    Peer Classification Flow                     │
+├────────────────────────────────────────────────────────────────┤
+│                                                                │
+│  New peer joins (via SWIM membership event)                    │
+│         │                                                      │
+│         ▼                                                      │
+│  ┌──────────────┐                                              │
+│  │  LAZY PEER   │  ◄── All new peers start as lazy             │
+│  └──────────────┘                                              │
+│         │                                                      │
+│         │ (receives IHAVE, timeout waiting for GOSSIP)         │
+│         ▼                                                      │
+│  ┌──────────────┐                                              │
+│  │    GRAFT     │  ◄── "I need this message, add me as eager"  │
+│  └──────────────┘                                              │
+│         │                                                      │
+│         ▼                                                      │
+│  ┌──────────────┐                                              │
+│  │  EAGER PEER  │  ◄── Now receives full messages              │
+│  └──────────────┘                                              │
+│         │                                                      │
+│         │ (receives duplicate from multiple eager peers)       │
+│         ▼                                                      │
+│  ┌──────────────┐                                              │
+│  │    PRUNE     │  ◄── "I already have this, demote me"        │
+│  └──────────────┘                                              │
+│         │                                                      │
+│         ▼                                                      │
+│  ┌──────────────┐                                              │
+│  │  LAZY PEER   │  ◄── Back to lazy, tree optimized            │
+│  └──────────────┘                                              │
+│                                                                │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### Promotion (Lazy → Eager)
+
+A lazy peer is promoted to eager when:
+
+1. **GRAFT received**: The peer sends a GRAFT request for a missing message
+2. **Topology repair**: An eager peer fails and needs replacement
+3. **Initial connection**: Hash ring neighbors are auto-promoted for connectivity
+
+### Demotion (Eager → Lazy)
+
+An eager peer is demoted to lazy when:
+
+1. **PRUNE received**: The peer sends a PRUNE after receiving a duplicate message
+2. **Rebalancing**: Too many eager peers (above `eager_fanout` target)
+
+### Hash Ring Topology (Optional)
+
+When `local_id` is configured, this implementation uses a **deterministic hash ring** for peer selection:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Hash Ring Topology                            │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│         [Node 7]                      [Node 2]                  │
+│              \                        /                         │
+│               \    [Node 0 (local)]  /                          │
+│                \        │           /                           │
+│                 ◄───────┼──────────►                            │
+│               (i-1)     │        (i+1)                          │
+│          predecessor    │      successor                        │
+│                         │                                       │
+│     ◄───────────────────┼───────────────────►                   │
+│   (i-X/4)               │               (i+X/4)                 │
+│  long-range jump        │          long-range jump              │
+│                                                                 │
+│  Ring Position = Hash(NodeID) mod RingSize                      │
+│                                                                 │
+│  Protected Neighbors (always eager, never demoted):             │
+│  • i±1 (adjacent) - basic ring connectivity                     │
+│  • i±2 (second-nearest) - Z≥2 redundancy                        │
+│                                                                 │
+│  Performance Links (eager but can be demoted):                  │
+│  • i±X/4 (long-range) - reduce network diameter                 │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Benefits of hash ring topology**:
+
+- **Deterministic**: Same membership = same topology across restarts
+- **Z≥2 Redundancy**: Adjacent neighbors protected from demotion
+- **Reduced Diameter**: Long-range jumps shorten message paths
+- **Churn Resilience**: Only affected neighbors need reconnection
+
+### RTT-Based Peer Scoring
+
+For non-ring-neighbor positions, peers are scored using a hybrid algorithm:
+
+```
+hybrid_score = (topology_score × 0.4) + (network_score × 0.6)
+```
+
+- **Topology score**: Based on hash ring distance (closer = higher)
+- **Network score**: Based on RTT and reliability (faster = higher)
+
+This creates a naturally optimized tree where messages flow through the fastest, most reliable paths while maintaining structural connectivity guarantees.
 
 ### Key Features
 
@@ -208,9 +376,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2. Create delegate for auto peer sync
     let delegate = PlumtreeNodeDelegate::new(1u64, NoopDelegate, pm.clone());
 
-    // 3. Create memberlist and stack (see full example for transport setup)
-    // let memberlist = Memberlist::new(transport, delegate, options).await?;
-    // let stack = MemberlistStack::new(pm, memberlist, advertise_addr);
+    // 3. Create SWIM instance and stack (see full example for transport setup)
+    // let swim = Memberlist::new(transport, delegate, options).await?;
+    // let stack = MemberlistStack::new(pm, swim, advertise_addr);
 
     // 4. CRITICAL: Start background tasks
     // let (transport, _rx) = ChannelTransport::bounded(1024);
@@ -579,11 +747,11 @@ plumtree.handle_message(from_peer, message); // Manual message handling
 
 ### `PlumtreeMemberlist` - Simplified Integration
 
-The `PlumtreeMemberlist` struct wraps `Plumtree` with a simpler API designed for integration with [memberlist](https://crates.io/crates/memberlist-core). Use this when:
+The `PlumtreeMemberlist` struct wraps `Plumtree` with a simpler API designed for integration with SWIM. Use this when:
 
 - You want a simpler broadcast API without manual message handling
-- You're using memberlist for cluster membership and peer discovery
-- You want automatic peer management based on memberlist events
+- You're using SWIM for cluster membership and peer discovery
+- You want automatic peer management based on SWIM membership events
 
 ```rust
 use memberlist_plumtree::{PlumtreeMemberlist, PlumtreeConfig, NoopDelegate};
@@ -595,7 +763,7 @@ let plumtree_ml = PlumtreeMemberlist::new(
     NoopDelegate,
 );
 
-// Add peers discovered via memberlist
+// Add peers discovered via SWIM
 plumtree_ml.add_peer(peer_id);
 
 // Broadcast - message reaches all nodes via spanning tree
@@ -614,7 +782,7 @@ let cache_stats = plumtree_ml.cache_stats();
 
 ### `MemberlistStack` - Full Integration (Recommended)
 
-The `MemberlistStack` struct provides the complete integration stack, combining Plumtree with a real Memberlist instance for automatic SWIM-based peer discovery. **This is the recommended entry point** for production deployments:
+The `MemberlistStack` struct provides the complete integration stack, combining Plumtree with SWIM for automatic peer discovery. **This is the recommended entry point** for production deployments:
 
 ```rust
 use memberlist_plumtree::{
@@ -635,14 +803,14 @@ let pm = Arc::new(PlumtreeMemberlist::new(
 // 2. Create PlumtreeNodeDelegate for auto peer sync
 let delegate = PlumtreeNodeDelegate::new(
     node_id.clone(),
-    NoopDelegate,  // Or your memberlist delegate
+    NoopDelegate,  // Or your SWIM delegate
     pm.clone(),
 );
 
-// 3. Create memberlist with transport
+// 3. Create SWIM instance (via memberlist) with transport
 let memberlist = Memberlist::new(transport, delegate, Options::default()).await?;
 
-// 4. Build the complete stack
+// 4. Build the complete stack (Plumtree + SWIM)
 let stack = MemberlistStack::new(pm, memberlist, advertise_addr);
 
 // 5. CRITICAL: Start background tasks!
@@ -674,10 +842,10 @@ stack.shutdown().await?;
 > - Tree self-healing will be broken
 
 **Key features of `MemberlistStack`**:
-- **Automatic peer discovery**: SWIM protocol discovers peers without manual `add_peer()` calls
+- **Automatic peer discovery**: SWIM discovers peers without manual `add_peer()` calls
 - **Simplified join API**: Just pass seed addresses, no need to deal with `MaybeResolvedAddress`
-- **Integrated lifecycle**: Single struct manages both Memberlist and Plumtree
-- **Peer sync**: `PlumtreeNodeDelegate` automatically syncs Plumtree peers when Memberlist membership changes
+- **Integrated lifecycle**: Single struct manages both SWIM and Plumtree
+- **Peer sync**: `PlumtreeNodeDelegate` automatically syncs Plumtree peers when SWIM membership changes
 - **Lazarus seed recovery**: Automatic reconnection to restarted seed nodes (see below)
 - **Peer persistence**: Save known peers to disk for crash recovery
 
@@ -777,7 +945,7 @@ let path = PathBuf::from(format!("/var/lib/myapp/{}/peers.txt", node_id));
 |-----|----------|
 | `Plumtree` | Custom transport, fine-grained control |
 | `PlumtreeMemberlist` | Manual peer management, testing |
-| `MemberlistStack` | **Production** - full SWIM + Plumtree integration |
+| `MemberlistStack` | **Production** - full SWIM + Plumtree integration (recommended) |
 
 ## Examples
 
