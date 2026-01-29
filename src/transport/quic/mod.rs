@@ -31,11 +31,11 @@
 //!
 //! # Configuration Presets
 //!
-//! - [`QuicConfig::default()`]: General-purpose defaults
-//! - [`QuicConfig::lan()`]: LAN-optimized (BBR, shorter timeouts)
-//! - [`QuicConfig::wan()`]: WAN-optimized (Cubic, longer timeouts)
-//! - [`QuicConfig::large_cluster()`]: Large clusters (high connection limits)
-//! - [`QuicConfig::insecure_dev()`]: Development only (self-signed certs)
+//! - [`QuicConfig::default()`] - General-purpose defaults
+//! - [`QuicConfig::lan()`] - LAN-optimized (BBR, shorter timeouts)
+//! - [`QuicConfig::wan()`] - WAN-optimized (Cubic, longer timeouts)
+//! - [`QuicConfig::large_cluster()`] - Large clusters (high connection limits)
+//! - [`QuicConfig::insecure_dev()`] - Development only (self-signed certs)
 //!
 //! # 0-RTT Early Data
 //!

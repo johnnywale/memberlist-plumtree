@@ -87,8 +87,8 @@ impl SyncState {
         let hash: [u8; 32] = hasher.finalize().into();
 
         // XOR into root (O(1))
-        for i in 0..32 {
-            self.root_hash[i] ^= hash[i];
+        for (dest, src) in self.root_hash.iter_mut().zip(hash.iter()) {
+            *dest ^= src;
         }
 
         self.leaves.insert(id, hash);
@@ -106,8 +106,8 @@ impl SyncState {
     pub fn remove(&mut self, id: &MessageId) {
         if let Some(hash) = self.leaves.remove(id) {
             // XOR out of root (O(1))
-            for i in 0..32 {
-                self.root_hash[i] ^= hash[i];
+            for (dest, src) in self.root_hash.iter_mut().zip(hash.iter()) {
+                *dest ^= src;
             }
         }
     }

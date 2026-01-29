@@ -4,21 +4,25 @@
 
 #![cfg(feature = "quic")]
 
+mod common;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use common::allocate_port;
 use memberlist_plumtree::{MapPeerResolver, PeerResolver, QuicConfig, QuicTransport, Transport};
 
 /// Get an available port for testing.
-fn get_test_addr(port: u16) -> SocketAddr {
-    format!("127.0.0.1:{}", port).parse().unwrap()
+fn get_test_addr() -> SocketAddr {
+    format!("127.0.0.1:{}", allocate_port()).parse().unwrap()
 }
 
 #[tokio::test]
 async fn test_quic_transport_creation() {
-    let addr = get_test_addr(19000);
+    let addr = get_test_addr();
+    let expected_port = addr.port();
     let resolver = MapPeerResolver::<u64>::new(addr);
 
     let config = QuicConfig::insecure_dev();
@@ -33,7 +37,7 @@ async fn test_quic_transport_creation() {
     let transport = transport.unwrap();
     let local_addr = transport.local_addr();
     assert!(local_addr.is_ok());
-    assert_eq!(local_addr.unwrap().port(), 19000);
+    assert_eq!(local_addr.unwrap().port(), expected_port);
 }
 
 #[tokio::test]
@@ -57,7 +61,7 @@ async fn test_quic_config_presets() {
 
 #[tokio::test]
 async fn test_quic_transport_peer_not_found() {
-    let addr = get_test_addr(19001);
+    let addr = get_test_addr();
     let resolver = MapPeerResolver::<u64>::new(addr);
     // Don't add any peers
 
@@ -74,7 +78,7 @@ async fn test_quic_transport_peer_not_found() {
 
 #[tokio::test]
 async fn test_quic_transport_stats() {
-    let addr = get_test_addr(19002);
+    let addr = get_test_addr();
     let resolver = MapPeerResolver::<u64>::new(addr);
 
     let config = QuicConfig::insecure_dev();
@@ -88,7 +92,7 @@ async fn test_quic_transport_stats() {
 
 #[tokio::test]
 async fn test_quic_transport_shutdown() {
-    let addr = get_test_addr(19003);
+    let addr = get_test_addr();
     let resolver = MapPeerResolver::<u64>::new(addr);
 
     let config = QuicConfig::insecure_dev();
@@ -138,7 +142,7 @@ async fn test_resolver_operations() {
 
 #[tokio::test]
 async fn test_shared_resolver() {
-    let addr = get_test_addr(19004);
+    let addr = get_test_addr();
     let resolver = Arc::new(MapPeerResolver::<u64>::new(addr));
 
     let config = QuicConfig::insecure_dev();
@@ -155,7 +159,7 @@ async fn test_shared_resolver() {
 
 #[tokio::test]
 async fn test_quic_transport_clone() {
-    let addr = get_test_addr(19005);
+    let addr = get_test_addr();
     let resolver = MapPeerResolver::<u64>::new(addr);
 
     let config = QuicConfig::insecure_dev();

@@ -40,7 +40,10 @@
 
 #![cfg(all(feature = "tokio"))]
 
+mod common;
+
 use bytes::{Buf, BufMut, Bytes};
+use common::allocate_port;
 use memberlist::net::NetTransportOptions;
 use memberlist::tokio::{TokioRuntime, TokioSocketAddrResolver, TokioTcp};
 use memberlist::{Memberlist, Options as MemberlistOptions};
@@ -261,7 +264,7 @@ impl RealStack {
     ///
     /// # Arguments
     /// * `name` - Node name/ID
-    /// * `port` - Port for SWIM gossip (0 for random)
+    /// * `port` - Port for SWIM gossip (0 for auto-allocated)
     /// * `config` - Custom PlumtreeConfig
     async fn new_with_config(
         name: &str,
@@ -269,7 +272,9 @@ impl RealStack {
         config: PlumtreeConfig,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let node_id = TestNodeId(name.to_string());
-        let bind_addr: SocketAddr = format!("127.0.0.1:{}", port).parse()?;
+        // Use port allocator when port is 0 to avoid Windows socket permission errors
+        let actual_port = if port == 0 { allocate_port() } else { port };
+        let bind_addr: SocketAddr = format!("127.0.0.1:{}", actual_port).parse()?;
 
         let delegate = TrackingDelegate::new();
 

@@ -5,7 +5,10 @@
 
 #![cfg(all(feature = "quic", feature = "tokio"))]
 
+mod common;
+
 use bytes::Bytes;
+use common::allocate_ports;
 use memberlist_plumtree::{
     encode_plumtree_envelope, IncomingConfig, MapPeerResolver, MessageId, PlumtreeMessage,
     QuicConfig, QuicTransport, Transport,
@@ -17,9 +20,10 @@ use std::time::Duration;
 /// Test that two nodes can send messages to each other over QUIC.
 #[tokio::test]
 async fn test_bidirectional_quic_communication() {
-    // Create two nodes
-    let addr1: SocketAddr = "127.0.0.1:19001".parse().unwrap();
-    let addr2: SocketAddr = "127.0.0.1:19002".parse().unwrap();
+    // Allocate ports to avoid Windows socket permission errors
+    let ports = allocate_ports(2);
+    let addr1: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr2: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
 
     // Create resolvers
     let resolver1 = Arc::new(MapPeerResolver::<u64>::new(addr1));
@@ -115,8 +119,9 @@ async fn test_bidirectional_quic_communication() {
 /// Test multiple messages in sequence.
 #[tokio::test]
 async fn test_multiple_messages() {
-    let addr1: SocketAddr = "127.0.0.1:19003".parse().unwrap();
-    let addr2: SocketAddr = "127.0.0.1:19004".parse().unwrap();
+    let ports = allocate_ports(2);
+    let addr1: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr2: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
 
     let resolver1 = Arc::new(MapPeerResolver::<u64>::new(addr1));
     resolver1.add_peer(2, addr2);
@@ -175,8 +180,9 @@ async fn test_multiple_messages() {
 /// Test IHave message type.
 #[tokio::test]
 async fn test_ihave_message() {
-    let addr1: SocketAddr = "127.0.0.1:19005".parse().unwrap();
-    let addr2: SocketAddr = "127.0.0.1:19006".parse().unwrap();
+    let ports = allocate_ports(2);
+    let addr1: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr2: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
 
     let resolver1 = Arc::new(MapPeerResolver::<u64>::new(addr1));
     resolver1.add_peer(2, addr2);
@@ -229,8 +235,9 @@ async fn test_ihave_message() {
 /// Test Graft message type.
 #[tokio::test]
 async fn test_graft_message() {
-    let addr1: SocketAddr = "127.0.0.1:19007".parse().unwrap();
-    let addr2: SocketAddr = "127.0.0.1:19008".parse().unwrap();
+    let ports = allocate_ports(2);
+    let addr1: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr2: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
 
     let resolver1 = Arc::new(MapPeerResolver::<u64>::new(addr1));
     resolver1.add_peer(2, addr2);
@@ -279,8 +286,9 @@ async fn test_graft_message() {
 /// Test Prune message type.
 #[tokio::test]
 async fn test_prune_message() {
-    let addr1: SocketAddr = "127.0.0.1:19009".parse().unwrap();
-    let addr2: SocketAddr = "127.0.0.1:19010".parse().unwrap();
+    let ports = allocate_ports(2);
+    let addr1: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+    let addr2: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
 
     let resolver1 = Arc::new(MapPeerResolver::<u64>::new(addr1));
     resolver1.add_peer(2, addr2);

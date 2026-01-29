@@ -18,7 +18,10 @@
 
 #![cfg(all(feature = "tokio", feature = "sync"))]
 
+mod common;
+
 use bytes::{Buf, BufMut, Bytes};
+use common::allocate_port;
 use memberlist::net::NetTransportOptions;
 use memberlist::tokio::{TokioRuntime, TokioSocketAddrResolver, TokioTcp};
 use memberlist::{Memberlist, Options as MemberlistOptions};
@@ -254,7 +257,9 @@ impl RealStack {
         config: PlumtreeConfig,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let node_id = TestNodeId(name.to_string());
-        let bind_addr: SocketAddr = format!("127.0.0.1:{}", port).parse()?;
+        // Use port allocator when port is 0 to avoid Windows socket permission errors
+        let actual_port = if port == 0 { allocate_port() } else { port };
+        let bind_addr: SocketAddr = format!("127.0.0.1:{}", actual_port).parse()?;
 
         let delegate = TrackingDelegate::new();
 

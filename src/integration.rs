@@ -17,7 +17,6 @@
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use nodecraft::Id;
-use smallvec::SmallVec;
 use std::{fmt::Debug, hash::Hash, sync::Arc};
 
 
@@ -28,7 +27,7 @@ use crate::{
     peer_state::PeerState,
     plumtree::{Plumtree, PlumtreeDelegate, PlumtreeHandle},
     storage::{current_time_ms, MemoryStore, MessageStore, StoredMessage},
-    sync::SyncHandler,
+    sync::{PlumtreeSyncStrategy, SyncHandler, SyncStrategy},
 };
 
 /// Storage type alias for convenience.
@@ -304,7 +303,7 @@ impl<I: IdCodec> UnicastEnvelope<I> {
 /// //     pm.incoming_sender().send((sender_id, message)).await.ok();
 /// // }
 /// ```
-/// Combined Plumtree + Memberlist system with configurable storage.
+/// Combined Plumtree + Memberlist system with configurable storage and sync strategy.
 ///
 /// # Type Parameters
 ///
@@ -316,7 +315,16 @@ impl<I: IdCodec> UnicastEnvelope<I> {
 ///
 /// Use [`PlumtreeDiscovery::new`] for in-memory storage (default).
 /// Use [`PlumtreeDiscovery::with_storage`] to provide a custom storage backend.
-pub struct PlumtreeDiscovery<I, PD, S = DefaultStore>
+///
+/// # Sync Strategy
+///
+/// By default, `PlumtreeDiscovery` uses [`PlumtreeSyncStrategy`] which runs its own
+/// background sync task. When using memberlist discovery, you can use
+/// [`MemberlistSyncStrategy`] to piggyback on memberlist's push-pull mechanism.
+///
+/// [`PlumtreeSyncStrategy`]: crate::sync::PlumtreeSyncStrategy
+/// [`MemberlistSyncStrategy`]: crate::sync::MemberlistSyncStrategy
+pub struct PlumtreeDiscovery<I, PD, S = DefaultStore, SS = PlumtreeSyncStrategy<I, S>>
 where
     I: Id,
     S: MessageStore,
@@ -340,13 +348,15 @@ where
     unicast_tx: async_channel::Sender<UnicastEnvelope<I>>,
     /// Message storage for sync/persistence.
     store: Arc<S>,
-    /// Sync handler for anti-entropy.
+    /// Sync handler for anti-entropy state (shared with sync_strategy).
     sync_handler: Arc<SyncHandler<S>>,
+    /// Sync strategy for anti-entropy.
+    sync_strategy: SS,
 }
 
-impl<I, PD> PlumtreeDiscovery<I, PD, DefaultStore>
+impl<I, PD> PlumtreeDiscovery<I, PD, DefaultStore, PlumtreeSyncStrategy<I, DefaultStore>>
 where
-    I: Id + IdCodec + Clone + Eq + Hash + Debug + Send + Sync + 'static,
+    I: Id + IdCodec + Clone + Eq + Hash + Ord + Debug + Send + Sync + 'static,
     PD: PlumtreeDelegate<I>,
 {
     /// Create a new PlumtreeDiscovery instance with default in-memory storage.
@@ -364,7 +374,11 @@ where
     ///
     /// Use [`with_storage`](Self::with_storage) to provide a custom storage backend
     /// (e.g., Sled for persistence).
-    pub fn new(local_id: I, config: PlumtreeConfig, delegate: PD) -> Self {
+    pub fn new(
+        local_id: I,
+        config: PlumtreeConfig,
+        delegate: PD,
+    ) -> PlumtreeDiscovery<I, PD, DefaultStore, PlumtreeSyncStrategy<I, DefaultStore>> {
         // Create storage based on config
         let max_messages = config
             .storage
@@ -373,7 +387,7 @@ where
             .unwrap_or(100_000);
         let store = Arc::new(MemoryStore::new(max_messages));
 
-        Self::with_storage(local_id, config, delegate, store)
+        PlumtreeDiscovery::with_storage(local_id, config, delegate, store)
     }
 
     /// Create a PlumtreeDiscovery from a PlumtreeStackConfig with MemberlistDiscovery.
@@ -409,21 +423,25 @@ where
     pub fn from_stack_config<D>(
         config: &crate::PlumtreeStackConfig<I, D>,
         delegate: PD,
-    ) -> Self
+    ) -> PlumtreeDiscovery<I, PD, DefaultStore, PlumtreeSyncStrategy<I, DefaultStore>>
     where
         D: crate::discovery::ClusterDiscovery<I>,
     {
-        Self::new(config.local_id.clone(), config.plumtree.clone(), delegate)
+        PlumtreeDiscovery::new(config.local_id.clone(), config.plumtree.clone(), delegate)
     }
 }
 
-impl<I, PD, S> PlumtreeDiscovery<I, PD, S>
+impl<I, PD, S> PlumtreeDiscovery<I, PD, S, PlumtreeSyncStrategy<I, S>>
 where
-    I: Id + IdCodec + Clone + Eq + Hash + Debug + Send + Sync + 'static,
+    I: Id + IdCodec + Clone + Eq + Hash + Ord + Debug + Send + Sync + 'static,
     PD: PlumtreeDelegate<I>,
     S: MessageStore + 'static,
 {
     /// Create a new PlumtreeDiscovery instance with a custom storage backend.
+    ///
+    /// Uses [`PlumtreeSyncStrategy`] by default, which runs its own background
+    /// sync task. Use [`with_sync_strategy`](Self::with_sync_strategy) for
+    /// custom sync behavior.
     ///
     /// # Arguments
     ///
@@ -440,7 +458,14 @@ where
     /// let store = Arc::new(SledStore::open("/tmp/plumtree")?);
     /// let pm = PlumtreeDiscovery::with_storage(node_id, config, delegate, store);
     /// ```
-    pub fn with_storage(local_id: I, config: PlumtreeConfig, delegate: PD, store: Arc<S>) -> Self {
+    ///
+    /// [`PlumtreeSyncStrategy`]: crate::sync::PlumtreeSyncStrategy
+    pub fn with_storage(
+        local_id: I,
+        config: PlumtreeConfig,
+        delegate: PD,
+        store: Arc<S>,
+    ) -> PlumtreeDiscovery<I, PD, S, PlumtreeSyncStrategy<I, S>> {
         // Create channels for communication
         let (incoming_tx, incoming_rx) = async_channel::bounded(1024);
         let (outgoing_tx, outgoing_rx) = async_channel::bounded(1024);
@@ -456,9 +481,20 @@ where
         let config = config.with_hash_ring(true);
 
         // Create the Plumtree instance
-        let (plumtree, handle) = Plumtree::new(local_id, config, event_handler);
+        let (plumtree, handle) = Plumtree::new(local_id.clone(), config, event_handler);
 
-        Self {
+        // Create default sync strategy (PlumtreeSyncStrategy)
+        let sync_config = plumtree.config().sync.clone().unwrap_or_default();
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sync_strategy = PlumtreeSyncStrategy::new(
+            local_id,
+            sync_handler.clone(),
+            plumtree.peers().clone(),
+            sync_config,
+            shutdown,
+        );
+
+        PlumtreeDiscovery {
             plumtree,
             handle,
             incoming_tx,
@@ -469,6 +505,90 @@ where
             unicast_tx,
             store,
             sync_handler,
+            sync_strategy,
+        }
+    }
+}
+
+impl<I, PD, S, SS> PlumtreeDiscovery<I, PD, S, SS>
+where
+    I: Id + IdCodec + Clone + Eq + Hash + Debug + Send + Sync + 'static,
+    PD: PlumtreeDelegate<I>,
+    S: MessageStore + 'static,
+    SS: SyncStrategy<I, S>,
+{
+    /// Create a new PlumtreeDiscovery with a custom sync strategy.
+    ///
+    /// Use this when you want to use a different sync mechanism, such as
+    /// [`MemberlistSyncStrategy`] when using memberlist for discovery.
+    ///
+    /// **Important**: The `sync_handler` must be the same instance used to create
+    /// the `sync_strategy`. This ensures consistent sync state across all components.
+    ///
+    /// # Arguments
+    ///
+    /// * `local_id` - The local node's identifier
+    /// * `config` - Plumtree configuration
+    /// * `delegate` - Application delegate for message delivery
+    /// * `store` - Storage backend for message persistence
+    /// * `sync_handler` - Shared sync handler (must be same as used in strategy)
+    /// * `sync_strategy` - Custom sync strategy
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use memberlist_plumtree::{PlumtreeDiscovery, sync::{MemberlistSyncStrategy, SyncHandler}};
+    ///
+    /// let (sync_tx, sync_rx) = async_channel::bounded(64);
+    /// let sync_handler = Arc::new(SyncHandler::new(store.clone()));
+    /// let strategy = MemberlistSyncStrategy::new(
+    ///     sync_handler.clone(),
+    ///     Duration::from_secs(90),
+    ///     sync_tx,
+    /// );
+    ///
+    /// let pm = PlumtreeDiscovery::with_sync_strategy(
+    ///     node_id, config, delegate, store,
+    ///     sync_handler.clone(),  // Same sync_handler!
+    ///     strategy,
+    /// );
+    /// ```
+    ///
+    /// [`MemberlistSyncStrategy`]: crate::sync::MemberlistSyncStrategy
+    pub fn with_sync_strategy(
+        local_id: I,
+        config: PlumtreeConfig,
+        delegate: PD,
+        store: Arc<S>,
+        sync_handler: Arc<SyncHandler<S>>,
+        sync_strategy: SS,
+    ) -> PlumtreeDiscovery<I, PD, S, SS> {
+        // Create channels for communication
+        let (incoming_tx, incoming_rx) = async_channel::bounded(1024);
+        let (outgoing_tx, outgoing_rx) = async_channel::bounded(1024);
+        let (unicast_tx, unicast_rx) = async_channel::bounded(1024);
+
+        // Create the event handler with the shared sync handler
+        let event_handler = PlumtreeEventHandler::new(delegate, store.clone(), sync_handler.clone());
+
+        // Force hash ring topology for PlumtreeDiscovery
+        let config = config.with_hash_ring(true);
+
+        // Create the Plumtree instance
+        let (plumtree, handle) = Plumtree::new(local_id, config, event_handler);
+
+        PlumtreeDiscovery {
+            plumtree,
+            handle,
+            incoming_tx,
+            incoming_rx,
+            outgoing_rx,
+            outgoing_tx,
+            unicast_rx,
+            unicast_tx,
+            store,
+            sync_handler,
+            sync_strategy,
         }
     }
 
@@ -847,102 +967,49 @@ where
     }
 
     /// Handle a sync protocol message.
+    ///
+    /// Delegates to the configured [`SyncStrategy`] for handling.
     async fn handle_sync_message(&self, from: I, sync_msg: SyncMessage) -> Result<()> {
         let local_id = self.plumtree.local_id().clone();
 
-        match sync_msg {
-            SyncMessage::Request {
-                root_hash,
-                time_start,
-                time_end,
-            } => {
-                tracing::debug!(?from, "handling sync request");
-                let response = self
-                    .sync_handler
-                    .handle_sync_request(root_hash, (time_start, time_end))
-                    .await;
+        // Handle SyncPush specially - deliver messages through Plumtree
+        if let SyncMessage::Push { messages } = &sync_msg {
+            tracing::debug!(?from, count = messages.len(), "received sync push");
 
+            // Deliver each message through the normal Plumtree path
+            for (id, round, payload) in messages {
+                let gossip = PlumtreeMessage::Gossip {
+                    id: *id,
+                    round: *round,
+                    payload: payload.clone(),
+                };
+                if let Err(e) = self.plumtree.handle_message(from.clone(), gossip).await {
+                    tracing::warn!("failed to deliver synced message {:?}: {}", id, e);
+                }
+            }
+            return Ok(());
+        }
+
+        // Delegate other sync messages to the strategy
+        match self
+            .sync_strategy
+            .handle_sync_message(from.clone(), sync_msg)
+            .await
+        {
+            Ok(Some(response_msg)) => {
                 // Send response back to requester
-                let response_msg = PlumtreeMessage::Sync(SyncMessage::Response {
-                    matches: response.matches,
-                    message_ids: SmallVec::from_vec(response.message_ids),
-                    has_more: response.has_more,
-                });
                 let envelope = UnicastEnvelope {
                     sender: local_id,
                     target: from,
-                    message: response_msg,
+                    message: PlumtreeMessage::Sync(response_msg),
                 };
                 let _ = self.unicast_tx.send(envelope).await;
             }
-
-            SyncMessage::Response {
-                matches,
-                message_ids,
-                has_more: _,
-            } => {
-                if matches {
-                    tracing::debug!(?from, "sync complete - hashes match");
-                    return Ok(());
-                }
-
-                tracing::debug!(?from, ids = message_ids.len(), "sync response - checking for missing");
-
-                // Check which messages we're missing
-                if let Some(pull) = self
-                    .sync_handler
-                    .handle_sync_response(message_ids.to_vec())
-                    .await
-                {
-                    // Request missing messages
-                    let pull_msg = PlumtreeMessage::Sync(SyncMessage::Pull {
-                        message_ids: SmallVec::from_vec(pull.message_ids),
-                    });
-                    let envelope = UnicastEnvelope {
-                        sender: local_id,
-                        target: from,
-                        message: pull_msg,
-                    };
-                    let _ = self.unicast_tx.send(envelope).await;
-                }
+            Ok(None) => {
+                // No response needed
             }
-
-            SyncMessage::Pull { message_ids } => {
-                tracing::debug!(?from, ids = message_ids.len(), "handling sync pull");
-
-                // Get requested messages from storage
-                let push = self
-                    .sync_handler
-                    .handle_sync_pull(message_ids.to_vec())
-                    .await;
-
-                // Send messages back
-                let messages: Vec<(MessageId, u32, Bytes)> = push
-                    .messages
-                    .into_iter()
-                    .map(|m| (m.id, m.round, m.payload))
-                    .collect();
-
-                let push_msg = PlumtreeMessage::Sync(SyncMessage::Push { messages });
-                let envelope = UnicastEnvelope {
-                    sender: local_id,
-                    target: from,
-                    message: push_msg,
-                };
-                let _ = self.unicast_tx.send(envelope).await;
-            }
-
-            SyncMessage::Push { messages } => {
-                tracing::debug!(?from, count = messages.len(), "received sync push");
-
-                // Deliver each message through the normal Plumtree path
-                for (id, round, payload) in messages {
-                    // Create a Gossip message and process it
-                    let gossip = PlumtreeMessage::Gossip { id, round, payload };
-                    if let Err(e) = self.plumtree.handle_message(from.clone(), gossip).await {
-                        tracing::warn!("failed to deliver synced message {:?}: {}", id, e);
-                    }
-                }
+            Err(e) => {
+                tracing::warn!("sync strategy error: {}", e);
             }
         }
 
@@ -951,68 +1018,32 @@ where
 
     /// Run anti-entropy sync background task.
     ///
-    /// Periodically initiates sync with random peers to recover missed messages.
+    /// Delegates to the configured [`SyncStrategy`]:
+    /// - For strategies that need a background task (e.g., `PlumtreeSyncStrategy`),
+    ///   runs periodic sync with random peers
+    /// - For strategies using external sync (e.g., `MemberlistSyncStrategy`),
+    ///   this is a no-op since sync happens via memberlist's push-pull mechanism
     async fn run_anti_entropy_sync<T>(&self, transport: T)
     where
         T: crate::Transport<I>,
     {
-        let Some(ref sync_config) = self.plumtree.config().sync else {
-            tracing::info!("Anti-entropy sync not configured");
-            return;
-        };
-
-        if !sync_config.enabled {
-            tracing::info!("Anti-entropy sync disabled");
+        // Check if strategy is enabled
+        if !self.sync_strategy.is_enabled() {
+            tracing::info!("Anti-entropy sync disabled by strategy");
             return;
         }
 
-        tracing::info!(
-            interval_s = sync_config.sync_interval.as_secs(),
-            window_s = sync_config.sync_window.as_secs(),
-            "Anti-entropy sync started"
-        );
-
-        let local_id = self.plumtree.local_id().clone();
-
-        loop {
-            if self.plumtree.is_shutdown() {
-                tracing::info!("Anti-entropy sync shutting down");
-                break;
-            }
-
-            // Wait for sync interval
-            futures_timer::Delay::new(sync_config.sync_interval).await;
-
-            // Check for shutdown after waking
-            if self.plumtree.is_shutdown() {
-                break;
-            }
-
-            // Pick a random peer
-            if let Some(peer) = self.plumtree.peers().random_peer() {
-                tracing::debug!(?peer, "initiating sync with peer");
-
-                // Calculate time range for sync
-                let now = current_time_ms();
-                let start = now.saturating_sub(sync_config.sync_window.as_millis() as u64);
-
-                // Get our root hash
-                let root_hash = self.sync_handler.root_hash();
-
-                // Send sync request
-                let request = PlumtreeMessage::Sync(SyncMessage::Request {
-                    root_hash,
-                    time_start: start,
-                    time_end: now,
-                });
-
-                let encoded = encode_plumtree_envelope(&local_id, &request);
-                if let Err(e) = transport.send_to(&peer, encoded).await {
-                    tracing::warn!(?peer, "failed to send sync request: {}", e);
-                }
-            } else {
-                tracing::trace!("no peers available for sync");
-            }
+        // Only run background task if the strategy needs it
+        // (e.g., PlumtreeSyncStrategy runs its own periodic sync,
+        //  while MemberlistSyncStrategy uses push-pull hooks)
+        if self.sync_strategy.needs_background_task() {
+            tracing::info!("Anti-entropy sync delegating to strategy background task");
+            self.sync_strategy.run_background_sync(transport).await;
+        } else {
+            tracing::info!("Anti-entropy sync handled externally (e.g., via memberlist push-pull)");
+            // No background task needed - sync happens via external mechanism
+            // Just wait forever (or until shutdown)
+            std::future::pending::<()>().await;
         }
     }
 
@@ -1024,6 +1055,54 @@ where
     /// Get a reference to the message store.
     pub fn store(&self) -> &Arc<S> {
         &self.store
+    }
+
+    /// Get local sync state for memberlist push-pull exchange.
+    ///
+    /// This is called by memberlist's `local_state()` hook during push-pull sync
+    /// when using [`MemberlistSyncStrategy`].
+    ///
+    /// For strategies that don't use push-pull (e.g., `PlumtreeSyncStrategy`),
+    /// this returns empty bytes.
+    ///
+    /// [`MemberlistSyncStrategy`]: crate::sync::MemberlistSyncStrategy
+    pub async fn sync_local_state(&self) -> Bytes {
+        self.sync_strategy.local_state().await
+    }
+
+    /// Merge remote sync state from memberlist push-pull exchange.
+    ///
+    /// This is called by memberlist's `merge_remote_state()` hook.
+    /// When using [`MemberlistSyncStrategy`], it compares hashes and
+    /// queues sync requests on mismatch.
+    ///
+    /// For strategies that don't use push-pull, this is a no-op.
+    ///
+    /// # Arguments
+    ///
+    /// * `buf` - Remote sync state bytes from peer's `local_state()`
+    /// * `peer_resolver` - Callback to get a peer ID for follow-up requests
+    ///
+    /// [`MemberlistSyncStrategy`]: crate::sync::MemberlistSyncStrategy
+    pub async fn sync_merge_remote_state<F>(&self, buf: &[u8], peer_resolver: F)
+    where
+        F: FnOnce() -> Option<I> + Send,
+    {
+        self.sync_strategy.merge_remote_state(buf, peer_resolver).await;
+    }
+
+    /// Check if the sync strategy needs a background task.
+    ///
+    /// Returns `true` for strategies like `PlumtreeSyncStrategy` that run
+    /// periodic sync. Returns `false` for `MemberlistSyncStrategy` which
+    /// uses memberlist's push-pull mechanism instead.
+    pub fn sync_needs_background_task(&self) -> bool {
+        self.sync_strategy.needs_background_task()
+    }
+
+    /// Check if sync is enabled.
+    pub fn sync_is_enabled(&self) -> bool {
+        self.sync_strategy.is_enabled()
     }
 
     /// Shutdown the Plumtree layer.

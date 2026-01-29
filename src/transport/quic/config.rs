@@ -33,7 +33,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 /// QUIC transport configuration with modular sub-configs.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct QuicConfig {
     /// TLS/certificate configuration.
     pub tls: TlsConfig,
@@ -49,20 +49,6 @@ pub struct QuicConfig {
     pub migration: MigrationConfig,
     /// Plumtree-specific QUIC optimizations.
     pub plumtree: PlumtreeQuicConfig,
-}
-
-impl Default for QuicConfig {
-    fn default() -> Self {
-        Self {
-            tls: TlsConfig::default(),
-            connection: ConnectionConfig::default(),
-            streams: StreamConfig::default(),
-            zero_rtt: ZeroRttConfig::default(),
-            congestion: CongestionConfig::default(),
-            migration: MigrationConfig::default(),
-            plumtree: PlumtreeQuicConfig::default(),
-        }
-    }
 }
 
 impl QuicConfig {

@@ -259,7 +259,7 @@ where
 
     /// Get the local address the transport is bound to.
     pub fn local_addr(&self) -> Result<SocketAddr, QuicError> {
-        self.endpoint.local_addr().map_err(|e| QuicError::Bind(e))
+        self.endpoint.local_addr().map_err(QuicError::Bind)
     }
 
     /// Get transport statistics.

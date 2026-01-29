@@ -574,7 +574,7 @@ impl<I: Clone + Eq + Hash + Ord> PeerScoring<I> {
             reliable_percentage: reliable_pct,
             stale_peers: stale,
             avg_rtt_ms: avg_rtt,
-            avg_score: avg_score,
+            avg_score,
         }
     }
 

@@ -257,9 +257,7 @@ pub fn stable_hash<I: Hash>(id: &I) -> u64 {
     use std::hash::BuildHasher;
     // Use SipHasher with fixed keys for determinism
     let state = std::hash::BuildHasherDefault::<siphasher::sip::SipHasher13>::default();
-    let mut hasher = state.build_hasher();
-    id.hash(&mut hasher);
-    hasher.finish()
+    state.hash_one(id)
 }
 
 /// Sort peer IDs by (hash, id) to form a stable logical hash ring.

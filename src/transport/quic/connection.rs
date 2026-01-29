@@ -171,7 +171,7 @@ impl<I: Clone + Eq + Hash> LruIndex<I> {
         // Insert new timestamp
         self.by_time
             .entry(new_time)
-            .or_insert_with(HashSet::new)
+            .or_default()
             .insert(peer.clone());
         self.by_peer.insert(peer.clone(), new_time);
     }

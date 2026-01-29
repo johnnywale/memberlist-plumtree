@@ -116,12 +116,13 @@ impl<I: Clone> ShardedSeenMap<I> {
     /// Insert a seen entry for a message.
     /// Returns true if this is a new entry, false if it already existed.
     async fn insert(&self, id: MessageId, entry: SeenEntry<I>) -> bool {
+        use std::collections::hash_map::Entry;
         let mut shard = self.write_shard(&id).await;
-        if shard.contains_key(&id) {
-            false
-        } else {
-            shard.insert(id, entry);
+        if let Entry::Vacant(e) = shard.entry(id) {
+            e.insert(entry);
             true
+        } else {
+            false
         }
     }
 

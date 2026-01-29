@@ -15,6 +15,160 @@ Plumtree's gossip protocol provides reliable message delivery under normal condi
 
 **Anti-Entropy Sync** solves these problems through periodic state comparison and selective message exchange.
 
+## Sync Strategies
+
+The sync system uses a **pluggable strategy pattern** via the `SyncStrategy` trait. This allows you to choose the best sync mechanism for your deployment:
+
+| Strategy | Best For | Background Task | Sync Mechanism |
+|----------|----------|-----------------|----------------|
+| `PlumtreeSyncStrategy` | Static discovery, custom discovery providers | Yes (runs own timer) | 4-message protocol |
+| `MemberlistSyncStrategy` | Memberlist-based discovery | No (uses memberlist hooks) | Push-pull piggyback |
+| `NoOpSyncStrategy` | Testing, minimal deployments | No | Disabled |
+
+### PlumtreeSyncStrategy (Default)
+
+The default strategy runs its own periodic sync with random peers using the 4-message protocol (Request → Response → Pull → Push).
+
+```rust
+use memberlist_plumtree::{PlumtreeDiscovery, PlumtreeConfig, NoopDelegate};
+
+// PlumtreeSyncStrategy is used by default
+let pm = PlumtreeDiscovery::new(node_id, PlumtreeConfig::default(), NoopDelegate);
+
+// Sync runs automatically in run_with_transport()
+pm.run_with_transport(transport).await;
+```
+
+**When to use:**
+- Using static peer discovery (seed nodes)
+- Using custom discovery providers (Consul, etcd, DNS)
+- Need explicit control over sync timing
+- Running without memberlist
+
+### MemberlistSyncStrategy
+
+Piggybacks on memberlist's existing push-pull mechanism, avoiding duplicate timers and connections.
+
+```rust
+use memberlist_plumtree::{PlumtreeDiscovery, PlumtreeConfig, NoopDelegate};
+use memberlist_plumtree::sync::{MemberlistSyncStrategy, SyncHandler};
+use std::time::Duration;
+
+// Create shared sync handler
+let store = Arc::new(MemoryStore::new(100_000));
+let sync_handler = Arc::new(SyncHandler::new(store.clone()));
+
+// Create channel for sync requests triggered by hash mismatch
+let (sync_tx, sync_rx) = async_channel::bounded(64);
+
+// Create memberlist strategy
+let strategy = MemberlistSyncStrategy::new(
+    sync_handler.clone(),
+    Duration::from_secs(90),  // sync_window
+    sync_tx,
+);
+
+// Create PlumtreeDiscovery with custom strategy
+let pm = PlumtreeDiscovery::with_sync_strategy(
+    node_id,
+    config,
+    delegate,
+    store,
+    sync_handler,  // Must be same instance!
+    strategy,
+);
+
+// In your PlumtreeNodeDelegate implementation:
+// fn local_state(&self) -> Bytes {
+//     futures::executor::block_on(pm.sync_local_state())
+// }
+// fn merge_remote_state(&self, buf: &[u8]) {
+//     futures::executor::block_on(pm.sync_merge_remote_state(buf, || get_peer_id()))
+// }
+```
+
+**When to use:**
+- Using memberlist for cluster membership
+- Want to reduce network overhead (no duplicate sync traffic)
+- Memberlist's 30s push-pull interval is acceptable
+
+**How it works:**
+1. During memberlist push-pull, `local_state()` returns a 48-byte header:
+   - 32 bytes: XOR root hash
+   - 8 bytes: timestamp
+   - 8 bytes: sync window (ms)
+2. `merge_remote_state()` compares hashes
+3. On mismatch, queues a sync request to `sync_tx`
+4. Application processes sync requests via the channel
+
+### NoOpSyncStrategy
+
+Disables sync entirely. Useful for testing or when sync isn't needed.
+
+```rust
+use memberlist_plumtree::sync::NoOpSyncStrategy;
+
+let strategy = NoOpSyncStrategy::new();
+
+let pm = PlumtreeDiscovery::with_sync_strategy(
+    node_id, config, delegate, store,
+    sync_handler,
+    strategy,
+);
+```
+
+**When to use:**
+- Unit testing without sync overhead
+- Ephemeral messages that don't need recovery
+- Minimal resource deployments
+
+### Strategy Comparison
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      SYNC STRATEGY COMPARISON                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  PlumtreeSyncStrategy               MemberlistSyncStrategy                  │
+│  ─────────────────────              ────────────────────────                │
+│                                                                             │
+│  ┌─────────────┐                    ┌─────────────┐                         │
+│  │  Plumtree   │                    │  Plumtree   │                         │
+│  │   Timer     │ ─── tick ───▶      │             │                         │
+│  └─────────────┘                    └─────────────┘                         │
+│        │                                   │                                │
+│        ▼                                   │                                │
+│  ┌─────────────┐                    ┌──────┴──────┐                         │
+│  │   Random    │                    │ Memberlist  │ ◀── push-pull (30s)     │
+│  │    Peer     │                    │  Delegate   │                         │
+│  └─────────────┘                    └──────┬──────┘                         │
+│        │                                   │                                │
+│        ▼                                   ▼                                │
+│  ┌─────────────┐                    ┌─────────────┐                         │
+│  │ SyncRequest │                    │ local_state │ ─── 48-byte hash ───▶   │
+│  │ SyncResponse│                    │merge_remote │ ◀── compare hashes      │
+│  │ SyncPull    │                    └─────────────┘                         │
+│  │ SyncPush    │                           │                                │
+│  └─────────────┘                    on mismatch                             │
+│                                            │                                │
+│  Pros:                                     ▼                                │
+│  • Full control                     ┌─────────────┐                         │
+│  • Works without memberlist         │  sync_tx    │ ─── SyncRequest ───▶    │
+│  • Configurable interval            │  channel    │                         │
+│                                     └─────────────┘                         │
+│  Cons:                                                                      │
+│  • Extra timer/connections          Pros:                                   │
+│  • More network traffic             • No extra timers                       │
+│                                     • Reuses memberlist connections         │
+│                                     • Less network overhead                 │
+│                                                                             │
+│                                     Cons:                                   │
+│                                     • Requires memberlist                   │
+│                                     • Fixed 30s interval                    │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
 ## How It Works
 
 ```
@@ -193,12 +347,28 @@ impl MessageStore for MyStore {
 
 When sync is enabled, these background tasks run automatically:
 
-| Task | Purpose | Interval |
-|------|---------|----------|
-| `run_anti_entropy_sync` | Periodic sync with random peer | `sync_interval` |
-| `run_storage_prune` | Remove expired messages | `retention / 2` |
+| Task | Purpose | Interval | Strategy |
+|------|---------|----------|----------|
+| `run_anti_entropy_sync` | Periodic sync with random peer | `sync_interval` | `PlumtreeSyncStrategy` only |
+| `run_storage_prune` | Remove expired messages | `retention / 10` | All strategies |
+
+**Note:** The `run_anti_entropy_sync` task behavior depends on the sync strategy:
+
+- **PlumtreeSyncStrategy**: Runs the full 4-message sync protocol periodically
+- **MemberlistSyncStrategy**: No-op (sync happens via memberlist's push-pull hooks)
+- **NoOpSyncStrategy**: No-op (sync disabled)
 
 These tasks are started automatically when you call `stack.start(transport)` or `pm.run_with_transport(transport)`.
+
+You can check if your strategy needs a background task:
+
+```rust
+if pm.sync_needs_background_task() {
+    // PlumtreeSyncStrategy is in use
+} else {
+    // MemberlistSyncStrategy or NoOpSyncStrategy
+}
+```
 
 ## Protocol Messages
 
@@ -319,7 +489,7 @@ if health.storage_health.utilization > 0.9 {
 
 | Feature | Description |
 |---------|-------------|
-| `sync` | Enable anti-entropy sync (protocol + in-memory storage) |
+| `sync` | Enable anti-entropy sync (protocol + in-memory storage + all strategies) |
 | `storage` | Enable storage trait and MemoryStore |
 | `storage-sled` | Enable Sled persistent storage backend |
 
@@ -328,12 +498,87 @@ if health.storage_health.utilization > 0.9 {
 memberlist-plumtree = { version = "0.1", features = ["sync", "storage-sled"] }
 ```
 
+All sync strategies (`PlumtreeSyncStrategy`, `MemberlistSyncStrategy`, `NoOpSyncStrategy`) are available when the `sync` feature is enabled.
+
 ## Limitations
 
 1. **Not real-time:** Sync runs periodically, not on every message
 2. **Window-based:** Only syncs messages within `sync_window`
 3. **XOR hash:** Suitable for trusted P2P mesh; use proper Merkle tree for untrusted networks
 4. **Single storage type:** MemberlistStack currently uses default (memory) storage; use PlumtreeDiscovery::with_storage for custom backends
+
+## Implementing Custom Sync Strategies
+
+You can implement custom sync strategies by implementing the `SyncStrategy` trait:
+
+```rust
+use memberlist_plumtree::sync::{SyncStrategy, SyncResult, SyncError};
+use memberlist_plumtree::message::{MessageId, SyncMessage};
+use memberlist_plumtree::storage::MessageStore;
+use memberlist_plumtree::Transport;
+use bytes::Bytes;
+
+pub struct MyCustomStrategy<I, S> {
+    // ... your fields
+}
+
+impl<I, S> SyncStrategy<I, S> for MyCustomStrategy<I, S>
+where
+    I: Clone + Eq + std::hash::Hash + std::fmt::Debug + Send + Sync + 'static,
+    S: MessageStore + 'static,
+{
+    /// Does this strategy need its own background task?
+    fn needs_background_task(&self) -> bool {
+        true  // or false if using external mechanism
+    }
+
+    /// Get local state for push-pull exchange (48 bytes: hash + timestamp + window)
+    fn local_state(&self) -> impl Future<Output = Bytes> + Send {
+        async { Bytes::new() }
+    }
+
+    /// Compare and potentially trigger sync on remote state
+    fn merge_remote_state<F>(&self, buf: &[u8], peer_resolver: F) -> impl Future<Output = ()> + Send
+    where
+        F: FnOnce() -> Option<I> + Send,
+    {
+        async {}
+    }
+
+    /// Run background sync (called if needs_background_task() returns true)
+    fn run_background_sync<T>(&self, transport: T) -> impl Future<Output = ()> + Send
+    where
+        T: Transport<I>,
+    {
+        async {}
+    }
+
+    /// Handle incoming sync messages
+    fn handle_sync_message(
+        &self,
+        from: I,
+        message: SyncMessage,
+    ) -> impl Future<Output = SyncResult<Option<SyncMessage>>> + Send {
+        async { Ok(None) }
+    }
+
+    /// Is sync enabled?
+    fn is_enabled(&self) -> bool {
+        true
+    }
+
+    /// Get current root hash
+    fn root_hash(&self) -> [u8; 32] {
+        [0u8; 32]
+    }
+
+    /// Record a message in sync state
+    fn record_message(&self, id: MessageId, payload: &[u8]) {}
+
+    /// Remove a message from sync state
+    fn remove_message(&self, id: &MessageId) {}
+}
+```
 
 ## See Also
 

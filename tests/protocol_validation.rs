@@ -472,7 +472,6 @@ async fn test_phase_a_tree_construction() {
 /// Note: IHave messages require background scheduler tasks that this
 /// simulated test doesn't fully replicate. The test focuses on Gossip delivery.
 #[tokio::test]
-#[ignore]
 async fn test_phase_b_steady_state_efficiency() {
     let config = PlumtreeConfig::default()
         .with_eager_fanout(3)
@@ -576,7 +575,6 @@ async fn test_phase_b_steady_state_efficiency() {
 /// 3. Children send Graft after timeout
 /// 4. Message is recovered and children promote the Graft responder to Eager
 #[tokio::test]
-#[ignore]
 async fn test_phase_c_parent_killer_recovery() {
     // Use faster graft timeout for testing
     let config = PlumtreeConfig::default()
