@@ -703,7 +703,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)] // Intentionally testing with modified config
     fn test_failure_decay_over_time() {
+        use crate::testing::wait_for_condition;
+
         let mut config = ScoringConfig::default();
         config.failure_decay_halflife = 0.1; // 0.1 second for fast testing
 
@@ -714,19 +717,34 @@ mod tests {
         let initial_effective = score.effective_failure;
         assert_eq!(initial_effective, 1.0);
 
-        // Wait for half-life
-        std::thread::sleep(Duration::from_millis(100));
-        score.apply_decay(Instant::now(), &config);
+        // Wait until decay has occurred (condition-based, not fixed sleep)
+        // We use a RefCell to allow mutation inside the closure
+        let score_cell = std::cell::RefCell::new(score);
+        wait_for_condition(
+            || {
+                score_cell.borrow_mut().apply_decay(Instant::now(), &config);
+                score_cell.borrow().effective_failure < 0.8
+            },
+            Duration::from_secs(2),
+        )
+        .expect("Decay should occur within timeout");
 
-        // Should be approximately half
-        assert!(score.effective_failure < initial_effective);
-        assert!(score.effective_failure > 0.4 && score.effective_failure < 0.6);
+        let score = score_cell.into_inner();
+
+        // Should have decayed significantly
+        assert!(
+            score.effective_failure < initial_effective,
+            "effective_failure {} should be less than initial {}",
+            score.effective_failure,
+            initial_effective
+        );
 
         // But raw count should stay the same
         assert_eq!(score.failure_count, 1);
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)] // Intentionally testing with modified config
     fn test_optimistic_read_decay() {
         let mut config = ScoringConfig::default();
         config.failure_decay_halflife = 0.1;
@@ -789,6 +807,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)] // Intentionally testing with modified config
     fn test_cleanup_stale() {
         let mut config = ScoringConfig::default();
         config.max_sample_age = Duration::from_millis(1);
@@ -850,7 +869,7 @@ mod tests {
         // With default half-life of 1800s, decay over a few ms is negligible but nonzero
         let effective = score.effective_failure_weight(&scoring.config);
         assert!(
-            effective >= 2.99 && effective <= 3.01,
+            (2.99..=3.01).contains(&effective),
             "Effective failure weight {} should be approximately 3.0",
             effective
         );

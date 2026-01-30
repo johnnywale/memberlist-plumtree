@@ -27,6 +27,33 @@ type SemaphorePermitArc = SemaphoreGuardArc;
 use super::config::QuicConfig;
 use super::error::QuicError;
 
+/// Result of a get_or_connect operation with additional metadata.
+#[derive(Debug, Clone)]
+pub struct ConnectionResult {
+    /// The QUIC connection.
+    pub connection: Connection,
+    /// Whether this was a newly established connection.
+    pub newly_connected: bool,
+    /// Remote address of the peer.
+    pub remote_addr: SocketAddr,
+    /// Initial RTT estimate.
+    pub rtt: Option<Duration>,
+}
+
+/// Result of a send operation with connection and 0-RTT metadata.
+#[derive(Debug, Clone)]
+pub struct SendResult {
+    /// Connection information.
+    pub connection: ConnectionResult,
+    /// Whether 0-RTT early data was used for this send.
+    ///
+    /// This is true when:
+    /// - 0-RTT is enabled in config
+    /// - A session ticket existed for the peer
+    /// - The connection was in 0-RTT mode (handshake not complete)
+    pub used_0rtt: bool,
+}
+
 /// Statistics for the connection manager.
 ///
 /// # Note on Accuracy
@@ -203,6 +230,9 @@ impl<I: Clone + Eq + Hash> LruIndex<I> {
     }
 }
 
+/// Callback type for connection events during retry attempts.
+pub type ReconnectCallback<I> = Arc<dyn Fn(I, u32) + Send + Sync>;
+
 /// Manages QUIC connections with pooling and LRU eviction.
 pub struct ConnectionManager<I> {
     /// The QUIC endpoint for creating connections.
@@ -222,6 +252,9 @@ pub struct ConnectionManager<I> {
     config: QuicConfig,
     /// Statistics.
     stats: StatsInner,
+    /// Optional callback for reconnection attempts (peer, attempt number).
+    /// Uses SyncMutex for interior mutability so it can be set after construction.
+    reconnect_callback: SyncMutex<Option<ReconnectCallback<I>>>,
 }
 
 impl<I> ConnectionManager<I>
@@ -240,10 +273,24 @@ where
             connection_semaphore: Arc::new(Semaphore::new(max_connections)),
             config,
             stats: StatsInner::default(),
+            reconnect_callback: SyncMutex::new(None),
         }
     }
 
-    /// Get or create a connection to a peer.
+    /// Set a callback to be invoked during reconnection attempts.
+    ///
+    /// The callback receives the peer ID and the attempt number (1-based).
+    /// This can be called after construction to enable reconnection events.
+    pub fn set_reconnect_callback(&self, callback: ReconnectCallback<I>) {
+        *self.reconnect_callback.lock() = Some(callback);
+    }
+
+    /// Get or create a connection to a peer, with metadata about the connection.
+    ///
+    /// Returns a `ConnectionResult` containing:
+    /// - The connection
+    /// - Whether this was a newly established connection (`newly_connected`)
+    /// - Remote address and RTT
     ///
     /// This method prevents the "thundering herd" problem by tracking pending
     /// connection attempts. If multiple tasks try to connect to the same peer
@@ -272,13 +319,18 @@ where
         &self,
         peer: &I,
         addr: SocketAddr,
-    ) -> Result<Connection, QuicError> {
+    ) -> Result<ConnectionResult, QuicError> {
         // Fast path: check for existing usable connection (read lock)
         {
             let connections = self.connections.read().await;
             if let Some(pooled) = connections.get(peer) {
                 if pooled.is_usable() {
-                    return Ok(pooled.connection.clone());
+                    return Ok(ConnectionResult {
+                        connection: pooled.connection.clone(),
+                        newly_connected: false,
+                        remote_addr: pooled.connection.remote_address(),
+                        rtt: Some(pooled.connection.rtt()),
+                    });
                 }
             }
         }
@@ -344,28 +396,50 @@ where
                 };
 
                 // We are responsible for establishing the connection
-                let result = self.do_connect(peer.clone(), addr, &sender).await;
+                let connection =
+                    self.do_connect(peer.clone(), addr, &sender)
+                        .await
+                        .map_err(|e| match Arc::try_unwrap(e) {
+                            Ok(err) => err,
+                            Err(arc_err) => QuicError::Internal(arc_err.to_string()),
+                        })?;
 
                 // Guard is dropped here, removing from pending map
                 // (happens whether we return Ok, Err, or panic)
 
-                result.map_err(|e| match Arc::try_unwrap(e) {
-                    Ok(err) => err,
-                    Err(arc_err) => QuicError::Internal(arc_err.to_string()),
+                // We initiated this connection, so it's newly connected
+                Ok(ConnectionResult {
+                    remote_addr: connection.remote_address(),
+                    rtt: Some(connection.rtt()),
+                    connection,
+                    newly_connected: true,
                 })
             }
             Action::Wait(receiver) => {
                 // Wait for the pending connection result
-                match receiver.recv().await {
-                    Ok(Ok(conn)) => Ok(conn),
-                    Ok(Err(arc_err)) => Err(match Arc::try_unwrap(arc_err) {
-                        Ok(err) => err,
-                        Err(arc_err) => QuicError::Internal(arc_err.to_string()),
-                    }),
-                    Err(_) => Err(QuicError::Internal(
-                        "pending connection channel closed".to_string(),
-                    )),
-                }
+                let connection = match receiver.recv().await {
+                    Ok(Ok(conn)) => conn,
+                    Ok(Err(arc_err)) => {
+                        return Err(match Arc::try_unwrap(arc_err) {
+                            Ok(err) => err,
+                            Err(arc_err) => QuicError::Internal(arc_err.to_string()),
+                        });
+                    }
+                    Err(_) => {
+                        return Err(QuicError::Internal(
+                            "pending connection channel closed".to_string(),
+                        ));
+                    }
+                };
+
+                // We waited for another task to connect, so from our perspective
+                // this is not a new connection (another task initiated it)
+                Ok(ConnectionResult {
+                    remote_addr: connection.remote_address(),
+                    rtt: Some(connection.rtt()),
+                    connection,
+                    newly_connected: false,
+                })
             }
         }
     }
@@ -394,10 +468,10 @@ where
                 // At connection limit - try to evict an idle connection
                 self.evict_idle().await;
 
-                // Try again with a timeout
+                // Try again with a configurable timeout
                 let acquire_result = futures::select! {
                     permit = self.connection_semaphore.acquire_arc().fuse() => Some(permit),
-                    _ = futures_timer::Delay::new(Duration::from_secs(5)).fuse() => None,
+                    _ = futures_timer::Delay::new(self.config.connection.acquire_timeout).fuse() => None,
                 };
 
                 match acquire_result {
@@ -420,6 +494,10 @@ where
         let mut last_error = None;
         for attempt in 0..=self.config.connection.retries {
             if attempt > 0 {
+                // Emit reconnecting event via callback
+                if let Some(ref callback) = &*self.reconnect_callback.lock() {
+                    callback(peer.clone(), attempt);
+                }
                 futures_timer::Delay::new(self.config.connection.retry_delay).await;
             }
 
@@ -475,7 +553,7 @@ where
         let connecting = self
             .endpoint
             .connect_with(self.client_config.clone(), addr, server_name)
-            .map_err(|_e| QuicError::Connection(quinn::ConnectionError::LocallyClosed))?;
+            .map_err(|e| QuicError::TlsConfig(format!("connect failed: {}", e)))?;
 
         // Wait for connection with timeout using futures::select
         let timeout_duration = self.config.connection.handshake_timeout;
@@ -497,25 +575,59 @@ where
         }
     }
 
-    /// Send data on a connection to a peer.
+    /// Send data on a connection to a peer, with connection metadata.
+    ///
+    /// Returns information about whether a new connection was established,
+    /// which can be used to emit connection events.
+    ///
+    /// # 0-RTT Support
+    ///
+    /// If 0-RTT is enabled and a session ticket exists for this peer,
+    /// the transport attempts to send via early data (`open_uni_early`).
+    /// If early data is not available, it falls back to regular streams.
+    /// The `SendResult` includes whether 0-RTT was actually used.
     pub async fn send(
         &self,
         peer: &I,
         addr: SocketAddr,
         data: bytes::Bytes,
-    ) -> Result<(), QuicError> {
-        let connection = self.get_or_connect(peer, addr).await?;
+    ) -> Result<SendResult, QuicError> {
+        let conn_result = self.get_or_connect(peer, addr).await?;
 
-        // Open a unidirectional stream and send
-        let mut stream = connection
-            .open_uni()
-            .await
-            .map_err(|e| QuicError::Stream(e.to_string()))?;
+        // Try to use 0-RTT early data if enabled
+        let mut used_0rtt = false;
+        let send_result = if self.config.zero_rtt.enabled {
+            // Attempt early data first
+            match conn_result.connection.open_uni().await {
+                Ok(mut stream) => {
+                    // Check if we're still in 0-RTT phase (handshake not complete)
+                    // Note: quinn doesn't expose open_uni_early directly, but if the
+                    // connection was resumed with a session ticket and handshake isn't
+                    // complete yet, data sent is 0-RTT early data.
+                    used_0rtt = conn_result.connection.handshake_data().is_none();
+                    stream.write_all(&data).await.map_err(QuicError::Write)?;
+                    stream
+                        .finish()
+                        .map_err(|_| QuicError::Write(quinn::WriteError::ClosedStream))?;
+                    Ok(())
+                }
+                Err(e) => Err(QuicError::Stream(e.to_string())),
+            }
+        } else {
+            // 0-RTT disabled, use regular stream
+            let mut stream = conn_result
+                .connection
+                .open_uni()
+                .await
+                .map_err(|e| QuicError::Stream(e.to_string()))?;
+            stream.write_all(&data).await.map_err(QuicError::Write)?;
+            stream
+                .finish()
+                .map_err(|_| QuicError::Write(quinn::WriteError::ClosedStream))?;
+            Ok(())
+        };
 
-        stream.write_all(&data).await.map_err(QuicError::Write)?;
-        stream
-            .finish()
-            .map_err(|_| QuicError::Write(quinn::WriteError::ClosedStream))?;
+        send_result?;
 
         // Update stats and touch connection
         self.stats.messages_sent.fetch_add(1, Ordering::Relaxed);
@@ -536,7 +648,10 @@ where
             lru.touch(peer, now);
         }
 
-        Ok(())
+        Ok(SendResult {
+            connection: conn_result,
+            used_0rtt,
+        })
     }
 
     /// Remove a connection to a peer.

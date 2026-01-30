@@ -243,12 +243,7 @@ where
 {
     type Handle = MemberlistDiscoveryHandle;
 
-    async fn start(
-        &self,
-    ) -> (
-        async_channel::Receiver<DiscoveryEvent<I>>,
-        Self::Handle,
-    ) {
+    async fn start(&self) -> (async_channel::Receiver<DiscoveryEvent<I>>, Self::Handle) {
         // This is a "shell" discovery that provides the config.
         // The actual peer discovery happens through PlumtreeNodeDelegate
         // when integrated with memberlist via MemberlistStack.
@@ -518,10 +513,59 @@ where
     type Address = A;
 
     async fn notify_join(&self, node: Arc<NodeState<Self::Id, Self::Address>>) {
+        // Capture state before add (for accurate delta tracking)
+        #[cfg(feature = "metrics")]
+        let stats_before = self.peers.stats();
+
         // Sync: Add to Plumtree peers with hash ring-based auto-classification
         // This ensures new peers are placed correctly in the topology
-        self.peers
+        let result = self
+            .peers
             .add_peer_auto(node.id().clone(), self.max_peers, self.eager_fanout);
+
+        // Record metrics based on actual state change (handles internal rebalancing)
+        #[cfg(feature = "metrics")]
+        {
+            use crate::peer_state::AddPeerResult;
+            match result {
+                AddPeerResult::AddedEager
+                | AddPeerResult::AddedLazy
+                | AddPeerResult::AddedAfterEviction => {
+                    let stats_after = self.peers.stats();
+
+                    // Track total peer change
+                    let total_before = stats_before.eager_count + stats_before.lazy_count;
+                    let total_after = stats_after.eager_count + stats_after.lazy_count;
+                    if total_after > total_before {
+                        crate::metrics::record_peer_added();
+                        crate::metrics::inc_total_peers();
+                        crate::metrics::inc_peers_healthy();
+                    }
+
+                    // Track eager/lazy changes (including rebalancing effects)
+                    if stats_after.eager_count > stats_before.eager_count {
+                        for _ in 0..(stats_after.eager_count - stats_before.eager_count) {
+                            crate::metrics::inc_eager_peers();
+                        }
+                    } else if stats_before.eager_count > stats_after.eager_count {
+                        for _ in 0..(stats_before.eager_count - stats_after.eager_count) {
+                            crate::metrics::dec_eager_peers();
+                        }
+                    }
+
+                    if stats_after.lazy_count > stats_before.lazy_count {
+                        for _ in 0..(stats_after.lazy_count - stats_before.lazy_count) {
+                            crate::metrics::inc_lazy_peers();
+                        }
+                    } else if stats_before.lazy_count > stats_after.lazy_count {
+                        for _ in 0..(stats_before.lazy_count - stats_after.lazy_count) {
+                            crate::metrics::dec_lazy_peers();
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
 
         self.inner.notify_join(node).await;
     }
@@ -529,6 +573,27 @@ where
     async fn notify_leave(&self, node: Arc<NodeState<Self::Id, Self::Address>>) {
         // Sync: Remove from Plumtree peers immediately to stop sending to dead node
         let result = self.peers.remove_peer(node.id());
+
+        // Record metrics for peer removal
+        #[cfg(feature = "metrics")]
+        {
+            use crate::peer_state::RemovePeerResult;
+            match result {
+                RemovePeerResult::RemovedEager => {
+                    crate::metrics::record_peer_removed();
+                    crate::metrics::dec_total_peers();
+                    crate::metrics::dec_eager_peers();
+                    crate::metrics::dec_peers_healthy();
+                }
+                RemovePeerResult::RemovedLazy => {
+                    crate::metrics::record_peer_removed();
+                    crate::metrics::dec_total_peers();
+                    crate::metrics::dec_lazy_peers();
+                    crate::metrics::dec_peers_healthy();
+                }
+                RemovePeerResult::NotFound => {}
+            }
+        }
 
         // If an eager peer was removed, rebalance to promote a lazy peer
         // This maintains tree connectivity when eager peers leave
@@ -544,6 +609,21 @@ where
             if let Some(ref on_demotion) = self.on_demotion {
                 for peer in &rebalance_result.demoted {
                     on_demotion(peer);
+                }
+            }
+
+            // Record metrics for promotions/demotions from rebalance
+            #[cfg(feature = "metrics")]
+            {
+                for _ in &rebalance_result.promoted {
+                    crate::metrics::record_peer_promotion();
+                    crate::metrics::inc_eager_peers();
+                    crate::metrics::dec_lazy_peers();
+                }
+                for _ in &rebalance_result.demoted {
+                    crate::metrics::record_peer_demotion();
+                    crate::metrics::dec_eager_peers();
+                    crate::metrics::inc_lazy_peers();
                 }
             }
         }
@@ -880,7 +960,9 @@ where
         #[cfg(feature = "quic")]
         {
             match self.resolver {
-                Some(resolver) => PlumtreeBridge::with_config_and_resolver(self.pm, self.config, resolver),
+                Some(resolver) => {
+                    PlumtreeBridge::with_config_and_resolver(self.pm, self.config, resolver)
+                }
                 None => PlumtreeBridge::with_config(self.pm, self.config),
             }
         }
@@ -905,6 +987,109 @@ where
         D: EventDelegate<Id = I, Address = A>,
     {
         BridgeEventDelegate::with_inner(self.build(), inner)
+    }
+}
+
+// ============================================================================
+// MemberlistTransportAdapter - Transport wrapper for memberlist
+// ============================================================================
+
+/// Error type for MemberlistTransportAdapter.
+#[cfg(feature = "tokio")]
+#[derive(Debug)]
+pub struct MemberlistTransportError(String);
+
+#[cfg(feature = "tokio")]
+impl std::fmt::Display for MemberlistTransportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl std::error::Error for MemberlistTransportError {}
+
+/// A transport adapter that uses memberlist's reliable send.
+///
+/// This adapter wraps a memberlist instance and implements the `Transport` trait,
+/// allowing Plumtree's sync mechanism to send messages via memberlist's reliable
+/// TCP channel.
+#[cfg(feature = "tokio")]
+pub(crate) struct MemberlistTransportAdapter<I, T, D>
+where
+    I: Id + IdCodec + memberlist_core::proto::Data + Clone + Ord + Send + Sync + 'static,
+    T: memberlist_core::transport::Transport<Id = I>,
+    D: memberlist_core::delegate::Delegate<Id = I, Address = T::ResolvedAddress>,
+{
+    memberlist: memberlist_core::Memberlist<T, D>,
+    _marker: std::marker::PhantomData<I>,
+}
+
+#[cfg(feature = "tokio")]
+impl<I, T, D> MemberlistTransportAdapter<I, T, D>
+where
+    I: Id + IdCodec + memberlist_core::proto::Data + Clone + Ord + Send + Sync + 'static,
+    T: memberlist_core::transport::Transport<Id = I>,
+    D: memberlist_core::delegate::Delegate<Id = I, Address = T::ResolvedAddress>,
+{
+    pub fn new(memberlist: memberlist_core::Memberlist<T, D>) -> Self {
+        Self {
+            memberlist,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl<I, T, D> Clone for MemberlistTransportAdapter<I, T, D>
+where
+    I: Id + IdCodec + memberlist_core::proto::Data + Clone + Ord + Send + Sync + 'static,
+    T: memberlist_core::transport::Transport<Id = I>,
+    D: memberlist_core::delegate::Delegate<Id = I, Address = T::ResolvedAddress>,
+{
+    fn clone(&self) -> Self {
+        Self {
+            memberlist: self.memberlist.clone(),
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl<I, T, D> crate::Transport<I> for MemberlistTransportAdapter<I, T, D>
+where
+    I: Id + IdCodec + memberlist_core::proto::Data + Clone + Ord + Send + Sync + 'static,
+    T: memberlist_core::transport::Transport<Id = I> + 'static,
+    D: memberlist_core::delegate::Delegate<Id = I, Address = T::ResolvedAddress> + 'static,
+    T::ResolvedAddress: From<SocketAddr> + Send,
+{
+    type Error = MemberlistTransportError;
+
+    fn send_to(
+        &self,
+        target: &I,
+        data: Bytes,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+        let memberlist = self.memberlist.clone();
+        let target_id = target.clone();
+        async move {
+            // Look up the target node's address from memberlist
+            let members = memberlist.online_members().await;
+            let target_member = members.iter().find(|m| m.id() == &target_id);
+
+            if let Some(member) = target_member {
+                let addr = member.address();
+                memberlist
+                    .send_reliable(addr, data)
+                    .await
+                    .map_err(|e| MemberlistTransportError(e.to_string()))
+            } else {
+                Err(MemberlistTransportError(format!(
+                    "target node {:?} not found in memberlist",
+                    target_id
+                )))
+            }
+        }
     }
 }
 
@@ -956,8 +1141,8 @@ where
     T: memberlist_core::transport::Transport<Id = I>,
     D: memberlist_core::delegate::Delegate<Id = I, Address = T::ResolvedAddress>,
 {
-    /// The PlumtreeDiscovery instance.
-    pm: Arc<PlumtreeDiscovery<I, PD>>,
+    /// The PlumtreeBridge instance (wraps PlumtreeDiscovery).
+    bridge: PlumtreeBridge<I, PD>,
     /// The Memberlist instance for SWIM gossip.
     memberlist: memberlist_core::Memberlist<T, D>,
     /// The advertise address.
@@ -973,15 +1158,22 @@ where
 {
     /// Create a new MemberlistStack from pre-built components.
     ///
-    /// This is a low-level constructor. For most use cases, prefer using
-    /// [`from_config`](Self::from_config) which handles all the wiring automatically.
+    /// This is a low-level constructor that requires manually creating and wiring
+    /// all components. For a higher-level API with automatic configuration,
+    /// see the `PlumtreeStackConfig` builder pattern.
+    ///
+    /// # Arguments
+    ///
+    /// * `bridge` - The PlumtreeBridge instance (wraps PlumtreeDiscovery)
+    /// * `memberlist` - The Memberlist instance for SWIM gossip
+    /// * `advertise_addr` - The address this node advertises to the cluster
     pub fn new(
-        pm: Arc<PlumtreeDiscovery<I, PD>>,
+        bridge: PlumtreeBridge<I, PD>,
         memberlist: memberlist_core::Memberlist<T, D>,
         advertise_addr: SocketAddr,
     ) -> Self {
         Self {
-            pm,
+            bridge,
             memberlist,
             advertise_addr,
         }
@@ -999,7 +1191,7 @@ where
     /// # Arguments
     ///
     /// * `config` - Stack configuration with `MemberlistDiscovery`
-    /// * `plumtree_delegate` - Delegate for Plumtree message delivery
+    /// * `bridge` - PlumtreeBridge instance (wraps PlumtreeDiscovery)
     /// * `memberlist` - Pre-built Memberlist instance (with wrapped delegate)
     ///
     /// # Example
@@ -1007,7 +1199,7 @@ where
     /// ```ignore
     /// use memberlist_plumtree::{
     ///     PlumtreeStackConfig, PlumtreeConfig, MemberlistStack,
-    ///     PlumtreeDiscovery, NoopDelegate,
+    ///     PlumtreeBridge, PlumtreeDiscovery, NoopDelegate,
     ///     discovery::{MemberlistDiscovery, MemberlistDiscoveryConfig},
     /// };
     ///
@@ -1020,9 +1212,9 @@ where
     ///     .with_discovery(discovery)
     ///     .with_plumtree(PlumtreeConfig::default());
     ///
-    /// // 2. Create PlumtreeDiscovery from config
-    /// let pm = PlumtreeDiscovery::from_stack_config(&stack_config, NoopDelegate);
-    /// let pm = Arc::new(pm);
+    /// // 2. Create PlumtreeDiscovery and wrap in PlumtreeBridge
+    /// let pm = Arc::new(PlumtreeDiscovery::from_stack_config(&stack_config, NoopDelegate));
+    /// let bridge = PlumtreeBridge::new(pm.clone());
     ///
     /// // 3. Create wrapped delegate and memberlist
     /// let wrapped_delegate = PlumtreeNodeDelegate::new(
@@ -1036,11 +1228,11 @@ where
     /// let memberlist = Memberlist::new(transport, wrapped_delegate, options).await?;
     ///
     /// // 4. Create the stack
-    /// let stack = MemberlistStack::from_stack_config(stack_config, pm, memberlist);
+    /// let stack = MemberlistStack::from_stack_config(stack_config, bridge, memberlist);
     /// ```
     pub fn from_stack_config(
         config: crate::PlumtreeStackConfig<I, MemberlistDiscovery<I>>,
-        pm: Arc<PlumtreeDiscovery<I, PD>>,
+        bridge: PlumtreeBridge<I, PD>,
         memberlist: memberlist_core::Memberlist<T, D>,
     ) -> Self
     where
@@ -1048,15 +1240,20 @@ where
     {
         let advertise_addr = config.discovery.advertise_addr();
         Self {
-            pm,
+            bridge,
             memberlist,
             advertise_addr,
         }
     }
 
-    /// Get a reference to the PlumtreeDiscovery.
+    /// Get a reference to the PlumtreeBridge.
+    pub fn bridge(&self) -> &PlumtreeBridge<I, PD> {
+        &self.bridge
+    }
+
+    /// Get a reference to the underlying PlumtreeDiscovery.
     pub fn plumtree(&self) -> &Arc<PlumtreeDiscovery<I, PD>> {
-        &self.pm
+        self.bridge.plumtree()
     }
 
     /// Get a reference to the Memberlist.
@@ -1079,12 +1276,106 @@ where
     /// - Graft retry logic won't work
     /// - Tree self-healing will be broken
     ///
+    /// This method uses memberlist's reliable send for unicast messages (Gossip to
+    /// eager peers, Graft, Prune). This is the recommended way to start a `MemberlistStack`.
+    ///
     /// This spawns the following background tasks:
     /// - IHave scheduler (sends announcements to lazy peers)
     /// - Graft timer (handles retry logic for missing messages)
     /// - Seen map cleanup (memory management)
     /// - Outgoing message processor (routes messages)
     /// - Incoming message processor (handles received messages)
+    /// - Unicast sender (routes Gossip/Graft/Prune via memberlist)
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let stack = MemberlistStack::new(bridge, memberlist, advertise_addr);
+    ///
+    /// // REQUIRED: Start background tasks before using the stack
+    /// stack.start();
+    ///
+    /// // Now you can join and broadcast
+    /// stack.join(&seeds).await?;
+    /// stack.broadcast(b"Hello!").await?;
+    /// ```
+    #[cfg(feature = "tokio")]
+    pub fn start(&self)
+    where
+        PD: 'static,
+        T: 'static,
+        D: 'static,
+        <T as memberlist_core::transport::Transport>::ResolvedAddress: From<SocketAddr> + Send,
+    {
+        // Spawn the main Plumtree runner (IHave scheduler, Graft timer, etc.)
+        let pm_runner = self.bridge.pm.clone();
+        tokio::spawn(async move {
+            pm_runner.run().await;
+        });
+
+        // Spawn the incoming message processor
+        let pm_incoming = self.bridge.pm.clone();
+        tokio::spawn(async move {
+            pm_incoming.run_incoming_processor().await;
+        });
+
+        // Spawn the unicast sender that uses memberlist's reliable send
+        let unicast_rx = self.bridge.pm.unicast_receiver_raw();
+        let memberlist_unicast = self.memberlist.clone();
+        tokio::spawn(async move {
+            while let Ok(envelope) = unicast_rx.recv().await {
+                let target_id = envelope.target().clone();
+
+                // Encode the message (compression is already handled by Plumtree core)
+                let encoded = envelope.encode();
+
+                // Look up the target node's address from memberlist
+                // Iterate through online members to find the target
+                let members = memberlist_unicast.online_members().await;
+                let target_member = members.iter().find(|m| m.id() == &target_id);
+
+                // Note: Peer health metrics are tracked incrementally via
+                // inc_peers_healthy/dec_peers_healthy in notify_join/notify_leave
+
+                if let Some(member) = target_member {
+                    // Send via memberlist's reliable TCP channel
+                    let addr = member.address();
+                    if let Err(e) = memberlist_unicast.send_reliable(addr, encoded).await {
+                        tracing::warn!(
+                            target = ?target_id,
+                            error = %e,
+                            "failed to send unicast message via memberlist"
+                        );
+                    }
+                } else {
+                    tracing::debug!(
+                        target = ?target_id,
+                        "target node not found in memberlist, message dropped"
+                    );
+                }
+            }
+        });
+
+        // Spawn the anti-entropy sync task using memberlist as transport
+        let pm_sync = self.bridge.pm.clone();
+        let sync_transport = MemberlistTransportAdapter::new(self.memberlist.clone());
+        tokio::spawn(async move {
+            pm_sync.run_anti_entropy_sync(sync_transport).await;
+        });
+
+        // Spawn the storage prune task
+        let pm_prune = self.bridge.pm.clone();
+        tokio::spawn(async move {
+            pm_prune.run_storage_prune().await;
+        });
+
+        tracing::info!("MemberlistStack background tasks started (including sync)");
+    }
+
+    /// Start the Plumtree background tasks with a custom transport.
+    ///
+    /// Use this when you want to use a custom transport (e.g., QUIC) for unicast
+    /// message delivery instead of memberlist's reliable send.
     ///
     /// # Arguments
     ///
@@ -1093,41 +1384,41 @@ where
     /// # Example
     ///
     /// ```ignore
-    /// let stack = MemberlistStack::new(pm, memberlist, advertise_addr);
+    /// let stack = MemberlistStack::new(bridge, memberlist, advertise_addr);
     ///
-    /// // REQUIRED: Start background tasks before using the stack
-    /// stack.start(transport);
+    /// // Use QUIC transport for unicast messages
+    /// let quic_transport = QuicTransport::new(...);
+    /// stack.start_with_transport(quic_transport);
     ///
-    /// // Now you can join and broadcast
     /// stack.join(&seeds).await?;
     /// stack.broadcast(b"Hello!").await?;
     /// ```
     #[cfg(feature = "tokio")]
-    pub fn start<PT>(&self, transport: PT)
+    pub fn start_with_transport<PT>(&self, transport: PT)
     where
         PT: crate::Transport<I> + Clone + 'static,
         PD: 'static,
     {
         // Spawn the main Plumtree runner (IHave scheduler, Graft timer, etc.)
-        let pm_runner = self.pm.clone();
+        let pm_runner = self.bridge.pm.clone();
         tokio::spawn(async move {
             pm_runner.run_with_transport(transport).await;
         });
 
         // Spawn the incoming message processor
-        let pm_incoming = self.pm.clone();
+        let pm_incoming = self.bridge.pm.clone();
         tokio::spawn(async move {
             pm_incoming.run_incoming_processor().await;
         });
 
-        tracing::info!("MemberlistStack background tasks started");
+        tracing::info!("MemberlistStack background tasks started with custom transport");
     }
 
     /// Start the Plumtree background tasks without a transport.
     ///
     /// Use this when you handle unicast message delivery separately (e.g., via
-    /// memberlist's reliable send). For most use cases, prefer [`start()`](Self::start)
-    /// which handles unicast automatically.
+    /// a custom routing layer). For most use cases, prefer [`start()`](Self::start)
+    /// which handles unicast automatically via memberlist.
     ///
     /// # Warning
     ///
@@ -1137,18 +1428,22 @@ where
     ///
     /// Failure to do so will break Graft/Prune messages and prevent tree self-healing.
     #[cfg(feature = "tokio")]
+    #[deprecated(
+        since = "0.2.0",
+        note = "Use `start()` instead, which handles unicast via memberlist"
+    )]
     pub fn start_without_transport(&self)
     where
         PD: 'static,
     {
         // Spawn the main Plumtree runner without unicast handling
-        let pm_runner = self.pm.clone();
+        let pm_runner = self.bridge.pm.clone();
         tokio::spawn(async move {
             pm_runner.run().await;
         });
 
         // Spawn the incoming message processor
-        let pm_incoming = self.pm.clone();
+        let pm_incoming = self.bridge.pm.clone();
         tokio::spawn(async move {
             pm_incoming.run_incoming_processor().await;
         });
@@ -1158,7 +1453,17 @@ where
 
     /// Get Plumtree peer statistics.
     pub fn peer_stats(&self) -> crate::peer_state::PeerStats {
-        self.pm.peer_stats()
+        self.bridge.peer_stats()
+    }
+
+    /// Get the current cache statistics from Plumtree.
+    pub fn cache_stats(&self) -> crate::message::CacheStats {
+        self.bridge.pm.cache_stats()
+    }
+
+    /// Get the current seen map statistics from Plumtree (deduplication map).
+    pub fn seen_map_stats(&self) -> Option<crate::plumtree::SeenMapStats> {
+        self.bridge.pm.seen_map_stats()
     }
 
     /// Get the number of online memberlist members.
@@ -1174,7 +1479,7 @@ where
         &self,
         payload: impl Into<bytes::Bytes>,
     ) -> Result<crate::MessageId, crate::Error> {
-        self.pm.broadcast(payload).await
+        self.bridge.broadcast(payload).await
     }
 
     /// Join the cluster via seed nodes.
@@ -1196,10 +1501,7 @@ where
     /// ];
     /// stack.join(&seeds).await?;
     /// ```
-    pub async fn join(
-        &self,
-        seed_addrs: &[SocketAddr],
-    ) -> Result<(), MemberlistStackError>
+    pub async fn join(&self, seed_addrs: &[SocketAddr]) -> Result<(), MemberlistStackError>
     where
         <T as memberlist_core::transport::Transport>::ResolvedAddress: From<SocketAddr>,
     {
@@ -1209,7 +1511,7 @@ where
             // Create a placeholder ID - memberlist will resolve the actual ID
             // We use a minimal ID representation that will be replaced during handshake
             let seed_node = nodecraft::Node::new(
-                self.pm.plumtree().local_id().clone(),
+                self.bridge.local_id().clone(),
                 MaybeResolvedAddress::Resolved(addr.into()),
             );
 
@@ -1236,7 +1538,7 @@ where
     ///
     /// This shuts down both Plumtree and Memberlist.
     pub async fn shutdown(&self) -> Result<(), MemberlistStackError> {
-        self.pm.shutdown();
+        self.bridge.shutdown();
         self.memberlist
             .shutdown()
             .await
@@ -1245,7 +1547,7 @@ where
 
     /// Check if the stack has been shut down.
     pub fn is_shutdown(&self) -> bool {
-        self.pm.is_shutdown()
+        self.bridge.is_shutdown()
     }
 }
 
@@ -1335,7 +1637,7 @@ where
 
         let handle_clone = handle.clone();
         let memberlist = self.memberlist.clone();
-        let local_id = self.pm.plumtree().local_id().clone();
+        let local_id = self.bridge.local_id().clone();
         let seeds = config.static_seeds.clone();
         let interval = config.lazarus_interval;
 
@@ -1425,9 +1727,7 @@ where
         // When tokio is not available, log a warning
         #[cfg(not(feature = "tokio"))]
         {
-            tracing::warn!(
-                "Lazarus task requires the 'tokio' feature. Seed recovery is disabled."
-            );
+            tracing::warn!("Lazarus task requires the 'tokio' feature. Seed recovery is disabled.");
         }
 
         handle
@@ -1437,7 +1737,7 @@ where
     ///
     /// This is used by the Lazarus task to check which seeds are currently alive.
     async fn get_alive_addresses(
-        memberlist: &memberlist_core::Memberlist<T, D>,
+        memberlist: &Memberlist<T, D>,
     ) -> std::collections::HashSet<SocketAddr> {
         let mut addrs = std::collections::HashSet::new();
 
@@ -1672,7 +1972,10 @@ mod tests {
             .with_discovery(discovery);
 
         assert_eq!(stack_config.local_id, 1);
-        assert_eq!(stack_config.discovery.bind_addr(), "0.0.0.0:7946".parse().unwrap());
+        assert_eq!(
+            stack_config.discovery.bind_addr(),
+            "0.0.0.0:7946".parse().unwrap()
+        );
         assert_eq!(stack_config.discovery.seeds().len(), 1);
     }
 }

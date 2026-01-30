@@ -47,6 +47,8 @@ pub struct QuicConfig {
     pub congestion: CongestionConfig,
     /// Connection migration configuration.
     pub migration: MigrationConfig,
+    /// Datagram configuration.
+    pub datagram: DatagramConfig,
     /// Plumtree-specific QUIC optimizations.
     pub plumtree: PlumtreeQuicConfig,
 }
@@ -103,7 +105,7 @@ impl QuicConfig {
             },
             migration: MigrationConfig {
                 enabled: true,
-                validate_path: true,
+                ..Default::default()
             },
             ..Default::default()
         }
@@ -188,6 +190,12 @@ impl QuicConfig {
         self
     }
 
+    /// Builder method to set datagram configuration.
+    pub fn with_datagram(mut self, datagram: DatagramConfig) -> Self {
+        self.datagram = datagram;
+        self
+    }
+
     /// Builder method to set Plumtree-specific configuration.
     pub fn with_plumtree(mut self, plumtree: PlumtreeQuicConfig) -> Self {
         self.plumtree = plumtree;
@@ -231,6 +239,26 @@ pub struct TlsConfig {
     ///
     /// Default: `"localhost"` (suitable for self-signed certs).
     pub server_name: Option<String>,
+
+    /// Expected peer ID for client certificate verification.
+    ///
+    /// When set and mTLS is enabled, incoming client certificates must contain
+    /// a SAN entry with format `peer:<expected_peer_id>`. Certificates without
+    /// a matching peer ID will be rejected.
+    ///
+    /// This provides MITM protection by binding application-layer peer identity
+    /// to transport-layer certificate identity.
+    ///
+    /// Default: `None` (any valid certificate is accepted).
+    pub expected_peer_id: Option<String>,
+
+    /// Require peer ID SAN in client certificates.
+    ///
+    /// When true, client certificates without a `peer:*` SAN entry will be
+    /// rejected, even if no specific `expected_peer_id` is set.
+    ///
+    /// Default: `false`.
+    pub require_peer_id: bool,
 }
 
 impl TlsConfig {
@@ -281,6 +309,79 @@ impl TlsConfig {
         self
     }
 
+    /// Enable mutual TLS with peer ID verification.
+    ///
+    /// When enabled:
+    /// - Server requires client certificates
+    /// - Client presents its certificate during handshake
+    /// - Peer ID is extracted from certificate SAN for identity verification
+    ///
+    /// This provides MITM attack prevention by binding transport-layer
+    /// identity to application-layer peer IDs.
+    ///
+    /// # Requirements
+    ///
+    /// Both server and client must have certificates configured via
+    /// `with_cert_path()` and `with_key_path()`. Optionally, set a CA
+    /// certificate via `with_ca_path()` for chain verification.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let tls = TlsConfig::new()
+    ///     .with_cert_path("certs/node1.crt")
+    ///     .with_key_path("certs/node1.key")
+    ///     .with_ca_path("certs/ca.crt")
+    ///     .with_mtls_verification();
+    /// ```
+    pub fn with_mtls_verification(mut self) -> Self {
+        self.mtls_enabled = true;
+        self
+    }
+
+    /// Set the expected peer ID for client certificate verification.
+    ///
+    /// When set, incoming client certificates must contain a SAN entry
+    /// with format `peer:<expected_peer_id>`. Certificates with a different
+    /// peer ID or no peer ID SAN will be rejected.
+    ///
+    /// # Security
+    ///
+    /// This provides MITM protection by ensuring that only the expected
+    /// peer can establish a connection. An attacker with a valid certificate
+    /// for a different peer ID will be rejected.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let tls = TlsConfig::new()
+    ///     .with_cert_path("certs/server.crt")
+    ///     .with_key_path("certs/server.key")
+    ///     .with_ca_path("certs/ca.crt")
+    ///     .with_mtls_verification()
+    ///     .with_expected_peer_id("node123");
+    /// ```
+    pub fn with_expected_peer_id(mut self, peer_id: impl Into<String>) -> Self {
+        self.expected_peer_id = Some(peer_id.into());
+        self.mtls_enabled = true; // Implicitly enable mTLS
+        self
+    }
+
+    /// Require peer ID SAN in client certificates.
+    ///
+    /// When enabled, client certificates must contain a `peer:*` SAN entry.
+    /// This is useful when you want to enforce peer ID presence without
+    /// verifying against a specific expected value.
+    ///
+    /// Note: This is automatically enforced when `expected_peer_id` is set.
+    pub fn with_require_peer_id(mut self, require: bool) -> Self {
+        self.require_peer_id = require;
+        if require {
+            self.mtls_enabled = true; // Implicitly enable mTLS
+        }
+        self
+    }
+
     /// Check if custom certificates are configured.
     pub fn has_custom_certs(&self) -> bool {
         self.cert_path.is_some() && self.key_path.is_some()
@@ -294,7 +395,7 @@ impl TlsConfig {
     /// Get the ALPN protocols, using defaults if not specified.
     pub fn alpn_protocols_or_default(&self) -> Vec<Vec<u8>> {
         if self.alpn_protocols.is_empty() {
-            vec![b"plumtree/1".to_vec()]
+            vec![super::tls::DEFAULT_ALPN.to_vec()]
         } else {
             self.alpn_protocols.clone()
         }
@@ -333,6 +434,15 @@ pub struct ConnectionConfig {
     ///
     /// Default: 1 second.
     pub retry_delay: Duration,
+
+    /// Timeout for acquiring a connection slot when at max capacity.
+    ///
+    /// When all connection slots are in use, new connection attempts will wait
+    /// up to this duration for a slot to become available before failing with
+    /// `MaxConnectionsReached`.
+    ///
+    /// Default: 5 seconds.
+    pub acquire_timeout: Duration,
 }
 
 impl Default for ConnectionConfig {
@@ -344,6 +454,7 @@ impl Default for ConnectionConfig {
             handshake_timeout: Duration::from_secs(10),
             retries: 3,
             retry_delay: Duration::from_secs(1),
+            acquire_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -387,6 +498,12 @@ impl ConnectionConfig {
     /// Builder method to set retry delay.
     pub fn with_retry_delay(mut self, delay: Duration) -> Self {
         self.retry_delay = delay;
+        self
+    }
+
+    /// Builder method to set acquire timeout.
+    pub fn with_acquire_timeout(mut self, timeout: Duration) -> Self {
+        self.acquire_timeout = timeout;
         self
     }
 }
@@ -471,35 +588,61 @@ impl StreamConfig {
 
 /// 0-RTT early data configuration.
 ///
-/// # ⚠️ Not Yet Implemented
+/// When enabled, the transport configures TLS session resumption and early data
+/// support. This allows reconnections to previously-visited servers to send data
+/// before the TLS handshake completes, reducing latency.
 ///
-/// **Important**: The 0-RTT configuration is currently a **placeholder** for future
-/// implementation. Setting `enabled: true` has **no effect** - all messages are sent
-/// via regular 1-RTT streams regardless of this setting.
+/// # How It Works
 ///
-/// The configuration is provided to:
-/// 1. Reserve the API for future 0-RTT support
-/// 2. Allow applications to express intent for when support is added
-/// 3. Document the security considerations upfront
+/// 1. **First connection**: Normal TLS handshake, server sends session ticket
+/// 2. **Subsequent connections**: Client uses ticket for 0-RTT data
+/// 3. **Session tickets** are cached internally by rustls
 ///
-/// Full 0-RTT support requires:
-/// - Session ticket caching for connection resumption
-/// - Using `connection.open_uni_early()` for early data
-/// - Handling `EarlyDataRejected` errors with fallback
+/// # ⚠️ SECURITY WARNING - REPLAY ATTACKS ⚠️
 ///
-/// # Security Warning (for future implementation)
+/// **0-RTT data is replayable!** An attacker who captures 0-RTT packets can
+/// replay them to the server. This is a fundamental property of 0-RTT, not a bug.
 ///
-/// 0-RTT data is **replayable**! An attacker can capture and replay 0-RTT packets.
-/// Only enable 0-RTT for idempotent operations (like Gossip messages).
+/// ## What This Means for Plumtree
 ///
-/// **Never** send Graft or Prune control messages via 0-RTT.
+/// When 0-RTT is enabled, **ALL messages** (including Graft and Prune) may be
+/// sent as early data and are therefore **replayable**. The transport layer
+/// cannot distinguish message types without parsing the application-layer
+/// envelope, which requires knowing the peer ID serialization length.
+///
+/// ## Risk Assessment
+///
+/// | Message Type | Replay Impact | Risk Level |
+/// |--------------|---------------|------------|
+/// | **Gossip** | Duplicate delivery (handled by dedup) | LOW |
+/// | **IHave** | Duplicate announcement (harmless) | LOW |
+/// | **Graft** | May re-promote peer to eager set | MEDIUM |
+/// | **Prune** | May re-demote peer to lazy set | MEDIUM |
+///
+/// **Recommendation**: Only enable 0-RTT if:
+/// - Your network is trusted (no active attackers)
+/// - The latency reduction is worth the replay risk
+/// - You understand that tree topology may be affected by replays
+///
+/// # Configuration
+///
+/// ```ignore
+/// // ⚠️ Only enable if you understand the replay risks!
+/// let config = QuicConfig::default().with_zero_rtt(
+///     ZeroRttConfig::default()
+///         .with_enabled(true)
+///         .with_session_cache_capacity(1024),
+/// );
+/// ```
 #[derive(Debug, Clone)]
 pub struct ZeroRttConfig {
     /// Enable 0-RTT early data.
     ///
-    /// **Note**: Currently has no effect. See struct-level documentation.
+    /// **⚠️ WARNING**: When enabled, ALL messages (including Graft/Prune) may
+    /// be sent as replayable early data. Only enable in trusted networks where
+    /// the latency benefit outweighs the replay attack risk.
     ///
-    /// Default: false (safe default).
+    /// Default: false (safe default - no replay risk).
     pub enabled: bool,
 
     /// Maximum size of early data.
@@ -511,22 +654,14 @@ pub struct ZeroRttConfig {
     ///
     /// Default: 256.
     pub session_cache_capacity: usize,
-
-    /// Only allow 0-RTT for Gossip messages (idempotent).
-    ///
-    /// Graft/Prune/IHave are never sent via 0-RTT when this is true.
-    ///
-    /// Default: true.
-    pub gossip_only: bool,
 }
 
 impl Default for ZeroRttConfig {
     fn default() -> Self {
         Self {
-            enabled: false,            // Safe default: disabled
+            enabled: false,            // Safe default: disabled (no replay risk)
             max_early_data: 16 * 1024, // 16KB
             session_cache_capacity: 256,
-            gossip_only: true, // Only Gossip via 0-RTT
         }
     }
 }
@@ -538,6 +673,9 @@ impl ZeroRttConfig {
     }
 
     /// Builder method to enable 0-RTT.
+    ///
+    /// **⚠️ WARNING**: Enabling 0-RTT makes ALL messages (including Graft/Prune)
+    /// vulnerable to replay attacks. Only enable in trusted networks.
     pub fn with_enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
         self
@@ -552,12 +690,6 @@ impl ZeroRttConfig {
     /// Builder method to set session cache capacity.
     pub fn with_session_cache_capacity(mut self, capacity: usize) -> Self {
         self.session_cache_capacity = capacity;
-        self
-    }
-
-    /// Builder method to set gossip-only mode.
-    pub fn with_gossip_only(mut self, gossip_only: bool) -> Self {
-        self.gossip_only = gossip_only;
         self
     }
 }
@@ -655,6 +787,15 @@ pub struct MigrationConfig {
     ///
     /// Default: true.
     pub validate_path: bool,
+
+    /// Timeout for path validation during migration.
+    ///
+    /// When a peer migrates to a new address, QUIC validates the new path
+    /// before accepting it. This timeout controls how long to wait for
+    /// path validation to complete.
+    ///
+    /// Default: 5 seconds.
+    pub path_validation_timeout: Duration,
 }
 
 impl Default for MigrationConfig {
@@ -662,6 +803,7 @@ impl Default for MigrationConfig {
         Self {
             enabled: true,
             validate_path: true,
+            path_validation_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -683,17 +825,111 @@ impl MigrationConfig {
         self.validate_path = validate;
         self
     }
+
+    /// Builder method to set path validation timeout.
+    pub fn with_path_validation_timeout(mut self, timeout: Duration) -> Self {
+        self.path_validation_timeout = timeout;
+        self
+    }
+}
+
+/// QUIC datagram configuration.
+///
+/// QUIC datagrams (RFC 9221) provide a way to send unreliable data without
+/// stream overhead. This is useful for gossip messages that are:
+/// - Small (typically < 1200 bytes)
+/// - Fire-and-forget (application handles retransmission)
+/// - Latency-sensitive (no head-of-line blocking)
+///
+/// # When to Use Datagrams vs Streams
+///
+/// | Use Case | Recommended |
+/// |----------|-------------|
+/// | Small gossip messages | Datagrams |
+/// | Large payloads (> MTU) | Streams |
+/// | Control messages (Graft/Prune) | Streams (reliability needed) |
+/// | High-throughput bulk data | Streams |
+#[derive(Debug, Clone)]
+pub struct DatagramConfig {
+    /// Enable QUIC datagrams for message delivery.
+    ///
+    /// Default: false (use streams for compatibility).
+    pub enabled: bool,
+
+    /// Maximum datagram size.
+    ///
+    /// Messages larger than this will fall back to streams if `fallback_to_stream`
+    /// is enabled, otherwise the send will fail.
+    ///
+    /// Default: 1200 bytes (conservative MTU-safe value).
+    pub max_datagram_size: u16,
+
+    /// Fall back to streams when message exceeds max_datagram_size.
+    ///
+    /// When true, oversized messages automatically use streams instead of failing.
+    /// When false, sending a message larger than max_datagram_size returns an error.
+    ///
+    /// Default: true.
+    pub fallback_to_stream: bool,
+}
+
+impl Default for DatagramConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_datagram_size: 1200,
+            fallback_to_stream: true,
+        }
+    }
+}
+
+impl DatagramConfig {
+    /// Create a new datagram configuration.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Builder method to enable datagrams.
+    pub fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    /// Builder method to set max datagram size.
+    pub fn with_max_datagram_size(mut self, size: u16) -> Self {
+        self.max_datagram_size = size;
+        self
+    }
+
+    /// Builder method to set fallback behavior.
+    pub fn with_fallback_to_stream(mut self, fallback: bool) -> Self {
+        self.fallback_to_stream = fallback;
+        self
+    }
 }
 
 /// Plumtree-specific QUIC optimizations.
+///
+/// # Priority Streams (Future Feature)
+///
+/// The `priority_streams` and `priorities` fields are reserved for future implementation.
+/// Currently, all messages use the same stream type. When implemented, priority streams
+/// would allow different message types (Gossip, Graft, Prune, IHave) to use different
+/// QUIC stream priorities, ensuring critical messages (like Graft for tree repair) are
+/// delivered before less urgent messages.
 #[derive(Debug, Clone)]
 pub struct PlumtreeQuicConfig {
     /// Use priority streams for different message types.
+    ///
+    /// **Note:** This feature is not yet implemented. All messages currently use
+    /// the same stream type regardless of this setting.
     ///
     /// Default: true.
     pub priority_streams: bool,
 
     /// Priority levels for different message types.
+    ///
+    /// **Note:** Reserved for future use. Not currently applied to streams.
     pub priorities: MessagePriorities,
 
     /// Automatically record RTT to peer scoring.
@@ -740,6 +976,13 @@ impl PlumtreeQuicConfig {
 /// Priority levels for different Plumtree message types.
 ///
 /// Higher values = higher priority.
+///
+/// # Future Feature
+///
+/// This configuration is reserved for future priority stream implementation.
+/// Currently, these values are not applied to message delivery. When implemented,
+/// messages with higher priority values would be scheduled for delivery before
+/// lower priority messages during congestion.
 #[derive(Debug, Clone)]
 pub struct MessagePriorities {
     /// Priority for Gossip messages (full payload).
@@ -814,8 +1057,7 @@ mod tests {
         let config = QuicConfig::default();
         assert_eq!(config.connection.idle_timeout, Duration::from_secs(30));
         assert_eq!(config.connection.max_connections, 256);
-        assert!(!config.zero_rtt.enabled);
-        assert!(config.zero_rtt.gossip_only);
+        assert!(!config.zero_rtt.enabled); // 0-RTT disabled by default for safety
     }
 
     #[test]

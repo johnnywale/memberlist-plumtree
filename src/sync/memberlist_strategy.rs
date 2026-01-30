@@ -233,7 +233,11 @@ where
                 return Ok(None);
             }
 
-            tracing::debug!(?from, ids = message_ids.len(), "sync response - checking for missing");
+            tracing::debug!(
+                ?from,
+                ids = message_ids.len(),
+                "sync response - checking for missing"
+            );
 
             if let Some(pull) = sync_handler
                 .handle_sync_response(message_ids.to_vec())
@@ -282,8 +286,7 @@ mod tests {
         let sync_handler = Arc::new(SyncHandler::new(store));
         let (tx, rx) = async_channel::bounded(64);
 
-        let strategy =
-            MemberlistSyncStrategy::new(sync_handler, Duration::from_secs(90), tx);
+        let strategy = MemberlistSyncStrategy::new(sync_handler, Duration::from_secs(90), tx);
 
         (strategy, rx)
     }

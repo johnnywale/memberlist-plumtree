@@ -3,7 +3,7 @@
 //! These tests verify the end-to-end behavior of Plumtree broadcast,
 //! including message delivery, deduplication, and tree repair.
 
-use bytes::Bytes;
+use bytes::{BufMut, Bytes};
 use memberlist_plumtree::{
     MessageId, PeerTopology, Plumtree, PlumtreeConfig, PlumtreeDelegate, PlumtreeDiscovery,
     PlumtreeMessage,
@@ -98,10 +98,14 @@ async fn test_two_node_broadcast() {
         .unwrap();
 
     // Simulate message delivery to node 2
+    // Note: Payload must include compression header byte (0 = not compressed)
+    let mut payload_with_header = bytes::BytesMut::with_capacity(1 + 12);
+    payload_with_header.put_u8(0); // compression flags: not compressed
+    payload_with_header.put_slice(b"test message");
     let gossip_msg = PlumtreeMessage::Gossip {
         id: msg_id,
         round: 0,
-        payload: Bytes::from("test message"),
+        payload: payload_with_header.freeze(),
     };
 
     plumtree2
@@ -128,7 +132,11 @@ async fn test_duplicate_detection() {
     plumtree.add_peer(NodeId(2));
 
     let msg_id = MessageId::new();
-    let payload = Bytes::from("duplicate test");
+    // Note: Payload must include compression header byte (0 = not compressed)
+    let mut payload_with_header = bytes::BytesMut::with_capacity(1 + 14);
+    payload_with_header.put_u8(0); // compression flags: not compressed
+    payload_with_header.put_slice(b"duplicate test");
+    let payload = payload_with_header.freeze();
 
     // Receive same message multiple times
     for i in 0..5 {
@@ -328,10 +336,14 @@ async fn test_multi_hop_propagation() {
     let msg_id = plumtree1.broadcast(Bytes::from("multi-hop")).await.unwrap();
 
     // Simulate delivery to Node 2
+    // Note: Payload must include compression header byte (0 = not compressed)
+    let mut payload_with_header = bytes::BytesMut::with_capacity(1 + 9);
+    payload_with_header.put_u8(0); // compression flags: not compressed
+    payload_with_header.put_slice(b"multi-hop");
     let gossip1 = PlumtreeMessage::Gossip {
         id: msg_id,
         round: 0,
-        payload: Bytes::from("multi-hop"),
+        payload: payload_with_header.freeze(),
     };
     plumtree2.handle_message(NodeId(1), gossip1).await.unwrap();
 
@@ -343,10 +355,14 @@ async fn test_multi_hop_propagation() {
     assert!(outgoing.is_some());
 
     // Simulate delivery to Node 3 (round incremented)
+    // Note: Payload must include compression header byte (0 = not compressed)
+    let mut payload2_with_header = bytes::BytesMut::with_capacity(1 + 9);
+    payload2_with_header.put_u8(0); // compression flags: not compressed
+    payload2_with_header.put_slice(b"multi-hop");
     let gossip2 = PlumtreeMessage::Gossip {
         id: msg_id,
         round: 1,
-        payload: Bytes::from("multi-hop"),
+        payload: payload2_with_header.freeze(),
     };
     plumtree3.handle_message(NodeId(2), gossip2).await.unwrap();
 
@@ -369,13 +385,17 @@ async fn test_shutdown() {
     assert!(plumtree.is_shutdown());
 
     // Operations should fail after shutdown
+    // Note: Payload must include compression header byte (0 = not compressed)
+    let mut payload_with_header = bytes::BytesMut::with_capacity(1 + 4);
+    payload_with_header.put_u8(0); // compression flags: not compressed
+    payload_with_header.put_slice(b"test");
     let result = plumtree
         .handle_message(
             NodeId(2),
             PlumtreeMessage::Gossip {
                 id: MessageId::new(),
                 round: 0,
-                payload: Bytes::from("test"),
+                payload: payload_with_header.freeze(),
             },
         )
         .await;
@@ -440,11 +460,15 @@ async fn test_message_parent_tracking() {
     plumtree2.add_peer(NodeId(3));
 
     // Node 1 sends a message to Node 2
+    // Note: Payload must include compression header byte (0 = not compressed)
     let msg_id = MessageId::new();
+    let mut payload_with_header = bytes::BytesMut::with_capacity(1 + 20);
+    payload_with_header.put_u8(0); // compression flags: not compressed
+    payload_with_header.put_slice(b"parent tracking test");
     let gossip = PlumtreeMessage::Gossip {
         id: msg_id,
         round: 0,
-        payload: Bytes::from("parent tracking test"),
+        payload: payload_with_header.freeze(),
     };
 
     plumtree2.handle_message(NodeId(1), gossip).await.unwrap();
@@ -946,8 +970,12 @@ impl Transport<MemberlistNodeId> for IntegrationTestTransport {
 
     async fn send_to(&self, target: &MemberlistNodeId, data: Bytes) -> Result<(), Self::Error> {
         if let Some((sender, msg)) = decode_plumtree_envelope::<MemberlistNodeId>(&data) {
-            let routes = self.routes.read();
-            if let Some(tx) = routes.get(target) {
+            // Clone the sender to avoid holding lock across await
+            let tx = {
+                let routes = self.routes.read();
+                routes.get(target).cloned()
+            };
+            if let Some(tx) = tx {
                 tx.send((sender, msg))
                     .await
                     .map_err(|e| IntegrationTestTransportError(e.to_string()))?;

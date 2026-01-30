@@ -54,12 +54,7 @@ where
 {
     type Handle = SimpleDiscoveryHandle;
 
-    async fn start(
-        &self,
-    ) -> (
-        async_channel::Receiver<DiscoveryEvent<I>>,
-        Self::Handle,
-    ) {
+    async fn start(&self) -> (async_channel::Receiver<DiscoveryEvent<I>>, Self::Handle) {
         let (tx, rx) = async_channel::bounded(1);
         let running = Arc::new(AtomicBool::new(true));
 

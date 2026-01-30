@@ -105,7 +105,13 @@ where
         peers: Arc<PeerState<I>>,
         shutdown: Arc<AtomicBool>,
     ) -> Self {
-        Self::new(local_id, sync_handler, peers, SyncConfig::enabled(), shutdown)
+        Self::new(
+            local_id,
+            sync_handler,
+            peers,
+            SyncConfig::enabled(),
+            shutdown,
+        )
     }
 
     /// Get the sync handler reference.
@@ -324,13 +330,7 @@ mod tests {
         let peers = Arc::new(PeerState::new());
         let shutdown = Arc::new(AtomicBool::new(false));
 
-        PlumtreeSyncStrategy::new(
-            0u64,
-            sync_handler,
-            peers,
-            SyncConfig::enabled(),
-            shutdown,
-        )
+        PlumtreeSyncStrategy::new(0u64, sync_handler, peers, SyncConfig::enabled(), shutdown)
     }
 
     #[test]

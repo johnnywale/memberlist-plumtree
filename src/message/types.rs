@@ -16,6 +16,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use smallvec::SmallVec;
 
 use super::MessageId;
+use crate::priority::MessagePriority;
 
 /// Maximum number of IHave message IDs in a single batch.
 pub const MAX_IHAVE_BATCH: usize = 64;
@@ -215,6 +216,23 @@ impl PlumtreeMessage {
         }
     }
 
+    /// Get the priority level for this message type.
+    ///
+    /// Priority determines processing order under backpressure:
+    /// - **Critical**: Graft messages - tree repair is time-sensitive
+    /// - **High**: Gossip messages - payload delivery
+    /// - **Normal**: IHave/Sync messages - announcements and sync
+    /// - **Low**: Prune messages - optimization
+    pub fn priority(&self) -> MessagePriority {
+        match self {
+            PlumtreeMessage::Graft { .. } => MessagePriority::Critical,
+            PlumtreeMessage::Gossip { .. } => MessagePriority::High,
+            PlumtreeMessage::IHave { .. } => MessagePriority::Normal,
+            PlumtreeMessage::Sync(_) => MessagePriority::Normal,
+            PlumtreeMessage::Prune => MessagePriority::Low,
+        }
+    }
+
     /// Decode a message from bytes.
     pub fn decode(buf: &mut impl Buf) -> Option<Self> {
         if buf.remaining() < 1 {
@@ -280,8 +298,8 @@ impl PlumtreeMessage {
 
     /// Decode a message from a byte slice.
     pub fn decode_from_slice(data: &[u8]) -> Option<Self> {
-        let mut cursor = std::io::Cursor::new(data);
-        Self::decode(&mut cursor)
+        let mut buf = data;
+        Self::decode(&mut buf)
     }
 
     /// Check if this is a Gossip message.
@@ -506,8 +524,8 @@ impl SyncMessage {
 
     /// Decode a sync message from a byte slice.
     pub fn decode_from_slice(data: &[u8]) -> Option<Self> {
-        let mut cursor = std::io::Cursor::new(data);
-        Self::decode(&mut cursor)
+        let mut buf = data;
+        Self::decode(&mut buf)
     }
 
     /// Get the message tag.

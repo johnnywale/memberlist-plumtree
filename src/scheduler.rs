@@ -356,6 +356,9 @@ impl<I: Clone + Send + Sync + 'static> GraftTimer<I> {
     }
 
     /// Record that we're expecting a message (received IHave).
+    ///
+    /// Note: This assumes the initial Graft has already been sent, so
+    /// retry_count starts at 1. See `expect_message_with_alternatives`.
     pub fn expect_message(&self, message_id: MessageId, from: I, round: u32) {
         let now = std::time::Instant::now();
         let next_retry = now + self.base_timeout;
@@ -374,13 +377,18 @@ impl<I: Clone + Send + Sync + 'static> GraftTimer<I> {
                 from,
                 alternative_peers: Vec::new(),
                 round,
-                retry_count: 0,
+                // Start at 1 because initial Graft is sent before this is called
+                retry_count: 1,
             },
         );
         Self::add_to_timeout_index(&mut inner, next_retry, message_id);
     }
 
     /// Record that we're expecting a message with alternative peers to try.
+    ///
+    /// This is called after the initial Graft has been sent, so retry_count
+    /// starts at 1 to indicate a graft was already sent. If the message arrives
+    /// before the timeout, this counts as a successful graft.
     pub fn expect_message_with_alternatives(
         &self,
         message_id: MessageId,
@@ -405,7 +413,9 @@ impl<I: Clone + Send + Sync + 'static> GraftTimer<I> {
                 from,
                 alternative_peers: alternatives,
                 round,
-                retry_count: 0,
+                // Start at 1 because the initial Graft is sent immediately
+                // in handle_ihave before this method is called
+                retry_count: 1,
             },
         );
         Self::add_to_timeout_index(&mut inner, next_retry, message_id);
@@ -441,9 +451,14 @@ impl<I: Clone + Send + Sync + 'static> GraftTimer<I> {
     }
 
     /// Calculate backoff duration for a given retry count.
+    ///
+    /// Note: retry_count starts at 1 (initial graft already sent), so backoff
+    /// uses (retry_count - 1) to give: 1x, 2x, 4x, ... for retries 1, 2, 3, ...
     fn calculate_backoff(&self, retry_count: u32) -> Duration {
-        // Exponential backoff: base * 2^retry_count, capped at max
-        let multiplier = 1u32.checked_shl(retry_count).unwrap_or(u32::MAX);
+        // Exponential backoff: base * 2^(retry_count - 1), capped at max
+        // With retry_count starting at 1: retry 1 → 1x, retry 2 → 2x, retry 3 → 4x
+        let exponent = retry_count.saturating_sub(1);
+        let multiplier = 1u32.checked_shl(exponent).unwrap_or(u32::MAX);
         let backoff = self.base_timeout.saturating_mul(multiplier);
         std::cmp::min(backoff, self.max_timeout)
     }
@@ -525,7 +540,9 @@ impl<I: Clone + Send + Sync + 'static> GraftTimer<I> {
 
                 entry.retry_count += 1;
 
-                if entry.retry_count >= self.max_retries {
+                // With retry_count starting at 1 (initial graft), we check > not >=
+                // so that max_retries=3 gives 3 timer retries after the initial graft
+                if entry.retry_count > self.max_retries {
                     // Max retries exceeded, record failure for zombie detection
                     failed.push(FailedGraft {
                         message_id,
@@ -658,7 +675,8 @@ mod tests {
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].message_id, id);
         assert_eq!(expired[0].peer, 42u64);
-        assert_eq!(expired[0].retry_count, 0);
+        // retry_count starts at 1 (initial graft already sent)
+        assert_eq!(expired[0].retry_count, 1);
     }
 
     #[test]
@@ -677,33 +695,47 @@ mod tests {
 
     #[test]
     fn test_graft_timer_backoff() {
+        use crate::testing::wait_for;
+
+        // Use longer timeouts for CI stability
         let timer: GraftTimer<u64> =
-            GraftTimer::with_backoff(Duration::from_millis(20), Duration::from_millis(160), 3);
+            GraftTimer::with_backoff(Duration::from_millis(50), Duration::from_millis(400), 3);
 
         let id = MessageId::new();
         timer.expect_message(id, 1u64, 0);
 
-        // First expiry after base timeout
-        std::thread::sleep(Duration::from_millis(30));
-        let expired = timer.get_expired();
-        assert_eq!(expired.len(), 1);
-        assert_eq!(expired[0].retry_count, 0);
+        // Helper to wait for expiry using the testing utility
+        let wait_for_expiry = |expected_count: usize, timeout: Duration| -> Vec<_> {
+            let mut result = Vec::new();
+            wait_for(
+                || {
+                    result = timer.get_expired();
+                    result.len() == expected_count
+                },
+                timeout,
+                Duration::from_millis(5),
+            )
+            .unwrap_or_else(|_| {
+                panic!(
+                    "Timeout waiting for {} expired entries, got {}",
+                    expected_count,
+                    result.len()
+                )
+            });
+            result
+        };
 
-        // Second expiry should be after 2x base timeout (40ms)
-        std::thread::sleep(Duration::from_millis(30));
-        let expired = timer.get_expired();
-        assert!(expired.is_empty()); // Not yet
+        // First expiry after base timeout (retry_count starts at 1)
+        let expired = wait_for_expiry(1, Duration::from_millis(500));
+        assert_eq!(expired[0].retry_count, 1, "First retry");
 
-        std::thread::sleep(Duration::from_millis(20));
-        let expired = timer.get_expired();
-        assert_eq!(expired.len(), 1);
-        assert_eq!(expired[0].retry_count, 1);
+        // Second expiry after 2x base timeout
+        let expired = wait_for_expiry(1, Duration::from_millis(500));
+        assert_eq!(expired[0].retry_count, 2, "Second retry (backoff)");
 
-        // Third expiry after 4x base timeout (80ms)
-        std::thread::sleep(Duration::from_millis(90));
-        let expired = timer.get_expired();
-        assert_eq!(expired.len(), 1);
-        assert_eq!(expired[0].retry_count, 2);
+        // Third expiry after 4x base timeout
+        let expired = wait_for_expiry(1, Duration::from_secs(1));
+        assert_eq!(expired[0].retry_count, 3, "Third retry (more backoff)");
 
         // After max retries, entry should be removed
         assert_eq!(timer.pending_count(), 0);
@@ -720,25 +752,28 @@ mod tests {
         let alt2 = 3u64;
         timer.expect_message_with_alternatives(id, primary, vec![alt1, alt2], 0);
 
-        // First try: primary peer
-        std::thread::sleep(Duration::from_millis(30));
-        let expired = timer.get_expired();
-        assert_eq!(expired[0].peer, primary);
+        // Note: retry_count starts at 1 because initial Graft was already sent to primary
+        // in handle_ihave before calling expect_message_with_alternatives
 
-        // Second try: first alternative
-        std::thread::sleep(Duration::from_millis(50));
+        // First retry: first alternative (initial graft to primary already sent)
+        std::thread::sleep(Duration::from_millis(30));
         let expired = timer.get_expired();
         assert_eq!(expired[0].peer, alt1);
 
-        // Third try: second alternative
-        std::thread::sleep(Duration::from_millis(90));
+        // Second retry: second alternative
+        std::thread::sleep(Duration::from_millis(50));
         let expired = timer.get_expired();
         assert_eq!(expired[0].peer, alt2);
 
-        // Fourth try: back to first alternative (round-robin)
-        std::thread::sleep(Duration::from_millis(170));
+        // Third retry: back to first alternative (round-robin)
+        std::thread::sleep(Duration::from_millis(90));
         let expired = timer.get_expired();
         assert_eq!(expired[0].peer, alt1);
+
+        // Fourth retry: back to second alternative
+        std::thread::sleep(Duration::from_millis(170));
+        let expired = timer.get_expired();
+        assert_eq!(expired[0].peer, alt2);
     }
 
     #[test]

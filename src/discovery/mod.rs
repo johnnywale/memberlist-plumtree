@@ -55,16 +55,30 @@ pub use traits::{ClusterDiscovery, DiscoveryEvent, DiscoveryHandle, SimpleDiscov
 #[cfg(feature = "memberlist")]
 pub use memberlist::{
     // Memberlist delegate traits
-    AliveDelegate, ConflictDelegate, Delegate, EventDelegate, MergeDelegate, NodeDelegate,
-    PingDelegate, VoidDelegate,
-    // Memberlist types
-    Memberlist, Meta, NodeState,
-    // nodecraft types
-    CheapClone, Id,
-    // Plumtree-specific types
-    DemotionCallback, PlumtreeNodeDelegate, PromotionCallback,
+    AliveDelegate,
     // Bridge integration types
-    BridgeEventDelegate, MemberlistStack, MemberlistStackError, PlumtreeStackBuilder,
+    BridgeEventDelegate,
+    // nodecraft types
+    CheapClone,
+    ConflictDelegate,
+    Delegate,
+    // Plumtree-specific types
+    DemotionCallback,
+    EventDelegate,
+    Id,
+    // Memberlist types
+    Memberlist,
+    MemberlistStack,
+    MemberlistStackError,
+    MergeDelegate,
+    Meta,
+    NodeDelegate,
+    NodeState,
+    PingDelegate,
+    PlumtreeNodeDelegate,
+    PlumtreeStackBuilder,
+    PromotionCallback,
+    VoidDelegate,
 };
 
 // Re-export nodecraft types unconditionally (needed for IdCodec)

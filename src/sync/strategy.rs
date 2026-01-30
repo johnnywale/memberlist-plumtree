@@ -118,7 +118,11 @@ where
     /// * `buf` - Remote sync state bytes from peer's `local_state()`
     /// * `peer_resolver` - Callback to get a peer ID for follow-up requests.
     ///   Called only if sync is needed after hash comparison.
-    fn merge_remote_state<F>(&self, buf: &[u8], peer_resolver: F) -> impl Future<Output = ()> + Send
+    fn merge_remote_state<F>(
+        &self,
+        buf: &[u8],
+        peer_resolver: F,
+    ) -> impl Future<Output = ()> + Send
     where
         F: FnOnce() -> Option<I> + Send;
 

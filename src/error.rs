@@ -86,6 +86,9 @@ pub enum Error {
 
     /// Custom error with message.
     Custom(String),
+
+    /// Storage operation failed.
+    Storage(String),
 }
 
 impl fmt::Display for Error {
@@ -138,6 +141,9 @@ impl fmt::Display for Error {
             Error::Custom(msg) => {
                 write!(f, "{}", msg)
             }
+            Error::Storage(msg) => {
+                write!(f, "storage error: {}", msg)
+            }
         }
     }
 }
@@ -176,6 +182,9 @@ impl Error {
 
             // Custom errors default to transient (conservative approach)
             Error::Custom(_) => ErrorKind::Transient,
+
+            // Storage errors are transient (may succeed on retry)
+            Error::Storage(_) => ErrorKind::Transient,
         }
     }
 
@@ -258,7 +267,7 @@ mod tests {
 
     #[test]
     fn test_error_from_io() {
-        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "test error");
+        let io_err = std::io::Error::other("test error");
         let err: Error = io_err.into();
         assert!(matches!(err, Error::Io(_)));
     }

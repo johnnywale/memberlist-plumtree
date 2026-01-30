@@ -4,11 +4,14 @@
 //! Periodically probes seeds to detect availability.
 
 use super::traits::{ClusterDiscovery, DiscoveryEvent, SimpleDiscoveryHandle};
+#[cfg(feature = "tokio")]
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+#[cfg(feature = "tokio")]
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -144,47 +147,42 @@ where
 {
     type Handle = SimpleDiscoveryHandle;
 
-    async fn start(
-        &self,
-    ) -> (
-        async_channel::Receiver<DiscoveryEvent<I>>,
-        Self::Handle,
-    ) {
+    async fn start(&self) -> (async_channel::Receiver<DiscoveryEvent<I>>, Self::Handle) {
         let (tx, rx) = async_channel::bounded(self.config.seeds.len().max(16));
         let running = Arc::new(AtomicBool::new(true));
         let handle = SimpleDiscoveryHandle::new(running.clone());
 
         // Clone config for the background task
         let seeds = self.config.seeds.clone();
-        let probe_interval = self.config.probe_interval;
-        let _probe_timeout = self.config.probe_timeout;
-        let initial_delay = self.config.initial_delay;
         let emit_on_start = self.config.emit_on_start;
 
         // Spawn background probe task
         #[cfg(feature = "tokio")]
-        tokio::spawn(async move {
-            Self::run_discovery_loop(
-                tx,
-                running,
-                seeds,
-                probe_interval,
-                initial_delay,
-                emit_on_start,
-            )
-            .await;
-        });
+        {
+            let probe_interval = self.config.probe_interval;
+            let initial_delay = self.config.initial_delay;
+            tokio::spawn(async move {
+                Self::run_discovery_loop(
+                    tx,
+                    running,
+                    seeds,
+                    probe_interval,
+                    initial_delay,
+                    emit_on_start,
+                )
+                .await;
+            });
+        }
 
         #[cfg(not(feature = "tokio"))]
         {
             // For non-tokio builds, emit seeds synchronously
             if emit_on_start {
                 for (id, addr) in &seeds {
-                    let _ = tx
-                        .try_send(DiscoveryEvent::PeerDiscovered {
-                            id: id.clone(),
-                            addr: *addr,
-                        });
+                    let _ = tx.try_send(DiscoveryEvent::PeerDiscovered {
+                        id: id.clone(),
+                        addr: *addr,
+                    });
                 }
             }
         }
@@ -194,6 +192,10 @@ where
 
     fn local_addr(&self) -> Option<SocketAddr> {
         self.local_addr
+    }
+
+    fn initial_peers(&self) -> Vec<(I, SocketAddr)> {
+        self.config.seeds.clone()
     }
 }
 

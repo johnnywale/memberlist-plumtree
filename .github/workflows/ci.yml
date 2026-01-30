@@ -10,21 +10,95 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Format check - runs quickly, fail fast
+  fmt:
+    name: Formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+  # Clippy lint check
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-clippy-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-clippy-
+      - name: Run clippy
+        run: cargo clippy --all-features --all-targets -- -D warnings
+
+  # Documentation build
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-docs-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-docs-
+      - name: Build documentation
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  # Dependency audit
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      - name: Run cargo deny
+        run: cargo deny check
+
+  # Main test suite - multi-platform
   test:
-    name: Test
+    name: Test (${{ matrix.os }} / ${{ matrix.rust }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        os: [ ubuntu-latest ]
-        rust: [ stable ]
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        rust: [stable, "1.85.0"]  # stable + MSRV
+        exclude:
+          # Only test MSRV on Linux to save CI time
+          - os: windows-latest
+            rust: "1.85.0"
+          - os: macos-latest
+            rust: "1.85.0"
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
-          components: rustfmt, clippy
+          toolchain: ${{ matrix.rust }}
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -39,3 +113,31 @@ jobs:
 
       - name: Run tests
         run: cargo test --all-features
+
+  # Feature combinations test
+  features:
+    name: Feature Combinations
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-features-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-features-
+      - name: Test no default features
+        run: cargo check --no-default-features
+      - name: Test minimal features
+        run: cargo check --no-default-features --features "tokio"
+      - name: Test without memberlist
+        run: cargo check --no-default-features --features "tokio,quic"
+      - name: Test with sync
+        run: cargo test --features "tokio,sync,metrics"
+      - name: Test with storage-sled
+        run: cargo check --features "storage-sled"

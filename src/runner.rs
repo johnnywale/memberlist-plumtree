@@ -100,7 +100,9 @@ where
     /// Run the outgoing message processor with proper unicast delivery.
     pub async fn run_outgoing_processor(&self) {
         while let Some(outgoing) = self.handle.next_outgoing().await {
-            let OutgoingMessage { target, message } = outgoing;
+            let OutgoingMessage {
+                target, message, ..
+            } = outgoing;
 
             // Encode the message
             let encoded = encode_plumtree_message(&message);
@@ -218,7 +220,9 @@ where
     /// to the memberlist broadcast channel.
     pub async fn run_outgoing_processor(&self) {
         while let Some(outgoing) = self.handle.next_outgoing().await {
-            let OutgoingMessage { target: _, message } = outgoing;
+            let OutgoingMessage {
+                target: _, message, ..
+            } = outgoing;
 
             // Encode the message with Plumtree magic prefix
             let encoded = encode_plumtree_message(&message);

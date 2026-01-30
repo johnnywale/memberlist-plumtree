@@ -13,8 +13,8 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use memberlist_plumtree::storage::{current_time_ms, MemoryStore, MessageStore};
 use memberlist_plumtree::sync::{MemberlistSyncStrategy, SyncHandler, SyncStrategy};
 use memberlist_plumtree::{
-    IdCodec, MessageId, PlumtreeConfig, PlumtreeDelegate, PlumtreeDiscovery,
-    StorageConfig, SyncConfig, SyncMessage,
+    IdCodec, MessageId, PlumtreeConfig, PlumtreeDelegate, PlumtreeDiscovery, StorageConfig,
+    SyncConfig, SyncMessage,
 };
 use nodecraft::CheapClone;
 use parking_lot::Mutex;
@@ -81,7 +81,11 @@ impl TrackingDelegate {
     }
 
     fn get_payloads(&self) -> Vec<Bytes> {
-        self.delivered.lock().iter().map(|(_, p)| p.clone()).collect()
+        self.delivered
+            .lock()
+            .iter()
+            .map(|(_, p)| p.clone())
+            .collect()
     }
 }
 
@@ -196,7 +200,10 @@ async fn test_memberlist_strategy_merge_no_sync_on_match() {
         .await;
 
     // Should NOT have received any sync request
-    assert!(rx.try_recv().is_err(), "should NOT have sync request when hashes match");
+    assert!(
+        rx.try_recv().is_err(),
+        "should NOT have sync request when hashes match"
+    );
 }
 
 #[tokio::test]
@@ -237,9 +244,7 @@ async fn test_memberlist_strategy_merge_no_peer_resolver() {
     remote_state.put_u64(90_000);
 
     // Merge with peer_resolver returning None
-    strategy
-        .merge_remote_state(&remote_state, || None)
-        .await;
+    strategy.merge_remote_state(&remote_state, || None).await;
 
     // Should NOT have queued anything (no peer to sync with)
     assert!(rx.try_recv().is_err());
@@ -264,8 +269,22 @@ async fn test_memberlist_strategy_handles_sync_request() {
     let payload2 = Bytes::from_static(b"message 2");
 
     // Store messages in storage (required for handle_sync_request to return IDs)
-    store.insert(&memberlist_plumtree::storage::StoredMessage::new(id1, 0, payload1.clone())).await.unwrap();
-    store.insert(&memberlist_plumtree::storage::StoredMessage::new(id2, 0, payload2.clone())).await.unwrap();
+    store
+        .insert(&memberlist_plumtree::storage::StoredMessage::new(
+            id1,
+            0,
+            payload1.clone(),
+        ))
+        .await
+        .unwrap();
+    store
+        .insert(&memberlist_plumtree::storage::StoredMessage::new(
+            id2,
+            0,
+            payload2.clone(),
+        ))
+        .await
+        .unwrap();
 
     // Record in sync state (for hash tracking)
     strategy.record_message(id1, &payload1);
@@ -278,15 +297,18 @@ async fn test_memberlist_strategy_handles_sync_request() {
         time_end: u64::MAX,
     };
 
-    let result = strategy
-        .handle_sync_message(TestId(1), request)
-        .await;
+    let result = strategy.handle_sync_message(TestId(1), request).await;
 
     assert!(result.is_ok());
     let response = result.unwrap();
     assert!(response.is_some());
 
-    if let Some(SyncMessage::Response { matches, message_ids, .. }) = response {
+    if let Some(SyncMessage::Response {
+        matches,
+        message_ids,
+        ..
+    }) = response
+    {
         assert!(!matches, "should not match since hashes differ");
         assert!(!message_ids.is_empty(), "should include message IDs");
     } else {
@@ -312,9 +334,7 @@ async fn test_memberlist_strategy_handles_sync_request_with_matching_hash() {
         time_end: u64::MAX,
     };
 
-    let result = strategy
-        .handle_sync_message(TestId(1), request)
-        .await;
+    let result = strategy.handle_sync_message(TestId(1), request).await;
 
     assert!(result.is_ok());
     let response = result.unwrap();
@@ -347,9 +367,7 @@ async fn test_memberlist_strategy_handles_sync_pull() {
         message_ids: smallvec::smallvec![id],
     };
 
-    let result = strategy
-        .handle_sync_message(TestId(1), pull)
-        .await;
+    let result = strategy.handle_sync_message(TestId(1), pull).await;
 
     assert!(result.is_ok());
     let response = result.unwrap();
@@ -374,11 +392,8 @@ async fn test_memberlist_strategy_with_plumtree_discovery() {
     let sync_handler = Arc::new(SyncHandler::new(store.clone()));
     let (sync_tx, _sync_rx) = async_channel::bounded::<TestId>(64);
 
-    let strategy = MemberlistSyncStrategy::new(
-        sync_handler.clone(),
-        Duration::from_secs(90),
-        sync_tx,
-    );
+    let strategy =
+        MemberlistSyncStrategy::new(sync_handler.clone(), Duration::from_secs(90), sync_tx);
 
     let config = PlumtreeConfig::default()
         .with_sync(SyncConfig::enabled())
@@ -409,13 +424,10 @@ async fn test_memberlist_strategy_with_plumtree_discovery() {
 async fn test_memberlist_strategy_integration_merge_triggers_sync() {
     let store = Arc::new(MemoryStore::new(1000));
     let sync_handler = Arc::new(SyncHandler::new(store.clone()));
-    let (sync_tx, sync_rx) = async_channel::bounded::<TestId>(64);  // sync_rx is used below
+    let (sync_tx, sync_rx) = async_channel::bounded::<TestId>(64); // sync_rx is used below
 
-    let strategy = MemberlistSyncStrategy::new(
-        sync_handler.clone(),
-        Duration::from_secs(90),
-        sync_tx,
-    );
+    let strategy =
+        MemberlistSyncStrategy::new(sync_handler.clone(), Duration::from_secs(90), sync_tx);
 
     let config = PlumtreeConfig::default()
         .with_sync(SyncConfig::enabled())
@@ -442,7 +454,8 @@ async fn test_memberlist_strategy_integration_merge_triggers_sync() {
     remote_state.put_u64(90_000);
 
     // Merge via PlumtreeDiscovery API
-    pm.sync_merge_remote_state(&remote_state, || Some(TestId(42))).await;
+    pm.sync_merge_remote_state(&remote_state, || Some(TestId(42)))
+        .await;
 
     // Should have triggered sync request
     let peer = sync_rx.try_recv().expect("should have sync request");
@@ -461,21 +474,15 @@ async fn test_memberlist_strategy_two_node_sync_simulation() {
     let store1 = Arc::new(MemoryStore::new(1000));
     let sync_handler1 = Arc::new(SyncHandler::new(store1.clone()));
     let (sync_tx1, _sync_rx1) = async_channel::bounded::<TestId>(64);
-    let strategy1 = MemberlistSyncStrategy::new(
-        sync_handler1.clone(),
-        Duration::from_secs(90),
-        sync_tx1,
-    );
+    let strategy1 =
+        MemberlistSyncStrategy::new(sync_handler1.clone(), Duration::from_secs(90), sync_tx1);
 
     // Node 2 setup
     let store2 = Arc::new(MemoryStore::new(1000));
     let sync_handler2 = Arc::new(SyncHandler::new(store2.clone()));
     let (sync_tx2, sync_rx2) = async_channel::bounded::<TestId>(64);
-    let strategy2 = MemberlistSyncStrategy::new(
-        sync_handler2.clone(),
-        Duration::from_secs(90),
-        sync_tx2,
-    );
+    let strategy2 =
+        MemberlistSyncStrategy::new(sync_handler2.clone(), Duration::from_secs(90), sync_tx2);
 
     // Node 1 has a message that Node 2 doesn't have
     let msg_id = MessageId::new();
@@ -494,7 +501,9 @@ async fn test_memberlist_strategy_two_node_sync_simulation() {
         .await;
 
     // Node 2 should have queued a sync request for Node 1
-    let peer = sync_rx2.try_recv().expect("node 2 should request sync from node 1");
+    let peer = sync_rx2
+        .try_recv()
+        .expect("node 2 should request sync from node 1");
     assert_eq!(peer, TestId(1));
 
     // === Sync Protocol Phase ===
@@ -513,7 +522,12 @@ async fn test_memberlist_strategy_two_node_sync_simulation() {
         .unwrap();
 
     // Verify response indicates mismatch with message IDs
-    if let SyncMessage::Response { matches, message_ids, .. } = &response {
+    if let SyncMessage::Response {
+        matches,
+        message_ids,
+        ..
+    } = &response
+    {
         assert!(!matches);
         assert!(message_ids.contains(&msg_id));
     } else {
@@ -569,28 +583,26 @@ async fn test_memberlist_strategy_bidirectional_sync() {
     let store1 = Arc::new(MemoryStore::new(1000));
     let sync_handler1 = Arc::new(SyncHandler::new(store1.clone()));
     let (sync_tx1, _sync_rx1) = async_channel::bounded::<TestId>(64);
-    let strategy1 = MemberlistSyncStrategy::new(
-        sync_handler1.clone(),
-        Duration::from_secs(90),
-        sync_tx1,
-    );
+    let strategy1 =
+        MemberlistSyncStrategy::new(sync_handler1.clone(), Duration::from_secs(90), sync_tx1);
 
     // Node 2 setup
     let store2 = Arc::new(MemoryStore::new(1000));
     let sync_handler2 = Arc::new(SyncHandler::new(store2.clone()));
     let (sync_tx2, _sync_rx2) = async_channel::bounded::<TestId>(64);
-    let strategy2 = MemberlistSyncStrategy::new(
-        sync_handler2.clone(),
-        Duration::from_secs(90),
-        sync_tx2,
-    );
+    let strategy2 =
+        MemberlistSyncStrategy::new(sync_handler2.clone(), Duration::from_secs(90), sync_tx2);
 
     // Node 1 has message A
     let msg_a = MessageId::new();
     let payload_a = Bytes::from_static(b"message A from node 1");
     sync_handler1.record_message(msg_a, &payload_a);
     store1
-        .insert(&memberlist_plumtree::storage::StoredMessage::new(msg_a, 0, payload_a.clone()))
+        .insert(&memberlist_plumtree::storage::StoredMessage::new(
+            msg_a,
+            0,
+            payload_a.clone(),
+        ))
         .await
         .unwrap();
 
@@ -599,7 +611,11 @@ async fn test_memberlist_strategy_bidirectional_sync() {
     let payload_b = Bytes::from_static(b"message B from node 2");
     sync_handler2.record_message(msg_b, &payload_b);
     store2
-        .insert(&memberlist_plumtree::storage::StoredMessage::new(msg_b, 0, payload_b.clone()))
+        .insert(&memberlist_plumtree::storage::StoredMessage::new(
+            msg_b,
+            0,
+            payload_b.clone(),
+        ))
         .await
         .unwrap();
 
@@ -619,7 +635,12 @@ async fn test_memberlist_strategy_bidirectional_sync() {
         .unwrap()
         .unwrap();
 
-    if let SyncMessage::Response { matches, message_ids, .. } = response1 {
+    if let SyncMessage::Response {
+        matches,
+        message_ids,
+        ..
+    } = response1
+    {
         assert!(!matches);
         // Node 2's response contains msg_b (which Node 1 is missing)
         assert!(message_ids.contains(&msg_b));
@@ -628,7 +649,11 @@ async fn test_memberlist_strategy_bidirectional_sync() {
         let pull = SyncMessage::Pull {
             message_ids: smallvec::smallvec![msg_b],
         };
-        let push = strategy2.handle_sync_message(TestId(1), pull).await.unwrap().unwrap();
+        let push = strategy2
+            .handle_sync_message(TestId(1), pull)
+            .await
+            .unwrap()
+            .unwrap();
 
         if let SyncMessage::Push { messages } = push {
             // Node 1 receives and records msg_b
@@ -651,7 +676,12 @@ async fn test_memberlist_strategy_bidirectional_sync() {
         .unwrap()
         .unwrap();
 
-    if let SyncMessage::Response { matches, message_ids, .. } = response2 {
+    if let SyncMessage::Response {
+        matches,
+        message_ids,
+        ..
+    } = response2
+    {
         assert!(!matches);
         // Node 1's response contains msg_a (which Node 2 is missing)
         assert!(message_ids.contains(&msg_a));
@@ -660,7 +690,11 @@ async fn test_memberlist_strategy_bidirectional_sync() {
         let pull = SyncMessage::Pull {
             message_ids: smallvec::smallvec![msg_a],
         };
-        let push = strategy1.handle_sync_message(TestId(2), pull).await.unwrap().unwrap();
+        let push = strategy1
+            .handle_sync_message(TestId(2), pull)
+            .await
+            .unwrap()
+            .unwrap();
 
         if let SyncMessage::Push { messages } = push {
             // Node 2 receives and records msg_a
@@ -688,19 +722,26 @@ async fn test_memberlist_strategy_empty_sync() {
     let store1 = Arc::new(MemoryStore::new(1000));
     let sync_handler1 = Arc::new(SyncHandler::new(store1));
     let (tx1, _) = async_channel::bounded::<TestId>(64);
-    let strategy1 = MemberlistSyncStrategy::new(sync_handler1.clone(), Duration::from_secs(90), tx1);
+    let strategy1 =
+        MemberlistSyncStrategy::new(sync_handler1.clone(), Duration::from_secs(90), tx1);
 
     let store2 = Arc::new(MemoryStore::new(1000));
     let sync_handler2 = Arc::new(SyncHandler::new(store2));
     let (tx2, rx2) = async_channel::bounded::<TestId>(64);
-    let strategy2 = MemberlistSyncStrategy::new(sync_handler2.clone(), Duration::from_secs(90), tx2);
+    let strategy2 =
+        MemberlistSyncStrategy::new(sync_handler2.clone(), Duration::from_secs(90), tx2);
 
     // Both have empty state (zero hash)
     let state1 = strategy1.local_state().await;
-    strategy2.merge_remote_state(&state1, || Some(TestId(1))).await;
+    strategy2
+        .merge_remote_state(&state1, || Some(TestId(1)))
+        .await;
 
     // Should NOT trigger sync (both have same empty state)
-    assert!(rx2.try_recv().is_err(), "should not sync when both are empty");
+    assert!(
+        rx2.try_recv().is_err(),
+        "should not sync when both are empty"
+    );
 }
 
 #[tokio::test]
@@ -743,11 +784,17 @@ async fn test_memberlist_strategy_channel_full() {
     remote_state.put_u64(90_000);
 
     // First merge should succeed
-    strategy.merge_remote_state(&remote_state, || Some(TestId(1))).await;
+    strategy
+        .merge_remote_state(&remote_state, || Some(TestId(1)))
+        .await;
 
     // Second merge - channel is full, should not panic (graceful handling)
-    strategy.merge_remote_state(&remote_state, || Some(TestId(2))).await;
+    strategy
+        .merge_remote_state(&remote_state, || Some(TestId(2)))
+        .await;
 
     // Third merge - still should not panic
-    strategy.merge_remote_state(&remote_state, || Some(TestId(3))).await;
+    strategy
+        .merge_remote_state(&remote_state, || Some(TestId(3)))
+        .await;
 }

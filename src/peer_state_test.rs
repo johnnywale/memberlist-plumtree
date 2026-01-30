@@ -1146,9 +1146,9 @@ mod tests {
         // and low scores to peers 1, 2, 3
         let scorer = |peer: &u64| -> f64 {
             match *peer {
-                8 | 9 | 10 => 1.0, // High score (excellent peers)
-                4 | 5 | 6 | 7 => 0.5, // Medium score
-                _ => 0.1, // Low score (poor peers)
+                8..=10 => 1.0, // High score (excellent peers)
+                4..=7 => 0.5,  // Medium score
+                _ => 0.1,      // Low score (poor peers)
             }
         };
 
@@ -1217,7 +1217,10 @@ mod tests {
         let eager_peers: HashSet<u64> = state.eager_peers().into_iter().collect();
         let lazy_peers: HashSet<u64> = state.lazy_peers().into_iter().collect();
 
-        println!("After demotion: eager={:?}, lazy={:?}", eager_peers, lazy_peers);
+        println!(
+            "After demotion: eager={:?}, lazy={:?}",
+            eager_peers, lazy_peers
+        );
         println!("Ring neighbors (protected): {:?}", ring_neighbors);
 
         // Low-scoring non-ring-neighbor peers should be demoted first
@@ -1254,7 +1257,10 @@ mod tests {
 
         // Peer 5 (high score) should likely be promoted
         let eager_peers: HashSet<u64> = state.eager_peers().into_iter().collect();
-        println!("Eager peers: {:?} (expected peer 5 to be included)", eager_peers);
+        println!(
+            "Eager peers: {:?} (expected peer 5 to be included)",
+            eager_peers
+        );
     }
 
     #[test]
@@ -1302,7 +1308,10 @@ mod tests {
 
         println!(
             "After removing lazy peer {}: eager={}, lazy={}, total={}",
-            peer_to_remove, after_lazy_removal_eager, after_lazy_removal_lazy, after_lazy_removal_total
+            peer_to_remove,
+            after_lazy_removal_eager,
+            after_lazy_removal_lazy,
+            after_lazy_removal_total
         );
     }
 
@@ -1577,7 +1586,10 @@ mod tests {
 
         // With max_protected_neighbors=2, only immediate neighbors should be protected
         let ring_neighbors = state.ring_neighbors();
-        assert!(ring_neighbors.len() <= 2, "Should have at most 2 protected neighbors");
+        assert!(
+            ring_neighbors.len() <= 2,
+            "Should have at most 2 protected neighbors"
+        );
     }
 
     #[test]
@@ -1593,7 +1605,10 @@ mod tests {
 
         // With protection disabled, ring_neighbors should be empty
         let ring_neighbors = state.ring_neighbors();
-        assert!(ring_neighbors.is_empty(), "No neighbors should be protected");
+        assert!(
+            ring_neighbors.is_empty(),
+            "No neighbors should be protected"
+        );
 
         // All eager peers should be demotable
         for peer in state.eager_peers() {

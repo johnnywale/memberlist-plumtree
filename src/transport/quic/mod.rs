@@ -40,23 +40,29 @@
 //! # 0-RTT Early Data
 //!
 //! 0-RTT allows sending data during the TLS handshake for reduced latency.
-//! However, 0-RTT data is **replayable** and should only be used for idempotent
-//! operations.
 //!
-//! By default, 0-RTT is disabled. When enabled with `gossip_only: true`,
-//! only Gossip messages (which are idempotent) will use 0-RTT. Control
-//! messages (Graft, Prune, IHave) are never sent via 0-RTT.
+//! ## ⚠️ Security Warning - Replay Attacks
+//!
+//! **0-RTT data is replayable!** When enabled, ALL messages (including Graft/Prune
+//! control messages) may be sent as early data. An attacker can capture and replay
+//! these packets, potentially affecting the spanning tree topology.
+//!
+//! **By default, 0-RTT is disabled** (safe default).
+//!
+//! Only enable 0-RTT if:
+//! - Your network is trusted (no active attackers)
+//! - The latency reduction is worth the replay risk
+//! - You understand and accept the security implications
 //!
 //! ```ignore
+//! // ⚠️ Only enable if you understand the replay risks!
 //! let config = QuicConfig::default()
 //!     .with_zero_rtt(ZeroRttConfig::default()
 //!         .with_enabled(true)
-//!         .with_gossip_only(true));  // Safe default
+//!         .with_session_cache_capacity(1024));
 //! ```
 //!
-//! **Current Limitations**: The current implementation reserves the 0-RTT
-//! configuration API but uses regular 1-RTT streams for all messages.
-//! Full 0-RTT support requires session ticket caching and early data APIs.
+//! The transport tracks 0-RTT usage for statistics (`QuicStats::zero_rtt_sent`).
 //!
 //! # Stream vs Datagram Mode
 //!
@@ -122,20 +128,22 @@ mod config;
 mod connection;
 mod error;
 mod resolver;
+mod session_cache;
 mod tls;
 mod transport;
 
 // Re-export main types
 pub use config::{
-    CongestionConfig, CongestionController, ConnectionConfig, MessagePriorities, MigrationConfig,
-    PlumtreeQuicConfig, QuicConfig, StreamConfig, TlsConfig, ZeroRttConfig,
+    CongestionConfig, CongestionController, ConnectionConfig, DatagramConfig, MessagePriorities,
+    MigrationConfig, PlumtreeQuicConfig, QuicConfig, StreamConfig, TlsConfig, ZeroRttConfig,
 };
 pub use connection::ConnectionStats;
 pub use error::QuicError;
 pub use resolver::{MapPeerResolver, PeerResolver};
 #[allow(unused_imports)]
 pub use transport::{
-    CleanupTaskHandle, IncomingConfig, IncomingHandle, IncomingStats, QuicStats, QuicTransport,
+    CleanupTaskHandle, ConnectionEvent, DisconnectReason, IncomingConfig, IncomingHandle,
+    IncomingStats, QuicStats, QuicTransport,
 };
 
 // Re-export TLS utilities (used by consumers who want lower-level control)
@@ -144,4 +152,20 @@ pub use tls::{client_config, generate_self_signed, server_config, DEFAULT_ALPN};
 
 // Async TLS utilities (for use in async contexts to avoid blocking)
 #[allow(unused_imports)]
-pub use tls::{generate_self_signed_async, server_config_async};
+pub use tls::{
+    client_config_with_0rtt, generate_self_signed_async, server_config_async,
+    server_config_async_with_0rtt,
+};
+
+// mTLS peer verification utilities
+#[allow(unused_imports)]
+pub use tls::{
+    extract_peer_id_from_der, generate_self_signed_with_peer_id,
+    generate_self_signed_with_peer_id_async, PeerIdVerifier, PEER_ID_SAN_PREFIX,
+};
+
+// Session caching for 0-RTT (reference implementation, not currently integrated)
+// Note: The transport uses rustls's built-in session cache. These types are
+// provided for custom implementations or future persistent storage integration.
+#[allow(unused_imports)]
+pub use session_cache::{LruSessionCache, NoopSessionCache, SessionTicketStore};

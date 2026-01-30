@@ -1,3 +1,7 @@
+// Test utilities contain methods reserved for future test scenarios
+#![allow(dead_code)]
+#![allow(clippy::for_kv_map)]
+
 //! Protocol Validation Tests for Plumtree Implementation
 //!
 //! These tests verify the core Plumtree protocol behavior:
@@ -127,6 +131,7 @@ impl MessageStats {
 
 /// Test delegate that tracks message delivery.
 #[derive(Clone)]
+#[allow(dead_code)] // Test utility - methods reserved for future assertions
 struct TrackingDelegate {
     node_id: NodeId,
     stats: Arc<MessageStats>,
@@ -142,10 +147,12 @@ impl TrackingDelegate {
         }
     }
 
+    #[allow(dead_code)]
     fn delivered_count(&self) -> usize {
         self.delivered.lock().len()
     }
 
+    #[allow(dead_code)]
     fn has_message(&self, msg_id: &MessageId) -> bool {
         self.delivered.lock().iter().any(|(id, _)| id == msg_id)
     }
@@ -167,6 +174,8 @@ impl PlumtreeDelegate<NodeId> for TrackingDelegate {
 }
 
 /// A simulated network of Plumtree nodes.
+#[allow(dead_code)] // Test utility - fields and methods reserved for future test scenarios
+#[allow(clippy::for_kv_map)] // Intentional pattern for network iteration
 struct SimulatedNetwork {
     nodes: HashMap<NodeId, (Plumtree<NodeId, TrackingDelegate>, PlumtreeHandle<NodeId>)>,
     delegates: HashMap<NodeId, TrackingDelegate>,

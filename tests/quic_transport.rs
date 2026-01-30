@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use common::allocate_port;
+use common::{allocate_port, install_crypto_provider};
 use memberlist_plumtree::{MapPeerResolver, PeerResolver, QuicConfig, QuicTransport, Transport};
 
 /// Get an available port for testing.
@@ -21,6 +21,7 @@ fn get_test_addr() -> SocketAddr {
 
 #[tokio::test]
 async fn test_quic_transport_creation() {
+    install_crypto_provider();
     let addr = get_test_addr();
     let expected_port = addr.port();
     let resolver = MapPeerResolver::<u64>::new(addr);
@@ -61,6 +62,7 @@ async fn test_quic_config_presets() {
 
 #[tokio::test]
 async fn test_quic_transport_peer_not_found() {
+    install_crypto_provider();
     let addr = get_test_addr();
     let resolver = MapPeerResolver::<u64>::new(addr);
     // Don't add any peers
@@ -78,6 +80,7 @@ async fn test_quic_transport_peer_not_found() {
 
 #[tokio::test]
 async fn test_quic_transport_stats() {
+    install_crypto_provider();
     let addr = get_test_addr();
     let resolver = MapPeerResolver::<u64>::new(addr);
 
@@ -92,6 +95,7 @@ async fn test_quic_transport_stats() {
 
 #[tokio::test]
 async fn test_quic_transport_shutdown() {
+    install_crypto_provider();
     let addr = get_test_addr();
     let resolver = MapPeerResolver::<u64>::new(addr);
 
@@ -142,6 +146,7 @@ async fn test_resolver_operations() {
 
 #[tokio::test]
 async fn test_shared_resolver() {
+    install_crypto_provider();
     let addr = get_test_addr();
     let resolver = Arc::new(MapPeerResolver::<u64>::new(addr));
 
@@ -159,6 +164,7 @@ async fn test_shared_resolver() {
 
 #[tokio::test]
 async fn test_quic_transport_clone() {
+    install_crypto_provider();
     let addr = get_test_addr();
     let resolver = MapPeerResolver::<u64>::new(addr);
 
@@ -186,17 +192,12 @@ async fn test_quic_config_builder() {
                 .with_idle_timeout(Duration::from_secs(60)),
         )
         .with_streams(StreamConfig::default().with_max_uni_streams(200))
-        .with_zero_rtt(
-            ZeroRttConfig::default()
-                .with_enabled(true)
-                .with_gossip_only(true),
-        );
+        .with_zero_rtt(ZeroRttConfig::default().with_enabled(true));
 
     assert_eq!(config.connection.max_connections, 512);
     assert_eq!(config.connection.idle_timeout, Duration::from_secs(60));
     assert_eq!(config.streams.max_uni_streams, 200);
     assert!(config.zero_rtt.enabled);
-    assert!(config.zero_rtt.gossip_only);
 }
 
 #[tokio::test]

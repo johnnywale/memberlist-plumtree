@@ -85,6 +85,41 @@ pub enum QuicError {
     #[error("invalid message: {0}")]
     InvalidMessage(String),
 
+    /// Peer certificate verification failed.
+    ///
+    /// This occurs when the peer's certificate does not match the expected peer ID,
+    /// typically indicating a man-in-the-middle attack or misconfigured certificates.
+    #[error("peer verification failed for {peer_id}: {reason}")]
+    PeerVerificationFailed {
+        /// The peer ID that failed verification.
+        peer_id: String,
+        /// The reason for verification failure.
+        reason: String,
+    },
+
+    /// Datagram is too large to send.
+    ///
+    /// The message exceeds the maximum datagram size and `fallback_to_stream`
+    /// is disabled. Either enable fallback, reduce message size, or use streams.
+    #[error("datagram too large: {size} bytes exceeds max {max_size} bytes")]
+    DatagramTooLarge {
+        /// Size of the datagram that was attempted.
+        size: usize,
+        /// Maximum allowed datagram size.
+        max_size: usize,
+    },
+
+    /// Failed to send datagram.
+    #[error("datagram send failed: {0}")]
+    DatagramSendFailed(String),
+
+    /// Datagrams not supported by peer.
+    ///
+    /// The peer's QUIC implementation doesn't support datagrams, or
+    /// the connection wasn't configured to enable them.
+    #[error("datagrams not supported by peer")]
+    DatagramNotSupported,
+
     /// Internal error.
     #[error("internal error: {0}")]
     Internal(String),
@@ -110,6 +145,10 @@ impl QuicError {
             QuicError::Certificate(_) => false,
             QuicError::Bind(_) => false,
             QuicError::InvalidMessage(_) => false,
+            QuicError::PeerVerificationFailed { .. } => false,
+            QuicError::DatagramTooLarge { .. } => false, // Message needs to be smaller
+            QuicError::DatagramSendFailed(_) => true,    // Transient - retry may work
+            QuicError::DatagramNotSupported => false,    // Permanent - use streams
             QuicError::Internal(_) => false,
         }
     }
@@ -219,6 +258,11 @@ mod tests {
         assert!(QuicError::PeerNotFound("test".to_string()).is_permanent());
         assert!(QuicError::TlsConfig("bad config".to_string()).is_permanent());
         assert!(QuicError::Certificate("invalid cert".to_string()).is_permanent());
+        assert!(QuicError::PeerVerificationFailed {
+            peer_id: "node123".to_string(),
+            reason: "SAN mismatch".to_string(),
+        }
+        .is_permanent());
     }
 
     #[test]

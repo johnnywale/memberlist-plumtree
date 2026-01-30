@@ -4,7 +4,7 @@
 //! eager/lazy push mechanisms for efficient O(n) broadcast.
 
 use async_channel::{Receiver, Sender};
-use async_lock::RwLock;
+use async_lock::{Mutex as AsyncMutex, RwLock};
 use bytes::Bytes;
 use futures_timer::Delay;
 use smallvec::SmallVec;
@@ -22,12 +22,14 @@ use tracing::{debug, debug_span, info, instrument, trace, warn, Instrument};
 use crate::{
     adaptive_batcher::{AdaptiveBatcher, BatcherConfig},
     cleanup_tuner::{CleanupConfig, CleanupTuner},
+    compression::{compress_payload, decompress_payload},
     config::PlumtreeConfig,
     error::{Error, Result},
     health::{HealthReport, HealthReportBuilder},
     message::{MessageCache, MessageId, PlumtreeMessage},
     peer_scoring::{PeerScoring, ScoringConfig},
     peer_state::SharedPeerState,
+    priority::PriorityQueue,
     rate_limiter::RateLimiter,
     scheduler::{GraftTimer, IHaveScheduler, PendingIHave},
     PeerStateBuilder,
@@ -431,8 +433,11 @@ struct PlumtreeInner<I, D> {
     /// Shutdown flag.
     shutdown: AtomicBool,
 
-    /// Channel for outgoing messages.
-    outgoing_tx: Sender<OutgoingMessage<I>>,
+    /// Priority queue for outgoing messages.
+    outgoing_queue: Arc<AsyncMutex<PriorityQueue<OutgoingMessage<I>>>>,
+
+    /// Notification channel to wake up the receiver when messages are available.
+    outgoing_notify: Sender<()>,
 
     /// Channel for incoming messages.
     incoming_tx: Sender<IncomingMessage<I>>,
@@ -444,6 +449,56 @@ struct PlumtreeInner<I, D> {
     /// - Cleanup iterates through shards one at a time, yielding between shards
     /// - This prevents the cleanup task from blocking all message processing
     seen: ShardedSeenMap<I>,
+}
+
+impl<I: Clone, D> PlumtreeInner<I, D> {
+    /// Enqueue an outgoing message with priority.
+    ///
+    /// Returns `true` if the message was enqueued, `false` if the queue was full.
+    async fn enqueue_message(&self, msg: OutgoingMessage<I>) -> bool {
+        let priority = msg.priority;
+        let mut queue = self.outgoing_queue.lock().await;
+
+        if queue.push(msg, priority).is_ok() {
+            // Record metrics
+            #[cfg(feature = "metrics")]
+            crate::metrics::record_priority_enqueue(priority);
+
+            // Notify the receiver (non-blocking, ignore if already notified)
+            let _ = self.outgoing_notify.try_send(());
+            true
+        } else {
+            // Queue full, message dropped
+            #[cfg(feature = "metrics")]
+            crate::metrics::record_priority_drop(priority);
+
+            trace!(?priority, "outgoing priority queue full, message dropped");
+            false
+        }
+    }
+
+    /// Try to enqueue an outgoing message without blocking on the lock.
+    ///
+    /// Returns `true` if enqueued, `false` if lock contention or queue full.
+    fn try_enqueue_message(&self, msg: OutgoingMessage<I>) -> bool {
+        let priority = msg.priority;
+
+        if let Some(mut queue) = self.outgoing_queue.try_lock() {
+            if queue.push(msg, priority).is_ok() {
+                #[cfg(feature = "metrics")]
+                crate::metrics::record_priority_enqueue(priority);
+
+                let _ = self.outgoing_notify.try_send(());
+                true
+            } else {
+                #[cfg(feature = "metrics")]
+                crate::metrics::record_priority_drop(priority);
+                false
+            }
+        } else {
+            false
+        }
+    }
 }
 
 /// Entry for tracking seen messages and their delivery parent.
@@ -485,22 +540,32 @@ pub struct OutgoingMessage<I> {
     pub target: Option<I>,
     /// Message to send.
     pub message: PlumtreeMessage,
+    /// Message priority for scheduling.
+    pub priority: crate::priority::MessagePriority,
 }
 
 impl<I> OutgoingMessage<I> {
     /// Create a unicast message to a specific peer.
+    ///
+    /// Priority is automatically derived from the message type.
     pub fn unicast(target: I, message: PlumtreeMessage) -> Self {
+        let priority = message.priority();
         Self {
             target: Some(target),
             message,
+            priority,
         }
     }
 
     /// Create a broadcast message (for initial broadcast only).
+    ///
+    /// Priority is automatically derived from the message type.
     pub fn broadcast(message: PlumtreeMessage) -> Self {
+        let priority = message.priority();
         Self {
             target: None,
             message,
+            priority,
         }
     }
 
@@ -541,7 +606,13 @@ where
         #[cfg(feature = "metrics")]
         crate::metrics::init_metrics();
 
-        let (outgoing_tx, outgoing_rx) = async_channel::bounded(1024);
+        // Create priority queue for outgoing messages
+        let priority_config = config.priority.clone();
+        let outgoing_queue = Arc::new(AsyncMutex::new(PriorityQueue::new(priority_config)));
+
+        // Notification channel to wake up the receiver
+        let (outgoing_notify, outgoing_notify_rx) = async_channel::bounded(1);
+
         let (incoming_tx, incoming_rx) = async_channel::bounded(1024);
 
         // Rate limiter: allow 10 Graft requests per peer per second, burst of 20
@@ -589,7 +660,8 @@ where
             local_id,
             round: AtomicU32::new(0),
             shutdown: AtomicBool::new(false),
-            outgoing_tx,
+            outgoing_queue: outgoing_queue.clone(),
+            outgoing_notify,
             incoming_tx,
             seen: ShardedSeenMap::new(),
         });
@@ -599,7 +671,8 @@ where
         };
 
         let handle = PlumtreeHandle {
-            outgoing_rx,
+            outgoing_queue,
+            outgoing_notify_rx,
             incoming_rx,
             incoming_tx: plumtree.inner.incoming_tx.clone(),
         };
@@ -747,17 +820,53 @@ where
             return AddPeerResult::AlreadyExists;
         }
 
+        // Capture state before add (for accurate delta tracking)
+        #[cfg(feature = "metrics")]
+        let stats_before = self.inner.peers.stats();
+
         let result = self.inner.peers.add_peer_auto(
             peer,
             self.inner.config.max_peers,
             self.inner.config.eager_fanout,
         );
 
-        // Record metric for successful peer additions
+        // Record metrics based on actual state change (handles internal rebalancing)
         #[cfg(feature = "metrics")]
         match &result {
-            AddPeerResult::AddedEager | AddPeerResult::AddedLazy => {
-                crate::metrics::record_peer_added();
+            AddPeerResult::AddedEager
+            | AddPeerResult::AddedLazy
+            | AddPeerResult::AddedAfterEviction => {
+                let stats_after = self.inner.peers.stats();
+
+                // Track total peer change
+                let total_before = stats_before.eager_count + stats_before.lazy_count;
+                let total_after = stats_after.eager_count + stats_after.lazy_count;
+                if total_after > total_before {
+                    crate::metrics::record_peer_added();
+                    crate::metrics::inc_total_peers();
+                    crate::metrics::inc_peers_healthy();
+                }
+
+                // Track eager/lazy changes (including rebalancing effects)
+                if stats_after.eager_count > stats_before.eager_count {
+                    for _ in 0..(stats_after.eager_count - stats_before.eager_count) {
+                        crate::metrics::inc_eager_peers();
+                    }
+                } else if stats_before.eager_count > stats_after.eager_count {
+                    for _ in 0..(stats_before.eager_count - stats_after.eager_count) {
+                        crate::metrics::dec_eager_peers();
+                    }
+                }
+
+                if stats_after.lazy_count > stats_before.lazy_count {
+                    for _ in 0..(stats_after.lazy_count - stats_before.lazy_count) {
+                        crate::metrics::inc_lazy_peers();
+                    }
+                } else if stats_before.lazy_count > stats_after.lazy_count {
+                    for _ in 0..(stats_before.lazy_count - stats_after.lazy_count) {
+                        crate::metrics::dec_lazy_peers();
+                    }
+                }
             }
             _ => {}
         }
@@ -776,7 +885,12 @@ where
             self.inner.peers.add_peer(peer.clone());
 
             #[cfg(feature = "metrics")]
-            crate::metrics::record_peer_added();
+            {
+                crate::metrics::record_peer_added();
+                crate::metrics::inc_total_peers();
+                crate::metrics::inc_lazy_peers();
+                crate::metrics::inc_peers_healthy();
+            }
         }
     }
 
@@ -785,14 +899,33 @@ where
     /// Removes the peer from both the topology state (eager/lazy sets) and
     /// the scoring state (RTT, failure counts) to prevent memory leaks.
     pub fn remove_peer(&self, peer: &I) {
-        self.inner
+        let removed = self
+            .inner
             .peers
             .remove_peer_auto(peer, self.inner.config.eager_fanout);
+
         // Clean up scoring data to free memory for departed peers
         self.inner.peer_scoring.remove_peer(peer);
 
         #[cfg(feature = "metrics")]
-        crate::metrics::record_peer_removed();
+        {
+            use crate::peer_state::RemovePeerResult;
+            match removed {
+                RemovePeerResult::RemovedEager => {
+                    crate::metrics::record_peer_removed();
+                    crate::metrics::dec_total_peers();
+                    crate::metrics::dec_eager_peers();
+                    crate::metrics::dec_peers_healthy();
+                }
+                RemovePeerResult::RemovedLazy => {
+                    crate::metrics::record_peer_removed();
+                    crate::metrics::dec_total_peers();
+                    crate::metrics::dec_lazy_peers();
+                    crate::metrics::dec_peers_healthy();
+                }
+                RemovePeerResult::NotFound => {}
+            }
+        }
     }
 
     /// Broadcast a message to all nodes.
@@ -803,11 +936,16 @@ where
     /// Returns the unique message ID assigned to this broadcast.
     #[instrument(skip(self, payload), fields(payload_size))]
     pub async fn broadcast(&self, payload: impl Into<Bytes>) -> Result<MessageId> {
-        let payload = payload.into();
-        let payload_size = payload.len();
+        // Check if shutdown has been requested
+        if self.is_shutdown() {
+            return Err(Error::Shutdown);
+        }
+
+        let raw_payload = payload.into();
+        let payload_size = raw_payload.len();
         tracing::Span::current().record("payload_size", payload_size);
 
-        // Check size limit
+        // Check size limit (before compression)
         if payload_size > self.inner.config.max_message_size {
             warn!(
                 payload_size,
@@ -820,6 +958,20 @@ where
             });
         }
 
+        // Compress the payload if enabled
+        #[cfg(feature = "metrics")]
+        let (payload, compression_stats) =
+            compress_payload(&raw_payload, &self.inner.config.compression);
+        #[cfg(not(feature = "metrics"))]
+        let (payload, _compression_stats) =
+            compress_payload(&raw_payload, &self.inner.config.compression);
+
+        // Record compression metrics
+        #[cfg(feature = "metrics")]
+        if let Some((original, compressed)) = compression_stats {
+            crate::metrics::record_compression(original, compressed);
+        }
+
         let msg_id = MessageId::new();
         let round = self.inner.round.fetch_add(1, Ordering::Relaxed);
 
@@ -827,10 +979,11 @@ where
             message_id = %msg_id,
             round,
             payload_size,
+            compressed_size = payload.len(),
             "broadcasting new message"
         );
 
-        // Cache the message
+        // Cache the compressed message
         self.inner.cache.insert(msg_id, payload.clone());
 
         // Mark as seen (no parent since we originated this message)
@@ -858,11 +1011,10 @@ where
                 round,
                 payload: payload.clone(),
             };
-            // Use try_send to avoid blocking under backpressure
-            if let Err(_e) = self
+            // Use try_enqueue to avoid blocking under backpressure
+            if !self
                 .inner
-                .outgoing_tx
-                .try_send(OutgoingMessage::unicast(peer, msg))
+                .try_enqueue_message(OutgoingMessage::unicast(peer, msg))
             {
                 dropped_count += 1;
                 trace!(
@@ -890,7 +1042,7 @@ where
                 // All messages dropped - this is severe backpressure
                 return Err(Error::QueueFull {
                     dropped: dropped_count,
-                    capacity: self.inner.outgoing_tx.capacity().unwrap_or(1024),
+                    capacity: self.inner.config.priority.queue_depths.iter().sum(),
                 });
             }
         }
@@ -974,12 +1126,10 @@ where
 
         // Cancel any pending Graft timer for this message
         // Returns true if a graft was actually sent and satisfied
+        // Note: graft_timer.message_received() internally records metrics (graft_success, latency)
         if self.inner.graft_timer.message_received(&msg_id) {
             // Record graft success for adaptive batcher to adjust batch sizes
             self.inner.adaptive_batcher.record_graft_received();
-
-            #[cfg(feature = "metrics")]
-            crate::metrics::record_graft_success();
         }
 
         // Check if already seen and track parent atomically (single shard lock)
@@ -1026,10 +1176,8 @@ where
                         "pruning redundant path"
                     );
                     // Send Prune unicast to the duplicate sender
-                    let _ = self
-                        .inner
-                        .outgoing_tx
-                        .send(OutgoingMessage::unicast(
+                    self.inner
+                        .enqueue_message(OutgoingMessage::unicast(
                             from.clone(),
                             PlumtreeMessage::Prune,
                         ))
@@ -1044,7 +1192,11 @@ where
                         self.inner.delegate.on_lazy_demotion(&from);
 
                         #[cfg(feature = "metrics")]
-                        crate::metrics::record_peer_demotion();
+                        {
+                            crate::metrics::record_peer_demotion();
+                            crate::metrics::dec_eager_peers();
+                            crate::metrics::inc_lazy_peers();
+                        }
                     }
                 }
             }
@@ -1059,17 +1211,33 @@ where
             "delivering new message"
         );
 
-        // Cache for potential Graft requests
+        // Cache the compressed payload for potential Graft requests
         self.inner.cache.insert(msg_id, payload.clone());
 
-        // Deliver to application
-        self.inner.delegate.on_deliver(msg_id, payload.clone());
+        // Decompress payload before delivering to application
+        let decompressed_payload = match decompress_payload(&payload) {
+            Ok(data) => data,
+            Err(e) => {
+                warn!(
+                    message_id = %msg_id,
+                    error = %e,
+                    "failed to decompress payload, delivering raw"
+                );
+                // Fall back to raw payload if decompression fails
+                payload.clone()
+            }
+        };
 
-        // Record delivery metrics
+        // Deliver decompressed payload to application
+        self.inner
+            .delegate
+            .on_deliver(msg_id, decompressed_payload.clone());
+
+        // Record delivery metrics (use decompressed size for accurate stats)
         #[cfg(feature = "metrics")]
         {
             crate::metrics::record_delivery();
-            crate::metrics::record_message_size(payload_size);
+            crate::metrics::record_message_size(decompressed_payload.len());
             crate::metrics::record_message_hops(round);
         }
 
@@ -1084,12 +1252,10 @@ where
                 round: round + 1,
                 payload: payload.clone(),
             };
-            // Use try_send to avoid blocking under backpressure
-            if self
+            // Use try_enqueue to avoid blocking under backpressure
+            if !self
                 .inner
-                .outgoing_tx
-                .try_send(OutgoingMessage::unicast(peer, msg))
-                .is_err()
+                .try_enqueue_message(OutgoingMessage::unicast(peer, msg))
             {
                 dropped += 1;
             }
@@ -1174,14 +1340,16 @@ where
                     self.inner.delegate.on_eager_promotion(&from);
 
                     #[cfg(feature = "metrics")]
-                    crate::metrics::record_peer_promotion();
+                    {
+                        crate::metrics::record_peer_promotion();
+                        crate::metrics::inc_eager_peers();
+                        crate::metrics::dec_lazy_peers();
+                    }
                 }
 
-                // Send Graft to get the missing message
-                let _ = self
-                    .inner
-                    .outgoing_tx
-                    .send(OutgoingMessage::unicast(
+                // Send Graft to get the missing message (Critical priority)
+                self.inner
+                    .enqueue_message(OutgoingMessage::unicast(
                         from.clone(),
                         PlumtreeMessage::Graft {
                             message_id: msg_id,
@@ -1222,6 +1390,13 @@ where
         if self.inner.peers.promote_to_eager(&from) {
             debug!("promoted peer to eager after Graft request");
             self.inner.delegate.on_eager_promotion(&from);
+
+            #[cfg(feature = "metrics")]
+            {
+                crate::metrics::record_peer_promotion();
+                crate::metrics::inc_eager_peers();
+                crate::metrics::dec_lazy_peers();
+            }
         } else if !self.inner.peers.is_eager(&from) {
             // Promotion was rejected (likely due to max_eager_peers limit)
             debug!("could not promote peer to eager (at capacity or unknown peer)");
@@ -1239,10 +1414,8 @@ where
                 round,
                 payload: (*payload).clone(),
             };
-            let _ = self
-                .inner
-                .outgoing_tx
-                .send(OutgoingMessage::unicast(from, msg))
+            self.inner
+                .enqueue_message(OutgoingMessage::unicast(from, msg))
                 .await;
         } else {
             debug!(message_id = %msg_id, "Graft request for unknown message");
@@ -1257,6 +1430,13 @@ where
         if self.inner.peers.demote_to_lazy(&from) {
             debug!("demoted peer to lazy after Prune");
             self.inner.delegate.on_lazy_demotion(&from);
+
+            #[cfg(feature = "metrics")]
+            {
+                crate::metrics::record_peer_demotion();
+                crate::metrics::dec_eager_peers();
+                crate::metrics::inc_lazy_peers();
+            }
         }
         Ok(())
     }
@@ -1352,12 +1532,10 @@ where
                 message_ids: message_ids.clone(),
                 round,
             };
-            // Use try_send to avoid blocking under backpressure
-            if self
+            // Use try_enqueue to avoid blocking under backpressure
+            if !self
                 .inner
-                .outgoing_tx
-                .try_send(OutgoingMessage::unicast(peer, msg))
-                .is_err()
+                .try_enqueue_message(OutgoingMessage::unicast(peer, msg))
             {
                 ihave_dropped += 1;
             }
@@ -1446,10 +1624,9 @@ where
                     crate::metrics::record_graft_retry();
                 }
 
-                let _ = self
-                    .inner
-                    .outgoing_tx
-                    .send(OutgoingMessage::unicast(
+                // Graft retry - Critical priority for tree repair
+                self.inner
+                    .enqueue_message(OutgoingMessage::unicast(
                         expired_graft.peer.clone(),
                         PlumtreeMessage::Graft {
                             message_id: expired_graft.message_id,
@@ -1650,6 +1827,8 @@ where
                         #[cfg(feature = "metrics")]
                         for _ in 0..promoted {
                             crate::metrics::record_peer_promotion();
+                            crate::metrics::inc_eager_peers();
+                            crate::metrics::dec_lazy_peers();
                         }
                     }
                 } else {
@@ -1658,15 +1837,9 @@ where
                 }
             }
 
-            // Update metrics
+            // Update metrics (cache, queue, and pending grafts only - peer counts are tracked incrementally)
             #[cfg(feature = "metrics")]
             {
-                let stats = self.inner.peers.stats();
-                crate::metrics::set_eager_peers(stats.eager_count);
-                crate::metrics::set_lazy_peers(stats.lazy_count);
-                crate::metrics::set_total_peers(stats.eager_count + stats.lazy_count);
-
-                // Update cache, queue, and pending grafts gauges
                 let cache_stats = self.inner.cache.stats();
                 crate::metrics::set_cache_size(cache_stats.entries);
                 crate::metrics::set_ihave_queue_size(self.inner.scheduler.queue().len());
@@ -1739,7 +1912,7 @@ where
     pub fn shutdown(&self) {
         self.inner.shutdown.store(true, Ordering::Release);
         self.inner.scheduler.shutdown();
-        self.inner.outgoing_tx.close();
+        self.inner.outgoing_notify.close();
         self.inner.incoming_tx.close();
     }
 
@@ -1782,8 +1955,10 @@ impl<I, D> Clone for Plumtree<I, D> {
 ///
 /// Provides channels for sending and receiving messages.
 pub struct PlumtreeHandle<I> {
-    /// Channel for receiving outgoing messages to send.
-    outgoing_rx: Receiver<OutgoingMessage<I>>,
+    /// Priority queue for outgoing messages.
+    outgoing_queue: Arc<AsyncMutex<PriorityQueue<OutgoingMessage<I>>>>,
+    /// Notification receiver - signaled when messages are available.
+    outgoing_notify_rx: Receiver<()>,
     /// Channel for receiving incoming messages (for internal processing).
     incoming_rx: Receiver<IncomingMessage<I>>,
     /// Channel for submitting incoming messages.
@@ -1792,8 +1967,29 @@ pub struct PlumtreeHandle<I> {
 
 impl<I> PlumtreeHandle<I> {
     /// Get the next outgoing message to send.
+    ///
+    /// Messages are returned in priority order:
+    /// - Critical (Graft) - tree repair
+    /// - High (Gossip) - payload delivery
+    /// - Normal (IHave/Sync) - announcements
+    /// - Low (Prune) - optimization
     pub async fn next_outgoing(&self) -> Option<OutgoingMessage<I>> {
-        self.outgoing_rx.recv().await.ok()
+        loop {
+            // Try to get a message from the queue
+            {
+                let mut queue = self.outgoing_queue.lock().await;
+                #[allow(unused_variables)]
+                if let Some((msg, priority)) = queue.pop() {
+                    #[cfg(feature = "metrics")]
+                    crate::metrics::record_priority_dequeue(priority);
+                    return Some(msg);
+                }
+            }
+            // Wait for notification that a message is available
+            if self.outgoing_notify_rx.recv().await.is_err() {
+                return None; // Channel closed
+            }
+        }
     }
 
     /// Try to get the next outgoing message without blocking.
@@ -1801,7 +1997,35 @@ impl<I> PlumtreeHandle<I> {
     /// Returns `Some(message)` if a message is available, `None` otherwise.
     /// This is useful for non-blocking polling in tests and simulations.
     pub fn try_next_outgoing(&self) -> Option<OutgoingMessage<I>> {
-        self.outgoing_rx.try_recv().ok()
+        // Use try_lock to avoid blocking
+        if let Some(mut queue) = self.outgoing_queue.try_lock() {
+            #[allow(unused_variables)]
+            queue.pop().map(|(msg, priority)| {
+                #[cfg(feature = "metrics")]
+                crate::metrics::record_priority_dequeue(priority);
+                msg
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Get a batch of outgoing messages using weighted fair scheduling.
+    ///
+    /// Returns up to `max_count` messages, respecting priority weights.
+    /// Higher priority messages get more slots per batch.
+    pub async fn next_outgoing_batch(&self, max_count: usize) -> Vec<OutgoingMessage<I>> {
+        let mut queue = self.outgoing_queue.lock().await;
+        #[allow(unused_variables)]
+        queue
+            .pop_batch(max_count)
+            .into_iter()
+            .map(|(msg, priority)| {
+                #[cfg(feature = "metrics")]
+                crate::metrics::record_priority_dequeue(priority);
+                msg
+            })
+            .collect()
     }
 
     /// Submit an incoming message for processing.
@@ -1812,9 +2036,10 @@ impl<I> PlumtreeHandle<I> {
             .map_err(|e| Error::Channel(e.to_string()))
     }
 
-    /// Get a stream of outgoing messages.
-    pub fn outgoing_stream(&self) -> impl futures::Stream<Item = OutgoingMessage<I>> + '_ {
-        self.outgoing_rx.clone()
+    /// Get the current queue statistics.
+    pub async fn queue_stats(&self) -> crate::priority::PriorityQueueStatsSnapshot {
+        let queue = self.outgoing_queue.lock().await;
+        queue.stats().snapshot()
     }
 
     /// Get a stream of incoming messages for processing.
@@ -1834,7 +2059,7 @@ impl<I> PlumtreeHandle<I> {
 
     /// Check if the handle is closed.
     pub fn is_closed(&self) -> bool {
-        self.outgoing_rx.is_closed()
+        self.outgoing_notify_rx.is_closed()
     }
 }
 

@@ -189,7 +189,10 @@ async fn test_memory_store_eviction() {
     }
 
     assert_eq!(store.count().await.unwrap(), 5);
-    assert!(store.contains(&ids[0]).await.unwrap(), "Oldest should exist");
+    assert!(
+        store.contains(&ids[0]).await.unwrap(),
+        "Oldest should exist"
+    );
 
     // Insert one more - should evict oldest
     let new_msg = make_message(600, b"new");
@@ -253,7 +256,11 @@ fn test_sync_state_xor_hash() {
     // Remove all
     state.remove(&id1);
     assert!(state.is_empty());
-    assert_eq!(state.root_hash(), [0u8; 32], "Hash should be zero when empty");
+    assert_eq!(
+        state.root_hash(),
+        [0u8; 32],
+        "Hash should be zero when empty"
+    );
 
     println!("=== Test Passed: SyncState XOR hash operations work correctly ===");
 }
@@ -420,14 +427,9 @@ async fn test_sync_handler_basic_flow() {
     assert_ne!(hash_a, hash_b, "Hashes should differ when content differs");
 
     // A sends sync request to B
-    let response = handler_b
-        .handle_sync_request(hash_a, (0, 1000))
-        .await;
+    let response = handler_b.handle_sync_request(hash_a, (0, 1000)).await;
 
-    assert!(
-        !response.matches,
-        "Response should indicate mismatch"
-    );
+    assert!(!response.matches, "Response should indicate mismatch");
     assert!(
         !response.message_ids.is_empty(),
         "Response should contain message IDs"
@@ -606,7 +608,11 @@ async fn test_memory_store_large_scale() {
     // Range query should work
     // Note: timestamps are 0-4999, so [1000, 1999] gives 1000 messages
     let (range_ids, _) = store.get_range(1000, 1999, 1000, 0).await.unwrap();
-    assert_eq!(range_ids.len(), 1000, "Should have 1000 messages in [1000, 1999]");
+    assert_eq!(
+        range_ids.len(),
+        1000,
+        "Should have 1000 messages in [1000, 1999]"
+    );
 
     // Prune half
     let removed = store.prune(2500).await.unwrap();
