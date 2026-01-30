@@ -946,8 +946,12 @@ impl Transport<MemberlistNodeId> for IntegrationTestTransport {
 
     async fn send_to(&self, target: &MemberlistNodeId, data: Bytes) -> Result<(), Self::Error> {
         if let Some((sender, msg)) = decode_plumtree_envelope::<MemberlistNodeId>(&data) {
-            let routes = self.routes.read();
-            if let Some(tx) = routes.get(target) {
+            // Clone the sender to avoid holding lock across await
+            let tx = {
+                let routes = self.routes.read();
+                routes.get(target).cloned()
+            };
+            if let Some(tx) = tx {
                 tx.send((sender, msg))
                     .await
                     .map_err(|e| IntegrationTestTransportError(e.to_string()))?;

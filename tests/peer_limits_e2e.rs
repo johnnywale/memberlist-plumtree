@@ -6,9 +6,7 @@
 //! 3. Message propagation works end-to-end with the new settings
 
 use bytes::Bytes;
-use memberlist_plumtree::{
-    MessageId, Plumtree, PlumtreeConfig, PlumtreeDelegate, PlumtreeMessage,
-};
+use memberlist_plumtree::{MessageId, Plumtree, PlumtreeConfig, PlumtreeDelegate, PlumtreeMessage};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -20,6 +18,7 @@ use std::time::Duration;
 struct NodeId(u64);
 
 /// Test delegate that tracks delivered messages.
+#[allow(dead_code)] // Test utility - methods reserved for future assertions
 #[derive(Debug, Default, Clone)]
 struct TestDelegate {
     inner: Arc<TestDelegateInner>,
@@ -48,6 +47,7 @@ impl TestDelegate {
         self.inner.delivered_ids.lock().contains(id)
     }
 
+    #[allow(dead_code)] // Reserved for future graft tracking assertions
     fn graft_count(&self) -> usize {
         self.inner.graft_count.load(Ordering::Relaxed)
     }
@@ -102,10 +102,7 @@ async fn test_max_eager_peers_limit_on_graft() {
             message_id: msg_id,
             round: 0,
         };
-        plumtree
-            .handle_message(NodeId(i), graft_msg)
-            .await
-            .unwrap();
+        plumtree.handle_message(NodeId(i), graft_msg).await.unwrap();
     }
 
     // Should only have 2 eager peers (the limit)
@@ -148,17 +145,17 @@ async fn test_graft_works_under_limit() {
     }
 
     // Broadcast a message
-    let msg_id = plumtree.broadcast(Bytes::from("test message")).await.unwrap();
+    let msg_id = plumtree
+        .broadcast(Bytes::from("test message"))
+        .await
+        .unwrap();
 
     // GRAFT from peer 2
     let graft_msg = PlumtreeMessage::Graft {
         message_id: msg_id,
         round: 0,
     };
-    plumtree
-        .handle_message(NodeId(2), graft_msg)
-        .await
-        .unwrap();
+    plumtree.handle_message(NodeId(2), graft_msg).await.unwrap();
 
     // Peer 2 should be eager now
     assert!(
@@ -209,10 +206,30 @@ async fn test_message_propagation_e2e() {
     }
 
     // Promote some to eager for initial tree
-    nodes.get(&1).unwrap().0.peers().promote_to_eager(&NodeId(2));
-    nodes.get(&2).unwrap().0.peers().promote_to_eager(&NodeId(1));
-    nodes.get(&2).unwrap().0.peers().promote_to_eager(&NodeId(3));
-    nodes.get(&3).unwrap().0.peers().promote_to_eager(&NodeId(2));
+    nodes
+        .get(&1)
+        .unwrap()
+        .0
+        .peers()
+        .promote_to_eager(&NodeId(2));
+    nodes
+        .get(&2)
+        .unwrap()
+        .0
+        .peers()
+        .promote_to_eager(&NodeId(1));
+    nodes
+        .get(&2)
+        .unwrap()
+        .0
+        .peers()
+        .promote_to_eager(&NodeId(3));
+    nodes
+        .get(&3)
+        .unwrap()
+        .0
+        .peers()
+        .promote_to_eager(&NodeId(2));
 
     // Node 1 broadcasts
     let msg_id = nodes
@@ -550,23 +567,32 @@ async fn test_ihave_graft_full_flow_with_scheduler() {
     // The message is sent to eager peers (none in this case) and IHave queued for lazy peers
 
     // Wait for IHave to be scheduled and sent
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Use longer timeout for CI environments (especially macOS) which may be slower
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Process outgoing messages from Node 1 (should include IHave to Node 2)
+    // Retry loop with longer individual timeouts for CI stability
     let mut ihave_sent = false;
-    while let Ok(Some(out)) =
-        tokio::time::timeout(Duration::from_millis(10), handle1.next_outgoing()).await
-    {
-        if let PlumtreeMessage::IHave { message_ids, .. } = &out.message {
-            if message_ids.contains(&msg_id) {
-                ihave_sent = true;
-                // Route this IHave to Node 2
-                node2
-                    .handle_message(NodeId(1), out.message.clone())
-                    .await
-                    .unwrap();
+    for _ in 0..10 {
+        while let Ok(Some(out)) =
+            tokio::time::timeout(Duration::from_millis(50), handle1.next_outgoing()).await
+        {
+            if let PlumtreeMessage::IHave { message_ids, .. } = &out.message {
+                if message_ids.contains(&msg_id) {
+                    ihave_sent = true;
+                    // Route this IHave to Node 2
+                    node2
+                        .handle_message(NodeId(1), out.message.clone())
+                        .await
+                        .unwrap();
+                }
             }
         }
+        if ihave_sent {
+            break;
+        }
+        // Give the scheduler more time to fire
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
     assert!(ihave_sent, "Node 1 should have sent IHave to lazy peer");
@@ -581,7 +607,7 @@ async fn test_ihave_graft_full_flow_with_scheduler() {
     // Process outgoing messages from Node 2 (should include GRAFT)
     let mut graft_sent = false;
     while let Ok(Some(out)) =
-        tokio::time::timeout(Duration::from_millis(10), handle2.next_outgoing()).await
+        tokio::time::timeout(Duration::from_millis(50), handle2.next_outgoing()).await
     {
         if let PlumtreeMessage::Graft { message_id, .. } = &out.message {
             if *message_id == msg_id {
@@ -595,7 +621,10 @@ async fn test_ihave_graft_full_flow_with_scheduler() {
         }
     }
 
-    assert!(graft_sent, "Node 2 should have sent GRAFT for missing message");
+    assert!(
+        graft_sent,
+        "Node 2 should have sent GRAFT for missing message"
+    );
 
     // Node 1 should have promoted Node 2 to eager and sent Gossip response
     assert!(
@@ -606,7 +635,7 @@ async fn test_ihave_graft_full_flow_with_scheduler() {
     // Process outgoing Gossip from Node 1
     let mut gossip_sent = false;
     while let Ok(Some(out)) =
-        tokio::time::timeout(Duration::from_millis(10), handle1.next_outgoing()).await
+        tokio::time::timeout(Duration::from_millis(50), handle1.next_outgoing()).await
     {
         if let PlumtreeMessage::Gossip { id, payload, .. } = &out.message {
             if *id == msg_id {
@@ -621,7 +650,10 @@ async fn test_ihave_graft_full_flow_with_scheduler() {
         }
     }
 
-    assert!(gossip_sent, "Node 1 should have sent Gossip in response to GRAFT");
+    assert!(
+        gossip_sent,
+        "Node 1 should have sent Gossip in response to GRAFT"
+    );
 
     // Node 2 should now have the message
     assert!(
@@ -691,7 +723,10 @@ async fn test_no_graft_when_message_already_known() {
     node2.handle_message(NodeId(1), gossip).await.unwrap();
 
     // Verify Node 2 delivered the message
-    assert!(delegate2.has_message(&msg_id), "Node 2 should have the message via Gossip");
+    assert!(
+        delegate2.has_message(&msg_id),
+        "Node 2 should have the message via Gossip"
+    );
 
     // Now send IHave for the same message - should NOT trigger GRAFT
     let ihave = PlumtreeMessage::IHave {

@@ -8,7 +8,7 @@
 mod common;
 
 use bytes::Bytes;
-use common::allocate_ports;
+use common::{allocate_ports, install_crypto_provider};
 use memberlist_plumtree::{
     encode_plumtree_envelope, IncomingConfig, MapPeerResolver, MessageId, PlumtreeMessage,
     QuicConfig, QuicTransport, Transport,
@@ -20,6 +20,8 @@ use std::time::Duration;
 /// Test that two nodes can send messages to each other over QUIC.
 #[tokio::test]
 async fn test_bidirectional_quic_communication() {
+    install_crypto_provider();
+
     // Allocate ports to avoid Windows socket permission errors
     let ports = allocate_ports(2);
     let addr1: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
@@ -108,8 +110,14 @@ async fn test_bidirectional_quic_communication() {
     let stats1 = handle1.stats();
     let stats2 = handle2.stats();
 
-    assert_eq!(stats1.messages_received, 1, "Node1 should receive 1 message");
-    assert_eq!(stats2.messages_received, 1, "Node2 should receive 1 message");
+    assert_eq!(
+        stats1.messages_received, 1,
+        "Node1 should receive 1 message"
+    );
+    assert_eq!(
+        stats2.messages_received, 1,
+        "Node2 should receive 1 message"
+    );
 
     // Cleanup
     handle1.stop();
@@ -119,6 +127,8 @@ async fn test_bidirectional_quic_communication() {
 /// Test multiple messages in sequence.
 #[tokio::test]
 async fn test_multiple_messages() {
+    install_crypto_provider();
+
     let ports = allocate_ports(2);
     let addr1: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
     let addr2: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
@@ -180,6 +190,8 @@ async fn test_multiple_messages() {
 /// Test IHave message type.
 #[tokio::test]
 async fn test_ihave_message() {
+    install_crypto_provider();
+
     let ports = allocate_ports(2);
     let addr1: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
     let addr2: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
@@ -218,10 +230,7 @@ async fn test_ihave_message() {
 
     assert_eq!(sender, 1u64);
     match received_msg {
-        PlumtreeMessage::IHave {
-            message_ids,
-            round,
-        } => {
+        PlumtreeMessage::IHave { message_ids, round } => {
             assert_eq!(message_ids.len(), 1);
             assert_eq!(message_ids[0], msg_id);
             assert_eq!(round, 5);
@@ -235,6 +244,8 @@ async fn test_ihave_message() {
 /// Test Graft message type.
 #[tokio::test]
 async fn test_graft_message() {
+    install_crypto_provider();
+
     let ports = allocate_ports(2);
     let addr1: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
     let addr2: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
@@ -286,6 +297,8 @@ async fn test_graft_message() {
 /// Test Prune message type.
 #[tokio::test]
 async fn test_prune_message() {
+    install_crypto_provider();
+
     let ports = allocate_ports(2);
     let addr1: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
     let addr2: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();

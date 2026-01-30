@@ -1517,8 +1517,7 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
         if current_eager < target_eager {
             // Need to promote some lazy peers to eager
             let promote_count = target_eager - current_eager;
-            let to_promote =
-                self.select_peers_for_promotion_scored(&inner, promote_count, &scorer);
+            let to_promote = self.select_peers_for_promotion_scored(&inner, promote_count, &scorer);
 
             for peer in to_promote {
                 inner.lazy.remove(&peer);

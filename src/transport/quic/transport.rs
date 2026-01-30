@@ -83,6 +83,84 @@ pub struct QuicStats {
     pub connections: ConnectionStats,
 }
 
+// ============================================================================
+// Connection Events for Migration Support
+// ============================================================================
+
+/// Events emitted by the connection manager for observability.
+///
+/// These events can be used to:
+/// - Monitor connection health
+/// - Update resolver mappings when peers migrate
+/// - Trigger reconnection logic on disconnection
+/// - Log connection lifecycle for debugging
+#[derive(Debug, Clone)]
+pub enum ConnectionEvent<I> {
+    /// A new connection to a peer was established.
+    Connected {
+        /// The peer ID that connected.
+        peer: I,
+        /// Initial RTT estimate.
+        rtt: std::time::Duration,
+        /// Remote address of the peer.
+        remote_addr: SocketAddr,
+    },
+
+    /// A connection to a peer was closed.
+    Disconnected {
+        /// The peer ID that disconnected.
+        peer: I,
+        /// Reason for disconnection.
+        reason: DisconnectReason,
+    },
+
+    /// A peer's network address changed (connection migration).
+    ///
+    /// This event is emitted when QUIC detects that the peer is now
+    /// reachable at a different address. This can happen when:
+    /// - The peer's NAT rebinds their port
+    /// - The peer switches network interfaces
+    /// - The peer moves between networks (e.g., WiFi to cellular)
+    Migrated {
+        /// The peer ID that migrated.
+        peer: I,
+        /// Previous address.
+        old_addr: SocketAddr,
+        /// New address.
+        new_addr: SocketAddr,
+    },
+
+    /// A reconnection attempt is in progress.
+    Reconnecting {
+        /// The peer ID being reconnected.
+        peer: I,
+        /// Current attempt number (1-based).
+        attempt: u32,
+    },
+}
+
+/// Reason for connection disconnection.
+#[derive(Debug, Clone)]
+pub enum DisconnectReason {
+    /// Connection was closed cleanly by the application.
+    ApplicationClosed,
+    /// Connection was closed by the peer.
+    PeerClosed {
+        /// Error code from peer (0 indicates clean close).
+        code: u64,
+        /// Reason message from peer.
+        reason: String,
+    },
+    /// Connection timed out due to inactivity.
+    IdleTimeout,
+    /// Connection was reset by the network.
+    Reset,
+    /// Transport-level error occurred.
+    TransportError(String),
+    /// Connection was evicted due to pool limits.
+    Evicted,
+}
+
 /// Internal statistics tracking.
 #[derive(Debug, Default)]
 struct StatsInner {
@@ -150,6 +228,8 @@ where
     stats: Arc<StatsInner>,
     /// The QUIC endpoint.
     endpoint: Endpoint,
+    /// Event sender for connection lifecycle events.
+    event_sender: Option<async_channel::Sender<ConnectionEvent<I>>>,
 }
 
 impl<I, R> QuicTransport<I, R>
@@ -183,11 +263,21 @@ where
     ) -> Result<Self, QuicError> {
         let resolver = Arc::new(resolver);
 
-        // Build TLS configurations
-        // Use async version to avoid blocking when generating self-signed certs
-        let server_config = tls::server_config_async(&config.tls).await?;
+        // Build TLS configurations with full QuicConfig support
+        let max_early_data = if config.zero_rtt.enabled {
+            Some(config.zero_rtt.max_early_data)
+        } else {
+            None
+        };
 
-        let client_config = tls::client_config(&config.tls)?;
+        // Use async version to avoid blocking when generating self-signed certs
+        // Pass full config to apply stream limits, congestion control, etc.
+        let server_config =
+            tls::server_config_async_full(&config.tls, max_early_data, Some(&config)).await?;
+
+        // Build client config with session cache for 0-RTT resumption
+        let client_config =
+            tls::client_config_full(&config.tls, config.zero_rtt.enabled, Some(&config))?;
 
         // Create the endpoint
         let endpoint = Endpoint::server(server_config, bind_addr)?;
@@ -199,12 +289,11 @@ where
             config.clone(),
         ));
 
-        // Warn if 0-RTT is enabled but not yet implemented
         if config.zero_rtt.enabled {
             tracing::warn!(
-                "0-RTT is enabled in configuration but not yet implemented. \
-                 All messages will use regular 1-RTT streams. \
-                 See ZeroRttConfig documentation for details."
+                max_early_data = config.zero_rtt.max_early_data,
+                session_cache_capacity = config.zero_rtt.session_cache_capacity,
+                "0-RTT enabled - ALL messages (including Graft/Prune) are replayable!"
             );
         }
 
@@ -214,6 +303,7 @@ where
             connections,
             stats: Arc::new(StatsInner::default()),
             endpoint,
+            event_sender: None,
         })
     }
 
@@ -223,11 +313,21 @@ where
         config: QuicConfig,
         resolver: Arc<R>,
     ) -> Result<Self, QuicError> {
-        // Build TLS configurations
-        // Use async version to avoid blocking when generating self-signed certs
-        let server_config = tls::server_config_async(&config.tls).await?;
+        // Build TLS configurations with full QuicConfig support
+        let max_early_data = if config.zero_rtt.enabled {
+            Some(config.zero_rtt.max_early_data)
+        } else {
+            None
+        };
 
-        let client_config = tls::client_config(&config.tls)?;
+        // Use async version to avoid blocking when generating self-signed certs
+        // Pass full config to apply stream limits, congestion control, etc.
+        let server_config =
+            tls::server_config_async_full(&config.tls, max_early_data, Some(&config)).await?;
+
+        // Build client config with session cache for 0-RTT resumption
+        let client_config =
+            tls::client_config_full(&config.tls, config.zero_rtt.enabled, Some(&config))?;
 
         // Create the endpoint
         let endpoint = Endpoint::server(server_config, bind_addr)?;
@@ -239,12 +339,11 @@ where
             config.clone(),
         ));
 
-        // Warn if 0-RTT is enabled but not yet implemented
         if config.zero_rtt.enabled {
             tracing::warn!(
-                "0-RTT is enabled in configuration but not yet implemented. \
-                 All messages will use regular 1-RTT streams. \
-                 See ZeroRttConfig documentation for details."
+                max_early_data = config.zero_rtt.max_early_data,
+                session_cache_capacity = config.zero_rtt.session_cache_capacity,
+                "0-RTT enabled - ALL messages (including Graft/Prune) are replayable!"
             );
         }
 
@@ -254,6 +353,7 @@ where
             connections,
             stats: Arc::new(StatsInner::default()),
             endpoint,
+            event_sender: None,
         })
     }
 
@@ -394,61 +494,311 @@ where
         self.spawn_cleanup_task(std::time::Duration::ZERO)
     }
 
-    /// Check if 0-RTT should be used for this message.
+    // ========================================================================
+    // Connection Event Subscription
+    // ========================================================================
+
+    /// Subscribe to connection lifecycle events.
     ///
-    /// Returns true only if:
-    /// - 0-RTT is enabled in config
-    /// - gossip_only mode is **disabled** (user explicitly accepts all-message 0-RTT risk)
+    /// This enables monitoring of connection state changes including:
+    /// - New connections established
+    /// - Connections closed or lost
+    /// - Connection migrations (address changes)
+    /// - Reconnection attempts
     ///
-    /// # Current Limitations
+    /// # Returns
     ///
-    /// **Note**: The current implementation checks the configuration but does not
-    /// actually use QUIC 0-RTT Early Data APIs (`connection.open_uni_early()`).
-    /// True 0-RTT support requires:
+    /// A tuple of:
+    /// - `Receiver<ConnectionEvent<I>>` - Channel for receiving events
+    /// - A new transport instance with event subscription enabled
     ///
-    /// 1. Session ticket caching for connection resumption
-    /// 2. Using `connection.open_uni_early()` or `send_datagram_early()` for 0-RTT data
-    /// 3. Handling `EarlyDataRejected` errors with fallback to regular streams
+    /// # Example
     ///
-    /// The configuration is provided for future implementation and to reserve
-    /// the API. Currently, all messages use regular 1-RTT streams.
+    /// ```ignore
+    /// let (events, transport) = transport.subscribe_events(256);
+    ///
+    /// // Process events in a background task
+    /// tokio::spawn(async move {
+    ///     while let Ok(event) = events.recv().await {
+    ///         match event {
+    ///             ConnectionEvent::Migrated { peer, old_addr, new_addr } => {
+    ///                 // Update resolver with new address
+    ///                 resolver.update_peer(&peer, new_addr);
+    ///             }
+    ///             ConnectionEvent::Disconnected { peer, reason } => {
+    ///                 // Handle disconnection
+    ///             }
+    ///             _ => {}
+    ///         }
+    ///     }
+    /// });
+    /// ```
+    pub fn subscribe_events(
+        mut self,
+        buffer_size: usize,
+    ) -> (async_channel::Receiver<ConnectionEvent<I>>, Self) {
+        let (sender, receiver) = async_channel::bounded(buffer_size);
+        self.event_sender = Some(sender.clone());
+
+        // Set up reconnection callback to emit Reconnecting events
+        let reconnect_sender = sender;
+        self.connections
+            .set_reconnect_callback(Arc::new(move |peer: I, attempt: u32| {
+                let _ = reconnect_sender.try_send(ConnectionEvent::Reconnecting { peer, attempt });
+            }));
+
+        (receiver, self)
+    }
+
+    /// Emit a connection event if subscribers exist.
+    ///
+    /// This is a non-blocking send - events are dropped if the channel is full.
+    /// Callers should not rely on events being delivered in high-throughput scenarios.
+    pub(crate) fn emit_event_sync(&self, event: ConnectionEvent<I>) {
+        if let Some(sender) = &self.event_sender {
+            // Non-blocking send - drop if channel is full
+            let _ = sender.try_send(event);
+        }
+    }
+
+    /// Emit a connection event (async version for compatibility).
+    pub(crate) async fn emit_event(&self, event: ConnectionEvent<I>) {
+        self.emit_event_sync(event);
+    }
+
+    /// Spawn a connection monitoring task that watches for migration and disconnection.
+    ///
+    /// This task periodically checks if the connection's remote address has changed
+    /// (migration) or if the connection has been closed, emitting appropriate events.
+    fn spawn_connection_monitor(
+        &self,
+        peer: I,
+        connection: quinn::Connection,
+        initial_addr: SocketAddr,
+    ) {
+        let event_sender = self.event_sender.clone();
+        let migration_enabled = self.config.migration.enabled;
+
+        tokio::spawn(async move {
+            let mut current_addr = initial_addr;
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+
+            loop {
+                interval.tick().await;
+
+                // Check if connection is closed
+                if let Some(reason) = connection.close_reason() {
+                    if let Some(sender) = &event_sender {
+                        let disconnect_reason = match reason {
+                            quinn::ConnectionError::LocallyClosed => {
+                                DisconnectReason::ApplicationClosed
+                            }
+                            quinn::ConnectionError::ApplicationClosed(app_close) => {
+                                DisconnectReason::PeerClosed {
+                                    code: app_close.error_code.into_inner(),
+                                    reason: String::from_utf8_lossy(&app_close.reason).to_string(),
+                                }
+                            }
+                            quinn::ConnectionError::TimedOut => DisconnectReason::IdleTimeout,
+                            quinn::ConnectionError::Reset => DisconnectReason::Reset,
+                            quinn::ConnectionError::TransportError(e) => {
+                                DisconnectReason::TransportError(e.to_string())
+                            }
+                            _ => DisconnectReason::TransportError("unknown".to_string()),
+                        };
+                        let _ = sender.try_send(ConnectionEvent::Disconnected {
+                            peer: peer.clone(),
+                            reason: disconnect_reason,
+                        });
+                    }
+                    break;
+                }
+
+                // Check for address migration if enabled
+                if migration_enabled {
+                    let new_addr = connection.remote_address();
+                    if new_addr != current_addr {
+                        if let Some(sender) = &event_sender {
+                            let _ = sender.try_send(ConnectionEvent::Migrated {
+                                peer: peer.clone(),
+                                old_addr: current_addr,
+                                new_addr,
+                            });
+                        }
+                        current_addr = new_addr;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Check if connection migration is enabled.
+    pub fn migration_enabled(&self) -> bool {
+        self.config.migration.enabled
+    }
+
+    // ========================================================================
+    // Datagram Support
+    // ========================================================================
+
+    /// Check if datagrams are enabled.
+    pub fn datagrams_enabled(&self) -> bool {
+        self.config.datagram.enabled
+    }
+
+    /// Get the maximum datagram size.
+    pub fn max_datagram_size(&self) -> usize {
+        self.config.datagram.max_datagram_size as usize
+    }
+
+    /// Send data as a QUIC datagram.
+    ///
+    /// Datagrams are fire-and-forget unreliable messages with lower overhead
+    /// than streams. Use for small, latency-sensitive messages where the
+    /// application handles retransmission.
+    ///
+    /// # Arguments
+    ///
+    /// * `target` - The peer ID to send to
+    /// * `data` - The data to send (must be smaller than max_datagram_size)
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())` if the datagram was sent successfully
+    /// - `Err(DatagramTooLarge)` if data exceeds max size and fallback is disabled
+    /// - `Err(DatagramNotSupported)` if peer doesn't support datagrams
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Small gossip message - use datagram
+    /// if transport.datagrams_enabled() && data.len() <= transport.max_datagram_size() {
+    ///     transport.send_datagram(&peer, data).await?;
+    /// } else {
+    ///     transport.send_to(&peer, data).await?;
+    /// }
+    /// ```
+    pub async fn send_datagram(&self, target: &I, data: Bytes) -> Result<(), QuicError> {
+        let max_size = self.config.datagram.max_datagram_size as usize;
+
+        // Check size limit
+        if data.len() > max_size {
+            if self.config.datagram.fallback_to_stream {
+                // Fall back to stream
+                return self.send_to(target, data).await;
+            } else {
+                return Err(QuicError::DatagramTooLarge {
+                    size: data.len(),
+                    max_size,
+                });
+            }
+        }
+
+        // Resolve peer address
+        let addr = self
+            .resolver
+            .resolve(target)
+            .ok_or_else(|| QuicError::PeerNotFound(format!("{:?}", target)))?;
+
+        // Get or create connection
+        let result = self.connections.get_or_connect(target, addr).await?;
+
+        // Emit connection event and spawn monitor if this was a new connection
+        if result.newly_connected {
+            let remote_addr = result.remote_addr;
+            self.emit_event(ConnectionEvent::Connected {
+                peer: target.clone(),
+                rtt: result.rtt.unwrap_or(std::time::Duration::ZERO),
+                remote_addr,
+            })
+            .await;
+
+            // Spawn connection monitor for migration/disconnect events
+            if self.event_sender.is_some() {
+                self.spawn_connection_monitor(
+                    target.clone(),
+                    result.connection.clone(),
+                    remote_addr,
+                );
+            }
+        }
+
+        let connection = result.connection;
+
+        // Check if datagrams are supported
+        let max_size = connection.max_datagram_size();
+        match max_size {
+            Some(peer_max) if data.len() <= peer_max => {
+                // Send the datagram
+                connection
+                    .send_datagram(data.clone())
+                    .map_err(|e| QuicError::DatagramSendFailed(e.to_string()))?;
+
+                self.stats.messages_sent.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .bytes_sent
+                    .fetch_add(data.len() as u64, Ordering::Relaxed);
+                Ok(())
+            }
+            Some(_peer_max) => {
+                // Peer's max is smaller than message
+                if self.config.datagram.fallback_to_stream {
+                    self.send_stream(target, data).await
+                } else {
+                    Err(QuicError::DatagramTooLarge {
+                        size: data.len(),
+                        max_size: max_size.unwrap_or(0),
+                    })
+                }
+            }
+            None => {
+                // Datagrams not supported
+                if self.config.datagram.fallback_to_stream {
+                    self.send_stream(target, data).await
+                } else {
+                    Err(QuicError::DatagramNotSupported)
+                }
+            }
+        }
+    }
+
+    /// Send data as a QUIC stream.
+    ///
+    /// Streams provide reliable, ordered delivery with flow control.
+    /// Use for larger messages or when reliability is required.
+    ///
+    /// This is functionally equivalent to `send_to()` but named explicitly
+    /// to distinguish from `send_datagram()`.
+    pub async fn send_stream(&self, target: &I, data: Bytes) -> Result<(), QuicError> {
+        self.send_to(target, data).await
+    }
+
+    /// Check if 0-RTT is enabled in configuration.
     ///
     /// # Security Warning
     ///
-    /// 0-RTT data is **replayable** by attackers. Only idempotent operations
-    /// (like Gossip messages) should ever use 0-RTT. Control messages (Graft,
-    /// Prune, IHave) must never use 0-RTT as replay attacks could corrupt
-    /// the spanning tree topology.
+    /// When 0-RTT is enabled, **ALL messages** (including Graft/Prune control
+    /// messages) may be sent as replayable early data. The transport cannot
+    /// distinguish message types without parsing the application-layer envelope,
+    /// which requires knowing the peer ID serialization length.
     ///
-    /// # Why We Don't Parse Message Type
-    ///
-    /// The transport layer is generic over the peer ID type `I`, which can have
-    /// variable-length serialization (e.g., `u32`, `u64`, `u128`, `String`, `Uuid`).
-    /// The message format is `[MAGIC][sender_id][tag]...`, where the tag position
-    /// depends on the sender ID length.
-    ///
-    /// Rather than require `I: IdCodec` or a trait to determine serialized length,
-    /// we take the conservative approach: when `gossip_only` is true (the safe default),
-    /// 0-RTT is effectively disabled because we cannot reliably identify Gossip messages.
-    ///
-    /// Users who want 0-RTT for all messages can set `gossip_only: false`, accepting
-    /// the replay risk for non-idempotent messages.
+    /// Only enable 0-RTT if:
+    /// - Your network is trusted (no active attackers)
+    /// - The latency reduction is worth the replay risk
+    /// - You understand that tree topology may be affected by replays
     #[allow(dead_code)]
     fn should_use_0rtt(&self, _data: &Bytes) -> bool {
-        if !self.config.zero_rtt.enabled {
-            return false;
-        }
+        self.config.zero_rtt.enabled
+    }
 
-        if self.config.zero_rtt.gossip_only {
-            // Safe mode: would need message type parsing, which we can't do reliably
-            // at the transport layer due to variable-length peer ID serialization.
-            // Return false to be conservative.
-            return false;
-        }
+    /// Check if 0-RTT is enabled in configuration.
+    pub fn zero_rtt_enabled(&self) -> bool {
+        self.config.zero_rtt.enabled
+    }
 
-        // User explicitly enabled 0-RTT for ALL messages (dangerous!)
-        // They accept the replay risk.
-        true
+    /// Get session cache configuration.
+    pub fn session_cache_capacity(&self) -> usize {
+        self.config.zero_rtt.session_cache_capacity
     }
 }
 
@@ -466,19 +816,40 @@ where
             .resolve(target)
             .ok_or_else(|| QuicError::PeerNotFound(format!("{:?}", target)))?;
 
-        // Check if we should use 0-RTT
-        let _use_0rtt = self.should_use_0rtt(&data);
-        // Note: Actual 0-RTT implementation would use connection.open_uni_early()
-        // For now, we use regular streams. 0-RTT requires session ticket caching.
-
-        // Send via connection manager
+        // Send via connection manager with metadata
         let data_len = data.len();
         match self.connections.send(target, addr, data).await {
-            Ok(()) => {
+            Ok(result) => {
                 self.stats.messages_sent.fetch_add(1, Ordering::Relaxed);
                 self.stats
                     .bytes_sent
                     .fetch_add(data_len as u64, Ordering::Relaxed);
+
+                // Track 0-RTT usage
+                if result.used_0rtt {
+                    self.stats.zero_rtt_sent.fetch_add(1, Ordering::Relaxed);
+                }
+
+                // Emit connection event and spawn monitor if this was a new connection
+                if result.connection.newly_connected {
+                    let remote_addr = result.connection.remote_addr;
+                    self.emit_event(ConnectionEvent::Connected {
+                        peer: target.clone(),
+                        rtt: result.connection.rtt.unwrap_or(std::time::Duration::ZERO),
+                        remote_addr,
+                    })
+                    .await;
+
+                    // Spawn connection monitor for migration/disconnect events
+                    if self.event_sender.is_some() {
+                        self.spawn_connection_monitor(
+                            target.clone(),
+                            result.connection.connection.clone(),
+                            remote_addr,
+                        );
+                    }
+                }
+
                 Ok(())
             }
             Err(e) => {
@@ -841,6 +1212,7 @@ where
             connections: self.connections.clone(),
             stats: self.stats.clone(),
             endpoint: self.endpoint.clone(),
+            event_sender: self.event_sender.clone(),
         }
     }
 }

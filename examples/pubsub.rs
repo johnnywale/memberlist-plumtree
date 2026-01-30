@@ -442,9 +442,9 @@ async fn main() {
         .with_graft_timeout(Duration::from_millis(100))
         .with_message_cache_ttl(Duration::from_secs(30))
         // New: Peer limit configuration
-        .with_protect_ring_neighbors(false)   // Small cluster, no need for protection
-        .with_max_eager_peers(3)              // Cap eager peers for this demo
-        .with_max_lazy_peers(10);             // Cap lazy peers
+        .with_protect_ring_neighbors(false) // Small cluster, no need for protection
+        .with_max_eager_peers(3) // Cap eager peers for this demo
+        .with_max_lazy_peers(10); // Cap lazy peers
 
     // Create pub/sub nodes
     // IDs: 1=broker-1, 2=broker-2, 3=broker-3, 4=client-a, 5=client-b

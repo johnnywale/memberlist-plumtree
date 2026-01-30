@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+use crate::compression::CompressionConfig;
+
 /// Configuration options for the Plumtree protocol.
 ///
 /// These parameters control the balance between broadcast efficiency,
@@ -232,6 +234,16 @@ pub struct PlumtreeConfig {
     /// Default: None (disabled)
     #[cfg_attr(feature = "serde", serde(default))]
     pub storage: Option<StorageConfig>,
+
+    /// Compression configuration for message payloads.
+    ///
+    /// When enabled, Gossip message payloads are compressed before sending
+    /// and decompressed on receipt. Only payloads above the minimum size
+    /// threshold are compressed.
+    ///
+    /// Default: disabled
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub compression: CompressionConfig,
 }
 
 impl Default for PlumtreeConfig {
@@ -261,6 +273,7 @@ impl Default for PlumtreeConfig {
             max_lazy_peers: None,
             sync: None,
             storage: None,
+            compression: CompressionConfig::default(),
         }
     }
 }
@@ -277,6 +290,7 @@ impl PlumtreeConfig {
     /// - Smaller cache TTL
     /// - More aggressive optimization
     /// - Minimal ring neighbor protection (small clusters don't need it)
+    /// - Compression disabled (LAN has plenty of bandwidth)
     pub fn lan() -> Self {
         Self {
             max_peers: None,
@@ -303,6 +317,7 @@ impl PlumtreeConfig {
             max_lazy_peers: None,
             sync: None,
             storage: None,
+            compression: CompressionConfig::default(), // Disabled for LAN
         }
     }
 
@@ -312,6 +327,50 @@ impl PlumtreeConfig {
     /// - Longer cache TTL
     /// - More conservative optimization
     /// - Ring neighbor protection enabled for reliability
+    /// - Compression enabled (zstd level 3) to save bandwidth
+    #[cfg(feature = "compression")]
+    pub fn wan() -> Self {
+        use crate::compression::CompressionAlgorithm;
+        Self {
+            max_peers: None,
+            eager_fanout: 4,
+            lazy_fanout: 8,
+            ihave_interval: Duration::from_millis(200),
+            message_cache_ttl: Duration::from_secs(120),
+            message_cache_max_size: 20000,
+            optimization_threshold: 4,
+            ihave_batch_size: 16,
+            graft_timeout: Duration::from_secs(1),
+            max_message_size: 64 * 1024,
+            graft_rate_limit_per_second: 5.0,
+            graft_rate_limit_burst: 15,
+            graft_max_retries: 7,
+            maintenance_interval: Duration::from_secs(5),
+            maintenance_jitter: Duration::from_secs(1),
+            #[cfg(feature = "metrics")]
+            enable_metrics: true,
+            use_hash_ring: true,
+            protect_ring_neighbors: true,
+            max_protected_neighbors: 4,
+            max_eager_peers: None,
+            max_lazy_peers: None,
+            sync: None,
+            storage: None,
+            compression: CompressionConfig {
+                enabled: true,
+                algorithm: CompressionAlgorithm::Zstd { level: 3 },
+                min_payload_size: 256,
+            },
+        }
+    }
+
+    /// Configuration optimized for WAN environments.
+    ///
+    /// - Higher latency tolerance
+    /// - Longer cache TTL
+    /// - More conservative optimization
+    /// - Ring neighbor protection enabled for reliability
+    #[cfg(not(feature = "compression"))]
     pub fn wan() -> Self {
         Self {
             max_peers: None,
@@ -338,6 +397,7 @@ impl PlumtreeConfig {
             max_lazy_peers: None,
             sync: None,
             storage: None,
+            compression: CompressionConfig::default(),
         }
     }
 
@@ -348,6 +408,51 @@ impl PlumtreeConfig {
     /// - Conservative optimization to maintain reliability
     /// - Full ring neighbor protection for stability
     /// - Hard cap on eager peers to prevent runaway growth
+    /// - Compression enabled (zstd level 3) to reduce bandwidth
+    #[cfg(feature = "compression")]
+    pub fn large_cluster() -> Self {
+        use crate::compression::CompressionAlgorithm;
+        Self {
+            max_peers: None,
+            eager_fanout: 5,
+            lazy_fanout: 10,
+            ihave_interval: Duration::from_millis(150),
+            message_cache_ttl: Duration::from_secs(90),
+            message_cache_max_size: 50000,
+            optimization_threshold: 5,
+            ihave_batch_size: 32,
+            graft_timeout: Duration::from_millis(750),
+            max_message_size: 64 * 1024,
+            graft_rate_limit_per_second: 10.0,
+            graft_rate_limit_burst: 30,
+            graft_max_retries: 5,
+            maintenance_interval: Duration::from_secs(3),
+            maintenance_jitter: Duration::from_millis(750),
+            #[cfg(feature = "metrics")]
+            enable_metrics: true,
+            use_hash_ring: true,
+            protect_ring_neighbors: true,
+            max_protected_neighbors: 4,
+            max_eager_peers: Some(8), // Hard cap to prevent unbounded growth
+            max_lazy_peers: Some(50), // Limit IHAVE tracking overhead
+            sync: None,
+            storage: None,
+            compression: CompressionConfig {
+                enabled: true,
+                algorithm: CompressionAlgorithm::Zstd { level: 3 },
+                min_payload_size: 256,
+            },
+        }
+    }
+
+    /// Configuration for large clusters (1000+ nodes).
+    ///
+    /// - Higher fanout for better coverage
+    /// - Larger cache for more redundancy
+    /// - Conservative optimization to maintain reliability
+    /// - Full ring neighbor protection for stability
+    /// - Hard cap on eager peers to prevent runaway growth
+    #[cfg(not(feature = "compression"))]
     pub fn large_cluster() -> Self {
         Self {
             max_peers: None,
@@ -370,10 +475,11 @@ impl PlumtreeConfig {
             use_hash_ring: true,
             protect_ring_neighbors: true,
             max_protected_neighbors: 4,
-            max_eager_peers: Some(8),  // Hard cap to prevent unbounded growth
-            max_lazy_peers: Some(50),  // Limit IHAVE tracking overhead
+            max_eager_peers: Some(8), // Hard cap to prevent unbounded growth
+            max_lazy_peers: Some(50), // Limit IHAVE tracking overhead
             sync: None,
             storage: None,
+            compression: CompressionConfig::default(),
         }
     }
 
@@ -617,6 +723,25 @@ impl PlumtreeConfig {
     /// ```
     pub fn with_storage(mut self, storage: StorageConfig) -> Self {
         self.storage = Some(storage);
+        self
+    }
+
+    /// Enable compression with the given configuration (builder pattern).
+    ///
+    /// Compression reduces bandwidth usage by compressing Gossip message payloads.
+    /// Only payloads above the minimum size threshold are compressed.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use memberlist_plumtree::{PlumtreeConfig, CompressionConfig};
+    ///
+    /// // Enable zstd compression with 256 byte threshold
+    /// let config = PlumtreeConfig::default()
+    ///     .with_compression(CompressionConfig::zstd(3).with_min_size(256));
+    /// ```
+    pub fn with_compression(mut self, compression: CompressionConfig) -> Self {
+        self.compression = compression;
         self
     }
 }
@@ -962,9 +1087,6 @@ mod tests {
         assert!(config.enabled);
         assert_eq!(config.max_messages, 50_000);
         assert_eq!(config.retention, Duration::from_secs(600));
-        assert_eq!(
-            config.path,
-            Some(std::path::PathBuf::from("/tmp/plumtree"))
-        );
+        assert_eq!(config.path, Some(std::path::PathBuf::from("/tmp/plumtree")));
     }
 }

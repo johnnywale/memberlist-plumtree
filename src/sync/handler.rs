@@ -94,7 +94,9 @@ impl<S: MessageStore> SyncHandler<S> {
             return None;
         }
 
-        Some(SyncPull { message_ids: missing })
+        Some(SyncPull {
+            message_ids: missing,
+        })
     }
 
     /// Handle SyncPull (peer is asking for specific messages).
@@ -300,10 +302,7 @@ mod tests {
             .unwrap();
 
         // Peer says they have id2 and id3
-        let pull = handler
-            .handle_sync_response(vec![id2, id3])
-            .await
-            .unwrap();
+        let pull = handler.handle_sync_response(vec![id2, id3]).await.unwrap();
 
         // We should request id3 (we don't have it)
         assert_eq!(pull.message_ids.len(), 1);

@@ -1,0 +1,38 @@
+#!/bin/sh
+#
+# Pre-push hook - runs more comprehensive checks before pushing
+# This catches integration issues that pre-commit might miss
+#
+
+set -e
+
+echo "Running pre-push checks..."
+
+# Run tests with all features (catches feature integration issues)
+echo "Running tests with all features..."
+if ! cargo test --all-features --lib 2>&1; then
+    echo ""
+    echo "❌ Tests failed!"
+    echo "Fix the test failures before pushing."
+    exit 1
+fi
+echo "✓ All library tests passed"
+
+# Run integration tests (catches cross-module issues)
+echo "Running integration tests..."
+if ! cargo test --all-features --tests 2>&1; then
+    echo ""
+    echo "❌ Integration tests failed!"
+    echo "Fix the test failures before pushing."
+    exit 1
+fi
+echo "✓ Integration tests passed"
+
+# Check feature combinations (catches feature flag issues)
+echo "Checking feature combinations..."
+cargo check --no-default-features 2>&1 || { echo "❌ --no-default-features failed"; exit 1; }
+cargo check --no-default-features --features "tokio" 2>&1 || { echo "❌ tokio feature failed"; exit 1; }
+echo "✓ Feature combinations OK"
+
+echo ""
+echo "✅ All pre-push checks passed!"

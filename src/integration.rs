@@ -19,10 +19,9 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use nodecraft::Id;
 use std::{fmt::Debug, hash::Hash, sync::Arc};
 
-
 use crate::{
     config::PlumtreeConfig,
-    error::Result,
+    error::{Error, Result},
     message::{MessageId, PlumtreeMessage, SyncMessage},
     peer_state::PeerState,
     plumtree::{Plumtree, PlumtreeDelegate, PlumtreeHandle},
@@ -33,6 +32,23 @@ use crate::{
 /// Storage type alias for convenience.
 /// Users can provide their own storage backend by implementing MessageStore.
 pub type DefaultStore = MemoryStore;
+
+/// A page of stored messages with pagination metadata.
+///
+/// Returned by [`PlumtreeDiscovery::list_messages`] for paginated message queries.
+#[derive(Debug, Clone)]
+pub struct MessagePage {
+    /// The messages in this page.
+    pub messages: Vec<StoredMessage>,
+    /// Whether there are more messages after this page.
+    pub has_more: bool,
+    /// Total count of messages in the store.
+    pub total: usize,
+    /// Current offset used for this page.
+    pub offset: usize,
+    /// Limit used for this page.
+    pub limit: usize,
+}
 
 /// Trait for encoding and decoding node IDs for network transmission.
 ///
@@ -193,10 +209,17 @@ impl IdCodec for String {
     }
 }
 
-/// Magic byte prefix for Plumtree messages.
+/// Magic byte prefix for Plumtree messages (uncompressed).
 ///
 /// Used to distinguish Plumtree protocol messages from user messages.
 const PLUMTREE_MAGIC: u8 = 0x50;
+
+/// Magic byte prefix for compressed Plumtree messages.
+///
+/// Format: `[MAGIC_COMPRESSED][algo (1 byte)][sender_id][message]`
+/// where `[sender_id][message]` is compressed using the specified algorithm.
+#[cfg(feature = "compression")]
+const PLUMTREE_MAGIC_COMPRESSED: u8 = 0x51;
 
 /// Outgoing broadcast envelope (unencooded).
 ///
@@ -219,6 +242,26 @@ impl<I: IdCodec> BroadcastEnvelope<I> {
     pub fn encode(&self) -> Bytes {
         encode_plumtree_envelope(&self.sender, &self.message)
     }
+
+    /// Encode this envelope with optional compression.
+    ///
+    /// Returns a tuple of (encoded_bytes, compression_stats) where compression_stats
+    /// is `Some((original_size, compressed_size))` if compression was attempted.
+    ///
+    /// Compression is only applied to Gossip messages; control messages
+    /// (IHave, Graft, Prune) are always sent uncompressed.
+    pub fn encode_with_compression(
+        &self,
+        config: &crate::compression::CompressionConfig,
+    ) -> (Bytes, Option<(usize, usize)>) {
+        // Only compress Gossip messages (which contain actual payloads)
+        match &self.message {
+            PlumtreeMessage::Gossip { .. } => {
+                encode_plumtree_envelope_with_compression(&self.sender, &self.message, config)
+            }
+            _ => (encode_plumtree_envelope(&self.sender, &self.message), None),
+        }
+    }
 }
 
 /// Outgoing unicast envelope (unencooded).
@@ -237,8 +280,26 @@ pub(crate) struct UnicastEnvelope<I> {
 
 impl<I: IdCodec> UnicastEnvelope<I> {
     /// Encode this envelope for network transmission.
+    #[allow(dead_code)]
     fn encode(&self) -> Bytes {
         encode_plumtree_envelope(&self.sender, &self.message)
+    }
+
+    /// Encode this envelope with optional compression.
+    ///
+    /// Returns a tuple of (encoded_bytes, compression_stats) where compression_stats
+    /// is `Some((original_size, compressed_size))` if compression was attempted.
+    fn encode_with_compression(
+        &self,
+        config: &crate::compression::CompressionConfig,
+    ) -> (Bytes, Option<(usize, usize)>) {
+        // Only compress Gossip messages (which contain actual payloads)
+        match &self.message {
+            PlumtreeMessage::Gossip { .. } => {
+                encode_plumtree_envelope_with_compression(&self.sender, &self.message, config)
+            }
+            _ => (encode_plumtree_envelope(&self.sender, &self.message), None),
+        }
     }
 }
 
@@ -475,7 +536,8 @@ where
         let sync_handler = Arc::new(SyncHandler::new(store.clone()));
 
         // Create the event handler that wraps the user delegate and storage
-        let event_handler = PlumtreeEventHandler::new(delegate, store.clone(), sync_handler.clone());
+        let event_handler =
+            PlumtreeEventHandler::new(delegate, store.clone(), sync_handler.clone());
 
         // Force hash ring topology for PlumtreeDiscovery
         let config = config.with_hash_ring(true);
@@ -569,7 +631,8 @@ where
         let (unicast_tx, unicast_rx) = async_channel::bounded(1024);
 
         // Create the event handler with the shared sync handler
-        let event_handler = PlumtreeEventHandler::new(delegate, store.clone(), sync_handler.clone());
+        let event_handler =
+            PlumtreeEventHandler::new(delegate, store.clone(), sync_handler.clone());
 
         // Force hash ring topology for PlumtreeDiscovery
         let config = config.with_hash_ring(true);
@@ -627,6 +690,38 @@ where
         self.outgoing_rx.clone()
     }
 
+    /// Receive the next outgoing broadcast and encode it with compression.
+    ///
+    /// This is a convenience method that combines receiving from the outgoing
+    /// channel with encoding using the configured compression settings.
+    ///
+    /// Returns `None` when the channel is closed.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Instead of:
+    /// let envelope = pm.outgoing_receiver().recv().await?;
+    /// let encoded = envelope.encode_with_compression(&compression_config);
+    ///
+    /// // Use:
+    /// let encoded = pm.recv_outgoing_encoded().await?;
+    /// memberlist.broadcast(encoded).await;
+    /// ```
+    pub async fn recv_outgoing_encoded(&self) -> Option<Bytes> {
+        let envelope = self.outgoing_rx.recv().await.ok()?;
+        let compression_config = &self.plumtree.config().compression;
+        let (encoded, compression_stats) = envelope.encode_with_compression(compression_config);
+
+        // Record compression metrics if compression was attempted
+        #[cfg(feature = "metrics")]
+        if let Some((original, compressed)) = compression_stats {
+            crate::metrics::record_compression(original, compressed);
+        }
+
+        Some(encoded)
+    }
+
     /// Get the receiver for outgoing unicast envelopes.
     ///
     /// **CRITICAL**: These messages MUST be sent directly to the specified
@@ -667,22 +762,70 @@ where
     /// Broadcast a message to all nodes in the cluster.
     ///
     /// Uses Plumtree's efficient O(n) spanning tree broadcast.
+    /// The message is automatically compressed if compression is configured
+    /// and the payload exceeds the minimum size threshold.
     /// The message is also stored for sync/persistence.
     pub async fn broadcast(&self, payload: impl Into<Bytes>) -> Result<MessageId> {
         let payload = payload.into();
 
+        // Apply compression if configured
+        let final_payload = self.compress_if_needed(&payload);
+
         // Broadcast via Plumtree
-        let msg_id = self.plumtree.broadcast(payload.clone()).await?;
+        let msg_id = self.plumtree.broadcast(final_payload.clone()).await?;
 
         // Store for sync/persistence (same as on_deliver)
-        self.sync_handler.record_message(msg_id, &payload);
+        self.sync_handler.record_message(msg_id, &final_payload);
 
-        let msg = StoredMessage::new(msg_id, 0, payload);
+        let msg = StoredMessage::new(msg_id, 0, final_payload);
         if let Err(e) = self.store.insert(&msg).await {
             tracing::warn!("failed to store broadcast message: {}", e);
         }
 
         Ok(msg_id)
+    }
+
+    /// Compress payload if compression is enabled and payload is large enough.
+    ///
+    /// Returns the original payload if:
+    /// - Compression is disabled in config
+    /// - Payload is smaller than `min_payload_size` threshold
+    /// - Compression fails
+    /// - Compressed size is not smaller than original
+    fn compress_if_needed(&self, payload: &Bytes) -> Bytes {
+        let config = &self.plumtree.config().compression;
+
+        // Check if compression should be applied
+        if !config.enabled || payload.len() < config.min_payload_size {
+            return payload.clone();
+        }
+
+        #[cfg(feature = "compression")]
+        {
+            match crate::compression::compress(payload, config.algorithm) {
+                Ok(compressed) if compressed.len() < payload.len() => {
+                    tracing::trace!(
+                        original_size = payload.len(),
+                        compressed_size = compressed.len(),
+                        "compressed broadcast payload"
+                    );
+                    compressed
+                }
+                Ok(_) => {
+                    // Compressed is not smaller, use original
+                    payload.clone()
+                }
+                Err(e) => {
+                    tracing::warn!("compression failed, using uncompressed: {}", e);
+                    payload.clone()
+                }
+            }
+        }
+
+        #[cfg(not(feature = "compression"))]
+        {
+            payload.clone()
+        }
     }
 
     /// Handle an incoming Plumtree message from the network.
@@ -715,6 +858,11 @@ where
     /// Get cache statistics.
     pub fn cache_stats(&self) -> crate::message::CacheStats {
         self.plumtree.cache_stats()
+    }
+
+    /// Get seen map statistics (deduplication map).
+    pub fn seen_map_stats(&self) -> Option<crate::plumtree::SeenMapStats> {
+        self.plumtree.seen_map_stats()
     }
 
     /// Add a peer to the Plumtree overlay with automatic classification.
@@ -806,7 +954,7 @@ where
         let sync_transport = transport.clone();
 
         futures::future::join(
-            futures::future::join(
+            futures::future::join3(
                 futures::future::join5(
                     self.plumtree.run_ihave_scheduler(),
                     self.plumtree.run_graft_timer(),
@@ -815,6 +963,8 @@ where
                     self.run_unicast_sender(transport),
                 ),
                 self.run_storage_prune(),
+                // Maintenance loop updates gauge metrics (eager/lazy/total peers, cache size, etc.)
+                self.plumtree.run_maintenance_loop(),
             ),
             self.run_anti_entropy_sync(sync_transport),
         )
@@ -859,7 +1009,8 @@ where
             }
 
             // Calculate cutoff timestamp
-            let cutoff = current_time_ms().saturating_sub(storage_config.retention.as_millis() as u64);
+            let cutoff =
+                current_time_ms().saturating_sub(storage_config.retention.as_millis() as u64);
 
             // Prune expired messages from storage
             match self.store.prune(cutoff).await {
@@ -891,13 +1042,23 @@ where
     /// Internal task that sends unicast messages via the provided transport.
     ///
     /// Serialization is deferred to this point to minimize allocations.
+    /// Compression is applied based on the config settings.
     async fn run_unicast_sender<T>(&self, transport: T)
     where
         T: crate::Transport<I>,
     {
+        let compression_config = &self.plumtree.config().compression;
+
         while let Ok(envelope) = self.unicast_rx.recv().await {
             // Encode at the last moment before network transmission
-            let encoded = envelope.encode();
+            let (encoded, compression_stats) = envelope.encode_with_compression(compression_config);
+
+            // Record compression metrics if compression was attempted
+            #[cfg(feature = "metrics")]
+            if let Some((original, compressed)) = compression_stats {
+                crate::metrics::record_compression(original, compressed);
+            }
+
             if let Err(e) = transport.send_to(&envelope.target, encoded).await {
                 tracing::warn!(
                     "failed to send unicast message to {:?}: {}",
@@ -954,7 +1115,10 @@ where
         while let Ok((from, message)) = self.incoming_rx.recv().await {
             // Handle sync messages specially
             if let PlumtreeMessage::Sync(sync_msg) = &message {
-                if let Err(e) = self.handle_sync_message(from.clone(), sync_msg.clone()).await {
+                if let Err(e) = self
+                    .handle_sync_message(from.clone(), sync_msg.clone())
+                    .await
+                {
                     tracing::warn!("failed to handle sync message: {}", e);
                 }
             } else {
@@ -1057,6 +1221,105 @@ where
         &self.store
     }
 
+    /// List stored messages with pagination.
+    ///
+    /// Returns a page of stored messages within the given time range.
+    /// Messages are ordered by timestamp (oldest first).
+    ///
+    /// # Arguments
+    ///
+    /// * `start_ts` - Start timestamp (inclusive, ms since UNIX epoch), 0 for beginning
+    /// * `end_ts` - End timestamp (inclusive), u64::MAX for no upper bound
+    /// * `limit` - Maximum number of messages to return (capped at 1000)
+    /// * `offset` - Number of messages to skip (for pagination)
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Get first page of all messages
+    /// let page = pm.list_messages(0, u64::MAX, 20, 0).await?;
+    /// println!("Got {} messages, has_more: {}", page.messages.len(), page.has_more);
+    ///
+    /// // Get next page
+    /// if page.has_more {
+    ///     let page2 = pm.list_messages(0, u64::MAX, 20, 20).await?;
+    /// }
+    /// ```
+    pub async fn list_messages(
+        &self,
+        start_ts: u64,
+        end_ts: u64,
+        limit: usize,
+        offset: usize,
+    ) -> Result<MessagePage> {
+        let limit = limit.min(1000); // Cap at 1000 to prevent unbounded queries
+
+        let total = self
+            .store
+            .count()
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let (ids, has_more) = self
+            .store
+            .get_range(start_ts, end_ts, limit, offset)
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let mut messages = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(msg) = self
+                .store
+                .get(&id)
+                .await
+                .map_err(|e| Error::Storage(e.to_string()))?
+            {
+                messages.push(msg);
+            }
+        }
+
+        Ok(MessagePage {
+            messages,
+            has_more,
+            total,
+            offset,
+            limit,
+        })
+    }
+
+    /// Get total count of stored messages.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let count = pm.message_count().await?;
+    /// println!("Store contains {} messages", count);
+    /// ```
+    pub async fn message_count(&self) -> Result<usize> {
+        self.store
+            .count()
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))
+    }
+
+    /// Get a specific stored message by ID.
+    ///
+    /// Returns `None` if the message is not found in the store.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// if let Some(msg) = pm.get_message(&message_id).await? {
+    ///     println!("Found message with payload: {:?}", msg.payload);
+    /// }
+    /// ```
+    pub async fn get_message(&self, id: &MessageId) -> Result<Option<StoredMessage>> {
+        self.store
+            .get(id)
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))
+    }
+
     /// Get local sync state for memberlist push-pull exchange.
     ///
     /// This is called by memberlist's `local_state()` hook during push-pull sync
@@ -1088,7 +1351,9 @@ where
     where
         F: FnOnce() -> Option<I> + Send,
     {
-        self.sync_strategy.merge_remote_state(buf, peer_resolver).await;
+        self.sync_strategy
+            .merge_remote_state(buf, peer_resolver)
+            .await;
     }
 
     /// Check if the sync strategy needs a background task.
@@ -1239,6 +1504,84 @@ pub fn encode_plumtree_envelope<I: IdCodec>(sender: &I, msg: &PlumtreeMessage) -
     buf.freeze()
 }
 
+/// Encode a Plumtree message with optional compression.
+///
+/// This function will compress the message if:
+/// - The `compression` feature is enabled
+/// - Compression is enabled in the config
+/// - The message payload exceeds the minimum size threshold
+/// - Compression actually reduces the size
+///
+/// Format (uncompressed): `[MAGIC][sender_id][message]`
+/// Format (compressed): `[MAGIC_COMPRESSED][algo][compressed([sender_id][message])]`
+///
+/// # Arguments
+///
+/// * `sender` - The sender's node ID
+/// * `msg` - The Plumtree message to encode
+/// * `config` - Compression configuration
+///
+/// # Returns
+///
+/// A tuple of (encoded_bytes, compression_stats) where compression_stats is
+/// (original_size, compressed_size) if compression was attempted.
+#[cfg(feature = "compression")]
+pub fn encode_plumtree_envelope_with_compression<I: IdCodec>(
+    sender: &I,
+    msg: &PlumtreeMessage,
+    config: &crate::compression::CompressionConfig,
+) -> (Bytes, Option<(usize, usize)>) {
+    use crate::compression::{compress, CompressionAlgorithm};
+
+    // First encode without compression
+    let uncompressed = encode_plumtree_envelope(sender, msg);
+    let original_size = uncompressed.len();
+
+    // Check if we should try compression
+    if !config.enabled || matches!(config.algorithm, CompressionAlgorithm::None) {
+        return (uncompressed, None);
+    }
+
+    // Only compress if payload exceeds minimum size
+    // (check against the encoded message, not just the payload)
+    if original_size < config.min_payload_size {
+        return (uncompressed, None);
+    }
+
+    // Try to compress
+    match compress(&uncompressed[1..], config.algorithm) {
+        Ok(compressed) => {
+            // Only use compression if it actually reduces size
+            // Account for the 2 extra bytes (magic + algo)
+            if compressed.len() + 2 < original_size {
+                let compressed_size = compressed.len() + 2;
+                let mut buf = BytesMut::with_capacity(compressed_size);
+                buf.put_u8(PLUMTREE_MAGIC_COMPRESSED);
+                buf.put_u8(config.algorithm.wire_id());
+                buf.extend_from_slice(&compressed);
+                (buf.freeze(), Some((original_size, compressed_size)))
+            } else {
+                // Compression didn't help, use uncompressed
+                (uncompressed, Some((original_size, original_size)))
+            }
+        }
+        Err(_) => {
+            // Compression failed, use uncompressed
+            (uncompressed, None)
+        }
+    }
+}
+
+/// Encode a Plumtree message (compression feature disabled).
+#[cfg(not(feature = "compression"))]
+pub fn encode_plumtree_envelope_with_compression<I: IdCodec>(
+    sender: &I,
+    msg: &PlumtreeMessage,
+    _config: &crate::compression::CompressionConfig,
+) -> (Bytes, Option<(usize, usize)>) {
+    (encode_plumtree_envelope(sender, msg), None)
+}
+
 /// Encode a Plumtree envelope directly into an existing buffer.
 ///
 /// This is useful for buffer pooling scenarios where you want to reuse
@@ -1285,23 +1628,45 @@ pub fn envelope_encoded_len<I: IdCodec>(sender: &I, msg: &PlumtreeMessage) -> us
 
 /// Decode a Plumtree envelope extracting sender ID and message.
 ///
-/// Format: `[MAGIC][sender_id][message]`
+/// This function automatically handles both compressed and uncompressed messages:
+/// - Format (uncompressed): `[MAGIC][sender_id][message]`
+/// - Format (compressed): `[MAGIC_COMPRESSED][algo][compressed([sender_id][message])]`
 ///
 /// Returns `Some((sender, message))` on success, `None` on decode failure.
 pub fn decode_plumtree_envelope<I: IdCodec>(data: &[u8]) -> Option<(I, PlumtreeMessage)> {
-    if data.is_empty() || data[0] != PLUMTREE_MAGIC {
+    if data.is_empty() {
         return None;
     }
 
-    let mut cursor = std::io::Cursor::new(&data[1..]);
+    match data[0] {
+        PLUMTREE_MAGIC => {
+            // Uncompressed message
+            let mut buf = &data[1..];
+            let sender = I::decode_id(&mut buf)?;
+            let msg = PlumtreeMessage::decode(&mut buf)?;
+            Some((sender, msg))
+        }
+        #[cfg(feature = "compression")]
+        PLUMTREE_MAGIC_COMPRESSED => {
+            // Compressed message
+            if data.len() < 3 {
+                return None;
+            }
+            let algo_id = data[1];
+            let algo = crate::compression::CompressionAlgorithm::from_wire_id(algo_id)?;
+            let compressed_data = &data[2..];
 
-    // Decode sender ID
-    let sender = I::decode_id(&mut cursor)?;
+            // Decompress
+            let decompressed = crate::compression::decompress(compressed_data, algo).ok()?;
 
-    // Decode message from remaining bytes
-    let msg = PlumtreeMessage::decode(&mut cursor)?;
-
-    Some((sender, msg))
+            // Now decode the decompressed data as [sender_id][message]
+            let mut buf = decompressed.as_ref();
+            let sender = I::decode_id(&mut buf)?;
+            let msg = PlumtreeMessage::decode(&mut buf)?;
+            Some((sender, msg))
+        }
+        _ => None,
+    }
 }
 
 /// Try to decode a Plumtree message from received bytes (without sender).
@@ -1317,9 +1682,19 @@ pub fn decode_plumtree_message(data: &[u8]) -> Option<PlumtreeMessage> {
     }
 }
 
-/// Check if data is a Plumtree message.
+/// Check if data is a Plumtree message (compressed or uncompressed).
 pub fn is_plumtree_message(data: &[u8]) -> bool {
-    !data.is_empty() && data[0] == PLUMTREE_MAGIC
+    if data.is_empty() {
+        return false;
+    }
+    #[cfg(feature = "compression")]
+    {
+        data[0] == PLUMTREE_MAGIC || data[0] == PLUMTREE_MAGIC_COMPRESSED
+    }
+    #[cfg(not(feature = "compression"))]
+    {
+        data[0] == PLUMTREE_MAGIC
+    }
 }
 
 #[cfg(test)]

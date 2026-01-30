@@ -17,8 +17,8 @@ use memberlist_plumtree::{
     PooledTransport,
 };
 use nodecraft::CheapClone;
-use smallvec::smallvec;
 use parking_lot::Mutex;
+use smallvec::smallvec;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
@@ -145,7 +145,11 @@ impl SimulatedNetwork {
         }
     }
 
-    fn register_node(&mut self, node_id: NodeId, incoming_tx: async_channel::Sender<(NodeId, PlumtreeMessage)>) {
+    fn register_node(
+        &mut self,
+        node_id: NodeId,
+        incoming_tx: async_channel::Sender<(NodeId, PlumtreeMessage)>,
+    ) {
         self.incoming_senders.insert(node_id, incoming_tx);
     }
 
@@ -156,7 +160,8 @@ impl SimulatedNetwork {
     /// Route a broadcast message to all nodes except the sender
     async fn route_broadcast(&self, from: NodeId, data: &Bytes) {
         if let Some((sender_id, message)) = decode_plumtree_envelope::<NodeId>(data) {
-            self.broadcast_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.broadcast_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             for (node_id, sender) in &self.incoming_senders {
                 if *node_id != from {
                     let _ = sender.send((sender_id, message.clone())).await;
@@ -168,7 +173,8 @@ impl SimulatedNetwork {
     /// Route a unicast message to a specific node
     async fn route_unicast(&self, target: NodeId, data: &Bytes) {
         if let Some((sender_id, message)) = decode_plumtree_envelope::<NodeId>(data) {
-            self.unicast_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.unicast_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if let Some(sender) = self.incoming_senders.get(&target) {
                 let _ = sender.send((sender_id, message)).await;
             }
@@ -223,7 +229,7 @@ async fn test_high_performance_basic_broadcast() {
 
     // Start all nodes with their transports
     let mut handles = Vec::new();
-    for (_i, (pm, transport)) in nodes.iter().zip(transports.iter()).enumerate() {
+    for (pm, transport) in nodes.iter().zip(transports.iter()) {
         // Start run_with_transport
         let pm_run = pm.clone();
         let transport_clone = transport.clone();
@@ -240,7 +246,7 @@ async fn test_high_performance_basic_broadcast() {
 
     // Start unicast message router
     let network = Arc::new(network);
-    for (_i, rx) in network.unicast_receivers.iter().enumerate() {
+    for rx in network.unicast_receivers.iter() {
         let network_clone = network.clone();
         let rx_clone = rx.clone();
         tokio::spawn(async move {
@@ -304,11 +310,7 @@ async fn test_pooled_transport_concurrency() {
     };
 
     let delegate = TestDelegate::new();
-    let pm = Arc::new(PlumtreeDiscovery::new(
-        NodeId(0),
-        config,
-        delegate.clone(),
-    ));
+    let pm = Arc::new(PlumtreeDiscovery::new(NodeId(0), config, delegate.clone()));
 
     let (transport, _unicast_rx) = ChannelTransport::<NodeId>::bounded(100);
     let pooled = Arc::new(PooledTransport::new(transport, pool_config));
@@ -342,11 +344,7 @@ async fn test_ihave_graft_cycle() {
         config.clone(),
         delegate1.clone(),
     ));
-    let pm2 = Arc::new(PlumtreeDiscovery::new(
-        NodeId(2),
-        config,
-        delegate2.clone(),
-    ));
+    let pm2 = Arc::new(PlumtreeDiscovery::new(NodeId(2), config, delegate2.clone()));
 
     // Add peers (node 2 is lazy for node 1)
     pm1.add_peer_lazy(NodeId(2));
@@ -423,11 +421,7 @@ async fn test_duplicate_handling() {
     let config = PlumtreeConfig::default();
     let delegate = TestDelegate::new();
 
-    let pm = Arc::new(PlumtreeDiscovery::new(
-        NodeId(0),
-        config,
-        delegate.clone(),
-    ));
+    let pm = Arc::new(PlumtreeDiscovery::new(NodeId(0), config, delegate.clone()));
 
     pm.add_peer(NodeId(1));
     pm.add_peer(NodeId(2));
@@ -462,11 +456,7 @@ async fn test_peer_topology_management() {
         .with_max_peers(10);
 
     let delegate = TestDelegate::new();
-    let pm = Arc::new(PlumtreeDiscovery::new(
-        NodeId(0),
-        config,
-        delegate,
-    ));
+    let pm = Arc::new(PlumtreeDiscovery::new(NodeId(0), config, delegate));
 
     // Add peers
     for i in 1..=5 {
@@ -495,11 +485,7 @@ async fn test_graceful_shutdown() {
     let config = PlumtreeConfig::default();
     let delegate = TestDelegate::new();
 
-    let pm = Arc::new(PlumtreeDiscovery::new(
-        NodeId(0),
-        config,
-        delegate,
-    ));
+    let pm = Arc::new(PlumtreeDiscovery::new(NodeId(0), config, delegate));
 
     let (transport, _rx) = ChannelTransport::<NodeId>::bounded(100);
     let pooled = Arc::new(PooledTransport::new(transport, PoolConfig::default()));
@@ -570,14 +556,22 @@ async fn test_envelope_encoding() {
                 assert_eq!(id1, id2);
             }
             (
-                PlumtreeMessage::IHave { message_ids: ids1, .. },
-                PlumtreeMessage::IHave { message_ids: ids2, .. },
+                PlumtreeMessage::IHave {
+                    message_ids: ids1, ..
+                },
+                PlumtreeMessage::IHave {
+                    message_ids: ids2, ..
+                },
             ) => {
                 assert_eq!(ids1.len(), ids2.len());
             }
             (
-                PlumtreeMessage::Graft { message_id: id1, .. },
-                PlumtreeMessage::Graft { message_id: id2, .. },
+                PlumtreeMessage::Graft {
+                    message_id: id1, ..
+                },
+                PlumtreeMessage::Graft {
+                    message_id: id2, ..
+                },
             ) => {
                 assert_eq!(id1, id2);
             }
@@ -605,11 +599,7 @@ async fn test_high_throughput_broadcast() {
     for i in 0..NUM_NODES {
         let delegate = TestDelegate::new();
         delegates.push(delegate.clone());
-        let pm = Arc::new(PlumtreeDiscovery::new(
-            NodeId(i),
-            config.clone(),
-            delegate,
-        ));
+        let pm = Arc::new(PlumtreeDiscovery::new(NodeId(i), config.clone(), delegate));
         nodes.push(pm);
     }
 

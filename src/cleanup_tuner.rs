@@ -1081,6 +1081,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)] // Intentionally testing validation of invalid values
     fn test_cleanup_config_validation() {
         let mut config = CleanupConfig::default();
         config.ttl_divisor = 0.5; // Too low
@@ -1408,20 +1409,27 @@ mod tests {
 
     #[test]
     fn test_rate_tracker_window_rollover() {
+        use crate::testing::wait_for_condition;
+
         let counter = LockFreeRateCounter::new();
-        let mut state = RateWindowState::new(Duration::from_millis(100));
+        let state = std::cell::RefCell::new(RateWindowState::new(Duration::from_millis(100)));
 
         // Add some messages
         counter.record_batch(50);
-        thread::sleep(Duration::from_millis(120));
 
-        // Should have rolled over
-        let rate = state.sync_and_calculate_rate(&counter);
-        assert!(rate > 0.0);
+        // Wait for window rollover using condition-based waiting
+        wait_for_condition(
+            || {
+                let rate = state.borrow_mut().sync_and_calculate_rate(&counter);
+                rate > 0.0
+            },
+            Duration::from_secs(2),
+        )
+        .expect("Rate should become positive after window rollover");
 
         // Previous window should be preserved
         counter.record_batch(50);
-        let rate2 = state.sync_and_calculate_rate(&counter);
+        let rate2 = state.borrow_mut().sync_and_calculate_rate(&counter);
         assert!(rate2 > 0.0);
     }
 

@@ -73,16 +73,21 @@
 //! // bridge.start_stack(transport, memberlist).await;
 //! ```
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_lock::RwLock;
 use bytes::Bytes;
 
 // Import types from discovery module
 use crate::discovery::Id;
-use crate::{IdCodec, PlumtreeDelegate, PlumtreeDiscovery};
+use crate::{
+    decode_plumtree_envelope, IdCodec, PlumtreeConfig, PlumtreeDelegate, PlumtreeDiscovery,
+    PlumtreeMessage,
+};
 
 #[cfg(not(feature = "quic"))]
 use std::marker::PhantomData;
@@ -268,7 +273,10 @@ where
     /// with their addresses.
     #[cfg(feature = "quic")]
     #[cfg_attr(docsrs, doc(cfg(feature = "quic")))]
-    pub fn with_resolver(pm: Arc<PlumtreeDiscovery<I, PD>>, resolver: Arc<MapPeerResolver<I>>) -> Self {
+    pub fn with_resolver(
+        pm: Arc<PlumtreeDiscovery<I, PD>>,
+        resolver: Arc<MapPeerResolver<I>>,
+    ) -> Self {
         Self {
             pm,
             config: BridgeConfig::default(),
@@ -350,6 +358,95 @@ where
     pub fn is_shutdown(&self) -> bool {
         self.pm.is_shutdown()
     }
+
+    /// Get the local node ID.
+    pub fn local_id(&self) -> &I {
+        self.pm.plumtree().local_id()
+    }
+
+    /// Create a new bridge with the given delegate.
+    ///
+    /// This creates the underlying `PlumtreeDiscovery` internally.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use memberlist_plumtree::{PlumtreeBridge, PlumtreeConfig, NoopDelegate};
+    ///
+    /// let bridge = PlumtreeBridge::create(node_id, PlumtreeConfig::default(), NoopDelegate);
+    /// ```
+    pub fn create(local_id: I, config: PlumtreeConfig, delegate: PD) -> Self {
+        let pm = Arc::new(PlumtreeDiscovery::new(local_id, config, delegate));
+        Self::new(pm)
+    }
+
+    /// Start the bridge with a shared router for local message routing.
+    ///
+    /// This method:
+    /// 1. Registers with the router for message dispatch
+    /// 2. Creates a `ChannelTransport` for message sending
+    /// 3. Starts the routing task to forward messages to other nodes
+    /// 4. Starts the Plumtree runner (processes outgoing messages)
+    /// 5. Starts the incoming processor (handles received messages)
+    ///
+    /// # Arguments
+    ///
+    /// * `router` - Shared router for dispatching messages between local nodes
+    ///
+    /// # Returns
+    ///
+    /// A [`BridgeTaskHandle`] that can be used to stop the background tasks.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use memberlist_plumtree::{PlumtreeBridge, BridgeRouter, PlumtreeConfig, NoopDelegate};
+    /// use std::sync::Arc;
+    ///
+    /// let router = Arc::new(BridgeRouter::new());
+    /// let bridge = PlumtreeBridge::create(node_id, PlumtreeConfig::default(), NoopDelegate);
+    /// let handle = bridge.start(&router).await;
+    ///
+    /// // Send messages
+    /// bridge.broadcast(b"Hello").await?;
+    ///
+    /// // Shutdown
+    /// handle.stop();
+    /// bridge.shutdown();
+    /// ```
+    #[cfg(feature = "tokio")]
+    pub async fn start(&self, router: &BridgeRouter<I>) -> BridgeTaskHandle {
+        let local_id = self.pm.plumtree().local_id().clone();
+
+        // 1. Register with router
+        router
+            .register(local_id.clone(), self.pm.incoming_sender())
+            .await;
+
+        // 2. Create ChannelTransport
+        let (transport, transport_rx) = crate::ChannelTransport::<I>::bounded(1000);
+
+        // 3. Start routing task
+        let routing_handle = router.start_routing_task(local_id, transport_rx);
+
+        // 4. Start Plumtree runner with transport
+        let pm_clone = self.pm.clone();
+        let runner_handle = tokio::spawn(async move {
+            pm_clone.run_with_transport(transport).await;
+        });
+
+        // 5. Start incoming processor
+        let pm_incoming = self.pm.clone();
+        let incoming_handle = tokio::spawn(async move {
+            pm_incoming.run_incoming_processor().await;
+        });
+
+        BridgeTaskHandle {
+            routing_handle,
+            runner_handle,
+            incoming_handle,
+        }
+    }
 }
 
 impl<I, PD> Clone for PlumtreeBridge<I, PD>
@@ -366,6 +463,203 @@ where
             #[cfg(not(feature = "quic"))]
             _marker: PhantomData,
         }
+    }
+}
+
+// ============================================================================
+// Bridge Router (for multiple local nodes)
+// ============================================================================
+
+/// Shared router for multiple local Plumtree nodes.
+///
+/// This is useful for testing and demos where multiple nodes run in the same process.
+/// Each node registers its `incoming_sender()` with the router, and the router dispatches
+/// messages to the correct node.
+///
+/// # Example
+///
+/// ```ignore
+/// use memberlist_plumtree::{BridgeRouter, PlumtreeBridge, PlumtreeDiscovery, PlumtreeConfig, NoopDelegate};
+/// use std::sync::Arc;
+///
+/// // Create shared router
+/// let router = Arc::new(BridgeRouter::<u64>::new());
+///
+/// // Create nodes and register with router
+/// for i in 0..10 {
+///     let pm = Arc::new(PlumtreeDiscovery::new(i, PlumtreeConfig::default(), NoopDelegate));
+///     let bridge = PlumtreeBridge::new(pm.clone());
+///
+///     // Register this node's incoming sender with the router
+///     router.register(i, pm.incoming_sender()).await;
+///
+///     // Create transport and start routing task
+///     let (transport, transport_rx) = ChannelTransport::bounded(1000);
+///     router.start_routing_task(i, transport_rx);
+///
+///     // Start the Plumtree runner
+///     tokio::spawn(async move { pm.run_with_transport(transport).await });
+/// }
+/// ```
+pub struct BridgeRouter<I>
+where
+    I: Id + IdCodec + Clone + Ord + Send + Sync + 'static,
+{
+    /// Map of node ID to their incoming message sender
+    incoming_senders: Arc<RwLock<HashMap<I, async_channel::Sender<(I, PlumtreeMessage)>>>>,
+}
+
+impl<I> BridgeRouter<I>
+where
+    I: Id + IdCodec + Clone + Ord + Send + Sync + 'static,
+{
+    /// Create a new bridge router.
+    pub fn new() -> Self {
+        Self {
+            incoming_senders: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Register a node's incoming message sender with the router.
+    ///
+    /// Messages destined for this node will be dispatched to the provided sender.
+    pub async fn register(&self, node_id: I, sender: async_channel::Sender<(I, PlumtreeMessage)>) {
+        self.incoming_senders.write().await.insert(node_id, sender);
+    }
+
+    /// Unregister a node from the router.
+    ///
+    /// Call this when a node goes offline to stop routing messages to it.
+    pub async fn unregister(&self, node_id: &I) {
+        self.incoming_senders.write().await.remove(node_id);
+    }
+
+    /// Start a routing task that reads from a transport receiver and routes messages.
+    ///
+    /// This task reads outgoing messages from the given transport receiver, decodes
+    /// the target node from the envelope, and dispatches the message to that node's
+    /// `incoming_sender()`.
+    ///
+    /// # Arguments
+    ///
+    /// * `sender_id` - The ID of the node sending messages
+    /// * `transport_rx` - Receiver for outgoing messages from ChannelTransport
+    ///
+    /// # Returns
+    ///
+    /// A task handle that can be used to abort the routing task.
+    #[cfg(feature = "tokio")]
+    pub fn start_routing_task(
+        &self,
+        sender_id: I,
+        transport_rx: async_channel::Receiver<(I, Bytes)>,
+    ) -> tokio::task::JoinHandle<()> {
+        let router = self.incoming_senders.clone();
+
+        tokio::spawn(async move {
+            while let Ok((target, data)) = transport_rx.recv().await {
+                // Decode the envelope to get sender and message
+                if let Some((_envelope_sender, message)) = decode_plumtree_envelope::<I>(&data) {
+                    let senders = router.read().await;
+                    if let Some(tx) = senders.get(&target) {
+                        let _ = tx.send((sender_id.clone(), message)).await;
+                    }
+                }
+            }
+        })
+    }
+
+    /// Get the number of registered nodes.
+    pub async fn node_count(&self) -> usize {
+        self.incoming_senders.read().await.len()
+    }
+
+    /// Check if a node is registered.
+    pub async fn is_registered(&self, node_id: &I) -> bool {
+        self.incoming_senders.read().await.contains_key(node_id)
+    }
+}
+
+impl<I> Default for BridgeRouter<I>
+where
+    I: Id + IdCodec + Clone + Ord + Send + Sync + 'static,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<I> Clone for BridgeRouter<I>
+where
+    I: Id + IdCodec + Clone + Ord + Send + Sync + 'static,
+{
+    fn clone(&self) -> Self {
+        Self {
+            incoming_senders: self.incoming_senders.clone(),
+        }
+    }
+}
+
+// ============================================================================
+// Bridge Task Handle
+// ============================================================================
+
+/// Handle for background tasks started by [`PlumtreeBridge::start()`].
+///
+/// This handle manages three background tasks:
+/// 1. **Routing task**: Dispatches outgoing messages to target nodes via the router
+/// 2. **Runner task**: Processes outgoing messages from Plumtree (IHave batching, Graft timer, etc.)
+/// 3. **Incoming task**: Processes incoming messages from other nodes
+///
+/// Call [`stop()`](Self::stop) to abort all tasks when shutting down.
+///
+/// # Example
+///
+/// ```ignore
+/// let handle = bridge.start(&router).await;
+///
+/// // ... use the bridge ...
+///
+/// // Shutdown
+/// handle.stop();
+/// bridge.shutdown();
+/// ```
+#[cfg(feature = "tokio")]
+pub struct BridgeTaskHandle {
+    routing_handle: tokio::task::JoinHandle<()>,
+    runner_handle: tokio::task::JoinHandle<()>,
+    incoming_handle: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(feature = "tokio")]
+impl BridgeTaskHandle {
+    /// Stop all background tasks.
+    ///
+    /// This aborts the routing, runner, and incoming processor tasks.
+    /// After calling this, you should also call `bridge.shutdown()` to
+    /// clean up the underlying Plumtree instance.
+    pub fn stop(&self) {
+        self.routing_handle.abort();
+        self.runner_handle.abort();
+        self.incoming_handle.abort();
+    }
+
+    /// Check if all tasks are finished.
+    ///
+    /// Returns `true` if all background tasks have completed (either normally or via abort).
+    pub fn is_finished(&self) -> bool {
+        self.routing_handle.is_finished()
+            && self.runner_handle.is_finished()
+            && self.incoming_handle.is_finished()
+    }
+
+    /// Wait for all tasks to complete.
+    ///
+    /// This is useful after calling `stop()` to ensure all tasks have been aborted.
+    pub async fn join(self) {
+        let _ = self.routing_handle.await;
+        let _ = self.runner_handle.await;
+        let _ = self.incoming_handle.await;
     }
 }
 
@@ -664,8 +958,7 @@ mod tests {
 
     #[test]
     fn test_bridge_config_persistence_path() {
-        let config = BridgeConfig::new()
-            .with_persistence_path(PathBuf::from("/tmp/peers.txt"));
+        let config = BridgeConfig::new().with_persistence_path(PathBuf::from("/tmp/peers.txt"));
 
         assert_eq!(
             config.persistence_path,
@@ -820,5 +1113,72 @@ mod tests {
 
         handle2.shutdown();
         assert!(handle.is_shutdown());
+    }
+
+    // ========================================================================
+    // BridgeTaskHandle Tests
+    // ========================================================================
+
+    #[test]
+    fn test_bridge_create() {
+        let bridge = PlumtreeBridge::create(1u64, PlumtreeConfig::default(), NoopDelegate);
+        assert!(!bridge.is_shutdown());
+        assert_eq!(*bridge.local_id(), 1u64);
+    }
+
+    #[tokio::test]
+    async fn test_bridge_start_and_stop() {
+        let router = BridgeRouter::<u64>::new();
+        let bridge = PlumtreeBridge::create(1u64, PlumtreeConfig::default(), NoopDelegate);
+
+        // Start the bridge
+        let handle = bridge.start(&router).await;
+
+        // Verify router registered the node
+        assert!(router.is_registered(&1u64).await);
+        assert_eq!(router.node_count().await, 1);
+
+        // Tasks should not be finished yet
+        assert!(!handle.is_finished());
+
+        // Stop the tasks
+        handle.stop();
+
+        // Shutdown the bridge
+        bridge.shutdown();
+        assert!(bridge.is_shutdown());
+
+        // Unregister from router
+        router.unregister(&1u64).await;
+        assert!(!router.is_registered(&1u64).await);
+    }
+
+    #[tokio::test]
+    async fn test_bridge_start_multiple_nodes() {
+        let router = BridgeRouter::<u64>::new();
+        let bridge1 = PlumtreeBridge::create(1u64, PlumtreeConfig::default(), NoopDelegate);
+        let bridge2 = PlumtreeBridge::create(2u64, PlumtreeConfig::default(), NoopDelegate);
+        let bridge3 = PlumtreeBridge::create(3u64, PlumtreeConfig::default(), NoopDelegate);
+
+        // Start all bridges
+        let handle1 = bridge1.start(&router).await;
+        let handle2 = bridge2.start(&router).await;
+        let handle3 = bridge3.start(&router).await;
+
+        // Verify all nodes registered
+        assert_eq!(router.node_count().await, 3);
+        assert!(router.is_registered(&1u64).await);
+        assert!(router.is_registered(&2u64).await);
+        assert!(router.is_registered(&3u64).await);
+
+        // Stop all tasks
+        handle1.stop();
+        handle2.stop();
+        handle3.stop();
+
+        // Shutdown all bridges
+        bridge1.shutdown();
+        bridge2.shutdown();
+        bridge3.shutdown();
     }
 }

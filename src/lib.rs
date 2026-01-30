@@ -5,6 +5,37 @@
 //! Plumtree combines the efficiency of tree-based broadcast (O(n) messages) with
 //! the reliability of gossip protocols through a hybrid push/lazy-push approach.
 //!
+//! ## Architecture
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │                        Application                               │
+//! │                   (PlumtreeDelegate)                             │
+//! └────────────────────────────┬────────────────────────────────────┘
+//!                              │ on_deliver()
+//! ┌────────────────────────────▼────────────────────────────────────┐
+//! │                     MemberlistStack                              │
+//! │  (Full integration - Plumtree + Memberlist + auto peer sync)     │
+//! ├─────────────────────────────────────────────────────────────────┤
+//! │                    PlumtreeDiscovery                             │
+//! │  (Integration layer - combines Plumtree with Memberlist)         │
+//! ├─────────────────────────────────────────────────────────────────┤
+//! │                        Plumtree                                  │
+//! │  (Core protocol - eager/lazy push, tree repair)                  │
+//! ├──────────────┬──────────────┬──────────────┬────────────────────┤
+//! │  PeerState   │ MessageCache │  Scheduler   │     GraftTimer     │
+//! │ (Eager/Lazy) │   (TTL)      │  (IHave)     │  (Retry/Backoff)   │
+//! └──────────────┴──────────────┴──────────────┴────────────────────┘
+//! ```
+//!
+//! ## API Entry Points
+//!
+//! | API | Use Case |
+//! |-----|----------|
+//! | [`MemberlistStack`] | Production - full Plumtree + Memberlist with SWIM peer discovery |
+//! | [`PlumtreeDiscovery`] | Manual peer management, custom integration |
+//! | [`Plumtree`] | Core protocol only, bring your own transport |
+//!
 //! ## How Plumtree Works
 //!
 //! - **Eager Push**: Full messages are sent along spanning tree edges (eager peers)
@@ -47,28 +78,32 @@
 mod adaptive_batcher;
 mod bridge;
 mod cleanup_tuner;
+mod compression;
 mod config;
 mod error;
 mod health;
 mod integration;
 mod message;
+mod peer_health;
 mod peer_scoring;
 mod peer_state;
+mod priority;
 
+pub mod discovery;
 mod plumtree;
 mod pooled_transport;
 mod rate_limiter;
 mod runner;
 mod scheduler;
 mod stack;
-pub mod discovery;
 pub mod storage;
 pub mod sync;
 pub mod testing;
 mod transport;
 
 #[cfg(feature = "metrics")]
-mod metrics;
+#[cfg_attr(docsrs, doc(cfg(feature = "metrics")))]
+pub mod metrics;
 
 #[cfg(test)]
 mod peer_state_test;
@@ -80,6 +115,14 @@ pub use adaptive_batcher::{AdaptiveBatcher, BatcherConfig, BatcherStats};
 pub use cleanup_tuner::{
     BackpressureHint, CleanupConfig, CleanupParameters, CleanupReason, CleanupStats, CleanupTuner,
     EfficiencyTrend, PressureTrend,
+};
+
+// Re-export compression types
+#[cfg(feature = "compression")]
+#[cfg_attr(docsrs, doc(cfg(feature = "compression")))]
+pub use compression::{compress, decompress};
+pub use compression::{
+    CompressionAlgorithm, CompressionConfig, CompressionError, CompressionStats,
 };
 
 // Re-export config types
@@ -99,11 +142,19 @@ pub use message::{
     SyncMessage,
 };
 
+// Re-export peer health monitoring types
+pub use peer_health::{
+    HealthSummary, PeerHealthConfig, PeerHealthState, PeerHealthTracker, PeerStatus, ZombieAction,
+};
+
 // Re-export peer state types
 pub use peer_state::{
     AddPeerResult, PeerState, PeerStateBuilder, PeerStats, PeerTopology, RebalanceResult,
     RemovePeerResult,
 };
+
+// Re-export priority types
+pub use priority::{MessagePriority, PriorityConfig, PriorityQueue, PriorityQueueStats};
 
 // Re-export peer scoring types
 pub use peer_scoring::{PeerScore, PeerScoring, ScoringConfig, ScoringStats};
@@ -124,9 +175,9 @@ pub use runner::{PlumtreeRunner, PlumtreeRunnerBuilder};
 // Re-export integration types
 pub use integration::{
     decode_plumtree_envelope, decode_plumtree_message, encode_plumtree_envelope,
-    encode_plumtree_envelope_into, encode_plumtree_message, envelope_encoded_len,
-    is_plumtree_message, BroadcastEnvelope, IdCodec, PlumtreeEventHandler,
-    PlumtreeDiscovery,
+    encode_plumtree_envelope_into, encode_plumtree_envelope_with_compression,
+    encode_plumtree_message, envelope_encoded_len, is_plumtree_message, BroadcastEnvelope, IdCodec,
+    MessagePage, PlumtreeDiscovery, PlumtreeEventHandler,
 };
 
 // Re-export memberlist-specific integration types (requires memberlist feature)
@@ -147,23 +198,62 @@ pub use transport::{ChannelTransport, ChannelTransportError, NoopTransport, Tran
 #[cfg(feature = "quic")]
 #[cfg_attr(docsrs, doc(cfg(feature = "quic")))]
 pub use transport::quic::{
-    CongestionConfig, CongestionController, ConnectionConfig, ConnectionStats, IncomingConfig,
-    IncomingHandle, IncomingStats, MapPeerResolver, MessagePriorities, MigrationConfig,
-    PeerResolver, PlumtreeQuicConfig, QuicConfig, QuicError, QuicStats, QuicTransport,
-    StreamConfig, TlsConfig, ZeroRttConfig,
+    // mTLS peer verification utilities
+    extract_peer_id_from_der,
+    generate_self_signed_with_peer_id,
+    generate_self_signed_with_peer_id_async,
+    CongestionConfig,
+    CongestionController,
+    ConnectionConfig,
+    // Connection migration events
+    ConnectionEvent,
+    ConnectionStats,
+    DatagramConfig,
+    DisconnectReason,
+    IncomingConfig,
+    IncomingHandle,
+    IncomingStats,
+    // Session caching for 0-RTT
+    LruSessionCache,
+    MapPeerResolver,
+    MessagePriorities,
+    MigrationConfig,
+    NoopSessionCache,
+    PeerIdVerifier,
+    PeerResolver,
+    PlumtreeQuicConfig,
+    QuicConfig,
+    QuicError,
+    QuicStats,
+    QuicTransport,
+    SessionTicketStore,
+    StreamConfig,
+    TlsConfig,
+    ZeroRttConfig,
+    PEER_ID_SAN_PREFIX,
 };
 
 // Re-export pooled transport types
 pub use pooled_transport::{PoolConfig, PoolStats, PooledTransport, PooledTransportError};
 
-// Re-export standalone stack config
+// Re-export standalone stack types
 pub use stack::PlumtreeStackConfig;
+
+// Re-export PlumtreeStack (requires "quic" feature)
+#[cfg(feature = "quic")]
+#[cfg_attr(docsrs, doc(cfg(feature = "quic")))]
+pub use stack::PlumtreeStack;
 
 // Re-export scheduler failure types
 pub use scheduler::FailedGraft;
 
 // Re-export bridge types (memberlist-independent)
-pub use bridge::{BridgeConfig, LazarusHandle, LazarusStats, PlumtreeBridge};
+pub use bridge::{BridgeConfig, BridgeRouter, LazarusHandle, LazarusStats, PlumtreeBridge};
+
+// Re-export BridgeTaskHandle (requires tokio feature)
+#[cfg(feature = "tokio")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
+pub use bridge::BridgeTaskHandle;
 
 // Re-export persistence module for peer state recovery
 pub use bridge::persistence;
@@ -177,8 +267,8 @@ pub use bridge::AddressExtractor;
 #[cfg(feature = "memberlist")]
 #[cfg_attr(docsrs, doc(cfg(feature = "memberlist")))]
 pub use discovery::{
-    BridgeEventDelegate, MemberlistDiscovery, MemberlistDiscoveryConfig,
-    MemberlistDiscoveryHandle, MemberlistStack, MemberlistStackError, PlumtreeStackBuilder,
+    BridgeEventDelegate, MemberlistDiscovery, MemberlistDiscoveryConfig, MemberlistDiscoveryHandle,
+    MemberlistStack, MemberlistStackError, PlumtreeStackBuilder,
 };
 
 /// Re-export memberlist-core types for convenience (requires memberlist feature)

@@ -1,3 +1,6 @@
+#![allow(clippy::type_complexity)]
+#![allow(clippy::needless_range_loop)]
+
 //! Web-based Chat example for Plumtree protocol testing with real networking
 //!
 //! ## Architecture: MemberlistStack with Real SWIM Discovery
@@ -28,6 +31,7 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Path, State,
     },
+    http::header,
     response::IntoResponse,
     routing::get,
     Json, Router,
@@ -38,10 +42,11 @@ use memberlist::net::NetTransportOptions;
 use memberlist::tokio::{TokioRuntime, TokioSocketAddrResolver, TokioTcp};
 use memberlist::{Memberlist, Options as MemberlistOptions};
 use memberlist_plumtree::{
-    decode_plumtree_envelope, ChannelTransport, IdCodec, MessageId, PeerStats,
-    PeerTopology, PlumtreeConfig, PlumtreeDelegate, PlumtreeDiscovery, PlumtreeMessage,
-    PlumtreeNodeDelegate,
+    storage::MemoryStore, CompressionConfig, IdCodec, MessageId, PeerHealthConfig,
+    PeerHealthTracker, PeerStats, PeerStatus, PeerTopology, PlumtreeBridge, PlumtreeConfig,
+    PlumtreeDelegate, PlumtreeDiscovery, PlumtreeNodeDelegate, SyncConfig,
 };
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use nodecraft::resolver::socket_addr::SocketAddrResolver;
 use nodecraft::CheapClone;
 use serde_json::{json, Value};
@@ -50,7 +55,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicI64, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -114,7 +119,9 @@ mod data_impl {
     impl<'a> DataRef<'a, NodeId> for u32 {
         fn decode(buf: &'a [u8]) -> Result<(usize, Self), DecodeError> {
             if buf.len() < 4 {
-                return Err(DecodeError::Custom(Cow::Borrowed("insufficient data for u32")));
+                return Err(DecodeError::Custom(Cow::Borrowed(
+                    "insufficient data for u32",
+                )));
             }
             let value = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
             Ok((4, value))
@@ -150,12 +157,8 @@ mod data_impl {
 // ============================================================================
 
 /// The memberlist transport type.
-type MemberlistTransport = memberlist::net::NetTransport<
-    NodeId,
-    TokioSocketAddrResolver,
-    TokioTcp,
-    TokioRuntime,
->;
+type MemberlistTransport =
+    memberlist::net::NetTransport<NodeId, TokioSocketAddrResolver, TokioTcp, TokioRuntime>;
 
 /// The delegate type used by MemberlistStack.
 type StackDelegate = memberlist_plumtree::PlumtreeNodeDelegate<
@@ -173,56 +176,6 @@ type ChatStack = memberlist_plumtree::MemberlistStack<
 >;
 
 // ============================================================================
-// Message Router for local nodes
-// ============================================================================
-
-/// Routes Plumtree messages between local nodes.
-///
-/// This is needed because `run_with_transport()` sends messages to `ChannelTransport`,
-/// and we need to dispatch them to the target node's `incoming_sender()`.
-struct MessageRouter {
-    /// Map of node ID to their incoming message sender
-    incoming_senders: Arc<RwLock<HashMap<NodeId, async_channel::Sender<(NodeId, PlumtreeMessage)>>>>,
-}
-
-impl MessageRouter {
-    fn new() -> Self {
-        Self {
-            incoming_senders: Arc::new(RwLock::new(HashMap::new())),
-        }
-    }
-
-    async fn register(&self, node_id: NodeId, sender: async_channel::Sender<(NodeId, PlumtreeMessage)>) {
-        self.incoming_senders.write().await.insert(node_id, sender);
-    }
-
-    async fn unregister(&self, node_id: &NodeId) {
-        self.incoming_senders.write().await.remove(node_id);
-    }
-
-    /// Start a routing task that reads from a transport receiver and routes messages
-    fn start_routing_task(
-        &self,
-        sender_id: NodeId,
-        transport_rx: async_channel::Receiver<(NodeId, Bytes)>,
-    ) -> tokio::task::JoinHandle<()> {
-        let router = self.incoming_senders.clone();
-
-        tokio::spawn(async move {
-            while let Ok((target, data)) = transport_rx.recv().await {
-                // Decode the envelope to get sender and message
-                if let Some((_envelope_sender, message)) = decode_plumtree_envelope::<NodeId>(&data) {
-                    let senders = router.read().await;
-                    if let Some(tx) = senders.get(&target) {
-                        let _ = tx.send((sender_id.clone(), message)).await;
-                    }
-                }
-            }
-        })
-    }
-}
-
-// ============================================================================
 // Protocol Types
 // ============================================================================
 
@@ -235,16 +188,16 @@ enum DeliveryMethod {
     SelfBroadcast,
 }
 
-impl DeliveryMethod {
-    fn to_string(&self) -> String {
+impl std::fmt::Display for DeliveryMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DeliveryMethod::Gossip { round, forwarder } => {
-                format!("GOSSIP from {} (round {})", forwarder, round)
+                write!(f, "GOSSIP from {} (round {})", forwarder, round)
             }
             DeliveryMethod::Graft { forwarder } => {
-                format!("GRAFT from {} (tree repair)", forwarder)
+                write!(f, "GRAFT from {} (tree repair)", forwarder)
             }
-            DeliveryMethod::SelfBroadcast => "LOCAL (self-broadcast)".to_string(),
+            DeliveryMethod::SelfBroadcast => write!(f, "LOCAL (self-broadcast)"),
         }
     }
 }
@@ -299,47 +252,206 @@ impl ProtocolEvent {
 }
 
 /// Metrics counters for protocol events.
-#[derive(Debug, Default)]
+/// Metrics reader that extracts values from Prometheus output.
+///
+/// Instead of manually tracking counters, this reads from the system metrics
+/// recorded by the library via the `metrics` crate. The library records global
+/// metrics (aggregated across all nodes in the process).
+#[derive(Debug)]
 struct Metrics {
-    messages_sent: AtomicUsize,
-    messages_received: AtomicUsize,
-    grafts_sent: AtomicUsize,
-    prunes_sent: AtomicUsize,
-    promotions: AtomicUsize,
-    demotions: AtomicUsize,
-    nodes_joined: AtomicUsize,
-    nodes_left: AtomicUsize,
-    #[allow(dead_code)]
-    packets_dropped: AtomicU64,
+    // Peer health gauges (use AtomicI64 to support decrement safely)
+    peers_healthy: AtomicI64,
+    peers_degraded: AtomicI64,
+    peers_zombie: AtomicI64,
 }
 
 impl Metrics {
     fn new() -> Self {
-        Self::default()
+        Self {
+            peers_healthy: AtomicI64::new(0),
+            peers_degraded: AtomicI64::new(0),
+            peers_zombie: AtomicI64::new(0),
+        }
     }
 
-    fn reset(&self) {
-        self.messages_sent.store(0, Ordering::SeqCst);
-        self.messages_received.store(0, Ordering::SeqCst);
-        self.grafts_sent.store(0, Ordering::SeqCst);
-        self.prunes_sent.store(0, Ordering::SeqCst);
-        self.promotions.store(0, Ordering::SeqCst);
-        self.demotions.store(0, Ordering::SeqCst);
-        self.nodes_joined.store(0, Ordering::SeqCst);
-        self.nodes_left.store(0, Ordering::SeqCst);
-        self.packets_dropped.store(0, Ordering::SeqCst);
+    /// Increment healthy peer count
+    fn inc_healthy(&self) {
+        self.peers_healthy.fetch_add(1, Ordering::SeqCst);
+        #[cfg(feature = "metrics")]
+        memberlist_plumtree::metrics::inc_peers_healthy();
     }
 
+    /// Decrement healthy peer count
+    fn dec_healthy(&self) {
+        self.peers_healthy.fetch_sub(1, Ordering::SeqCst);
+        #[cfg(feature = "metrics")]
+        memberlist_plumtree::metrics::dec_peers_healthy();
+    }
+
+    /// Increment degraded peer count
+    fn inc_degraded(&self) {
+        self.peers_degraded.fetch_add(1, Ordering::SeqCst);
+        #[cfg(feature = "metrics")]
+        memberlist_plumtree::metrics::inc_peers_degraded();
+    }
+
+    /// Decrement degraded peer count
+    fn dec_degraded(&self) {
+        self.peers_degraded.fetch_sub(1, Ordering::SeqCst);
+        #[cfg(feature = "metrics")]
+        memberlist_plumtree::metrics::dec_peers_degraded();
+    }
+
+    /// Increment zombie peer count
+    fn inc_zombie(&self) {
+        self.peers_zombie.fetch_add(1, Ordering::SeqCst);
+        #[cfg(feature = "metrics")]
+        memberlist_plumtree::metrics::inc_peers_zombie();
+    }
+
+    /// Decrement zombie peer count
+    fn dec_zombie(&self) {
+        self.peers_zombie.fetch_sub(1, Ordering::SeqCst);
+        #[cfg(feature = "metrics")]
+        memberlist_plumtree::metrics::dec_peers_zombie();
+    }
+
+    /// Transition a peer from one health state to another.
+    #[allow(dead_code)]
+    fn transition_peer_health(&self, from: Option<PeerStatus>, to: PeerStatus) {
+        if let Some(old) = from {
+            match old {
+                PeerStatus::Healthy => self.dec_healthy(),
+                PeerStatus::Degraded => self.dec_degraded(),
+                PeerStatus::Zombie => self.dec_zombie(),
+            }
+        }
+        match to {
+            PeerStatus::Healthy => self.inc_healthy(),
+            PeerStatus::Degraded => self.inc_degraded(),
+            PeerStatus::Zombie => self.inc_zombie(),
+        }
+    }
+
+    /// Remove a peer (decrement its current health state)
+    #[allow(dead_code)]
+    fn remove_peer(&self, current: PeerStatus) {
+        match current {
+            PeerStatus::Healthy => self.dec_healthy(),
+            PeerStatus::Degraded => self.dec_degraded(),
+            PeerStatus::Zombie => self.dec_zombie(),
+        }
+    }
+
+    /// Extract metrics from Prometheus text output.
+    ///
+    /// Note: The library records global metrics (without node labels), so metrics
+    /// are aggregated across all nodes in the process. This is appropriate for
+    /// the demo where we show total cluster activity.
+    fn to_json_from_prometheus(&self, prometheus_text: &str) -> Value {
+        // Helper to extract a metric value (global metrics without labels)
+        let get_metric = |name: &str| -> u64 {
+            for line in prometheus_text.lines() {
+                if line.starts_with('#') || line.is_empty() {
+                    continue;
+                }
+                // Look for lines like: metric_name 123 (global, no labels)
+                // or metric_name{} 123
+                if line.starts_with(name) {
+                    // Check if this is a global metric (no labels or empty labels)
+                    let has_labels = line.contains('{') && !line.contains("{}");
+                    if !has_labels {
+                        if let Some(value_str) = line.split_whitespace().last() {
+                            if let Ok(v) = value_str.parse::<f64>() {
+                                return v as u64;
+                            }
+                        }
+                    }
+                }
+            }
+            0
+        };
+
+        // Read counters from Prometheus
+        let sent = get_metric("plumtree_messages_broadcast_total");
+        let received = get_metric("plumtree_messages_delivered_total");
+        let grafts = get_metric("plumtree_graft_sent_total");
+        let prunes = get_metric("plumtree_prune_sent_total");
+        let promotions = get_metric("plumtree_peer_promotions_total");
+        let demotions = get_metric("plumtree_peer_demotions_total");
+        let joined = get_metric("plumtree_peer_added_total");
+        let left = get_metric("plumtree_peer_removed_total");
+
+        // Compression metrics
+        let bytes_in = get_metric("plumtree_compression_bytes_in_total");
+        let bytes_saved = get_metric("plumtree_compression_bytes_saved_total");
+
+        // Priority queue gauges (from library metrics)
+        let priority_critical = get_metric("plumtree_priority_critical");
+        let priority_high = get_metric("plumtree_priority_high");
+        let priority_normal = get_metric("plumtree_priority_normal");
+        let priority_low = get_metric("plumtree_priority_low");
+
+        // Peer health gauges (from library metrics)
+        let peers_healthy = get_metric("plumtree_peers_healthy");
+        let peers_degraded = get_metric("plumtree_peers_degraded");
+        let peers_zombie = get_metric("plumtree_peers_zombie");
+
+        json!({
+            "sent": sent,
+            "received": received,
+            "grafts": grafts,
+            "prunes": prunes,
+            "promotions": promotions,
+            "demotions": demotions,
+            "joined": joined,
+            "left": left,
+            // Phase 1 metrics
+            "compression": {
+                "bytes_in": bytes_in,
+                "bytes_saved": bytes_saved,
+            },
+            "priority_queue": {
+                "critical": priority_critical,
+                "high": priority_high,
+                "normal": priority_normal,
+                "low": priority_low,
+            },
+            "peer_health": {
+                "healthy": peers_healthy,
+                "degraded": peers_degraded,
+                "zombie": peers_zombie,
+            }
+        })
+    }
+
+    /// Legacy method for compatibility - returns only peer health (local state)
+    /// Use to_json_from_prometheus() with the Prometheus handle instead
     fn to_json(&self) -> Value {
         json!({
-            "sent": self.messages_sent.load(Ordering::SeqCst),
-            "received": self.messages_received.load(Ordering::SeqCst),
-            "grafts": self.grafts_sent.load(Ordering::SeqCst),
-            "prunes": self.prunes_sent.load(Ordering::SeqCst),
-            "promotions": self.promotions.load(Ordering::SeqCst),
-            "demotions": self.demotions.load(Ordering::SeqCst),
-            "joined": self.nodes_joined.load(Ordering::SeqCst),
-            "left": self.nodes_left.load(Ordering::SeqCst)
+            "sent": 0,
+            "received": 0,
+            "grafts": 0,
+            "prunes": 0,
+            "promotions": 0,
+            "demotions": 0,
+            "joined": 0,
+            "left": 0,
+            "compression": {
+                "bytes_in": 0,
+                "bytes_saved": 0,
+            },
+            "priority_queue": {
+                "critical": 0,
+                "high": 0,
+                "normal": 0,
+                "low": 0,
+            },
+            "peer_health": {
+                "healthy": self.peers_healthy.load(Ordering::SeqCst).max(0),
+                "degraded": self.peers_degraded.load(Ordering::SeqCst).max(0),
+                "zombie": self.peers_zombie.load(Ordering::SeqCst).max(0),
+            }
         })
     }
 }
@@ -444,6 +556,9 @@ struct ChatPlumtreeDelegate {
     node_idx: usize,
     /// Reference to the PlumtreeDiscovery (set after construction)
     pm: Arc<RwLock<Option<Arc<PlumtreeDiscovery<NodeId, Arc<ChatPlumtreeDelegate>>>>>>,
+    /// Peer health tracker for Phase 1 features
+    #[allow(dead_code)]
+    peer_health: Arc<PeerHealthTracker<NodeId>>,
 }
 
 impl ChatPlumtreeDelegate {
@@ -458,6 +573,7 @@ impl ChatPlumtreeDelegate {
             start_time: Instant::now(),
             node_idx,
             pm: Arc::new(RwLock::new(None)),
+            peer_health: Arc::new(PeerHealthTracker::new(PeerHealthConfig::default())),
         }
     }
 
@@ -520,10 +636,7 @@ impl ChatPlumtreeDelegate {
 
 impl PlumtreeDelegate<NodeId> for ChatPlumtreeDelegate {
     fn on_deliver(&self, message_id: MessageId, payload: Bytes) {
-        self.metrics
-            .messages_received
-            .fetch_add(1, Ordering::SeqCst);
-
+        // Message delivery is recorded by the library and read from Prometheus
         if let Some(chat_msg) = ChatMessage::decode(&payload) {
             let is_self = chat_msg.from == self.node_name;
             let pending = self.pending_context.clone();
@@ -588,7 +701,7 @@ impl PlumtreeDelegate<NodeId> for ChatPlumtreeDelegate {
     }
 
     fn on_eager_promotion(&self, peer: &NodeId) {
-        self.metrics.promotions.fetch_add(1, Ordering::SeqCst);
+        // Metrics are recorded by the library and read from Prometheus
         let events = self.events.clone();
         let update_tx = self.update_tx.clone();
         let peer_name = format!("U{}", peer.0 + 1);
@@ -633,7 +746,7 @@ impl PlumtreeDelegate<NodeId> for ChatPlumtreeDelegate {
     }
 
     fn on_lazy_demotion(&self, peer: &NodeId) {
-        self.metrics.demotions.fetch_add(1, Ordering::SeqCst);
+        // Metrics are recorded by the library and read from Prometheus
         let events = self.events.clone();
         let update_tx = self.update_tx.clone();
         let peer_name = format!("U{}", peer.0 + 1);
@@ -675,7 +788,7 @@ impl PlumtreeDelegate<NodeId> for ChatPlumtreeDelegate {
     }
 
     fn on_graft_sent(&self, peer: &NodeId, message_id: &MessageId) {
-        self.metrics.grafts_sent.fetch_add(1, Ordering::SeqCst);
+        // Metrics are recorded by the library and read from Prometheus
         let events = self.events.clone();
         let update_tx = self.update_tx.clone();
         let peer_name = format!("U{}", peer.0 + 1);
@@ -721,7 +834,7 @@ impl PlumtreeDelegate<NodeId> for ChatPlumtreeDelegate {
     }
 
     fn on_prune_sent(&self, peer: &NodeId) {
-        self.metrics.prunes_sent.fetch_add(1, Ordering::SeqCst);
+        // Metrics are recorded by the library and read from Prometheus
         let events = self.events.clone();
         let update_tx = self.update_tx.clone();
         let peer_name = format!("U{}", peer.0 + 1);
@@ -774,17 +887,11 @@ struct ChatNode {
     delegate: Arc<ChatPlumtreeDelegate>,
     /// The stack is created on start() and dropped on stop()
     stack: Option<ChatStack>,
-    /// Handle for the Plumtree runner task
-    runner_handle: Option<tokio::task::JoinHandle<()>>,
-    /// Handle for the routing task
-    routing_handle: Option<tokio::task::JoinHandle<()>>,
-    /// Handle for the incoming processor task
-    incoming_handle: Option<tokio::task::JoinHandle<()>>,
     is_online: bool,
     port: u16,
     seed_addr: Option<SocketAddr>,
-    /// Shared message router
-    router: Arc<MessageRouter>,
+    /// Persistent message store (survives restarts for sync recovery)
+    message_store: Arc<MemoryStore>,
 }
 
 impl ChatNode {
@@ -792,7 +899,6 @@ impl ChatNode {
         node_idx: usize,
         update_tx: broadcast::Sender<Value>,
         seed_addr: Option<SocketAddr>,
-        router: Arc<MessageRouter>,
     ) -> Self {
         let node_id = NodeId(node_idx as u32);
         let node_name = format!("U{}", node_idx + 1);
@@ -804,13 +910,10 @@ impl ChatNode {
             node_id,
             delegate,
             stack: None,
-            runner_handle: None,
-            routing_handle: None,
-            incoming_handle: None,
             is_online: false,
             port,
             seed_addr,
-            router,
+            message_store: Arc::new(MemoryStore::new(10_000)),
         }
     }
 
@@ -841,52 +944,43 @@ impl ChatNode {
         // 3. Reduce max_peers to create sparse connectivity
         //
         // The current config uses small ihave_interval to increase GRAFT chances.
+        // Configure compression - use zstd level 3 with 64 byte threshold for demo
+        #[cfg(feature = "compression")]
+        let compression_config = CompressionConfig::zstd(3).with_min_size(64);
+        #[cfg(not(feature = "compression"))]
+        let compression_config = CompressionConfig::default();
+
         let config = PlumtreeConfig::default()
             .with_eager_fanout(2)
-            .with_max_peers(6)                 // Sparse connectivity for GRAFT demos
+            .with_max_peers(6) // Sparse connectivity for GRAFT demos
             .with_lazy_fanout(3)
-            .with_ihave_interval(Duration::from_millis(10))  // Fast IHave for GRAFT demos
-            .with_graft_timeout(Duration::from_millis(100))  // Retry timeout
+            .with_ihave_interval(Duration::from_millis(10)) // Fast IHave for GRAFT demos
+            .with_graft_timeout(Duration::from_millis(100)) // Retry timeout
             .with_message_cache_ttl(Duration::from_secs(60))
             // Disable ring protection for more random topology
-            .with_hash_ring(true)             // No ring-based eager selection
+            .with_hash_ring(true) // No ring-based eager selection
             .with_protect_ring_neighbors(true) // Allow any peer to be demoted
-            .with_max_eager_peers(3)           // Hard cap on eager peers
-            .with_max_lazy_peers(8);           // Hard cap on lazy peers
+            .with_max_eager_peers(3) // Hard cap on eager peers
+            .with_max_lazy_peers(8) // Hard cap on lazy peers
+            // Enable sync for message recovery after node restarts
+            .with_sync(
+                SyncConfig::enabled()
+                    .with_sync_interval(Duration::from_secs(5)) // Sync every 5s for demo
+                    .with_sync_window(Duration::from_secs(120)), // 2 min window
+            )
+            // Enable compression for bandwidth savings
+            .with_compression(compression_config);
 
-        // Create PlumtreeDiscovery
-        let pm = Arc::new(PlumtreeDiscovery::new(
+        // Create PlumtreeDiscovery with persistent storage for sync recovery
+        let pm = Arc::new(PlumtreeDiscovery::with_storage(
             node_id.clone(),
             config,
             self.delegate.clone(),
+            self.message_store.clone(),
         ));
 
         // Set the PM reference in the delegate
         self.delegate.set_pm(pm.clone()).await;
-
-        // Register with the message router
-        self.router.register(node_id.clone(), pm.incoming_sender()).await;
-
-        // Create ChannelTransport for Plumtree message routing
-        let (transport, transport_rx) = ChannelTransport::<NodeId>::bounded(1000);
-
-        // Start the routing task that dispatches messages to target nodes
-        let routing_handle = self.router.start_routing_task(node_id.clone(), transport_rx);
-        self.routing_handle = Some(routing_handle);
-
-        // Start the Plumtree runner with the channel transport
-        let pm_clone = pm.clone();
-        let runner_handle = tokio::spawn(async move {
-            pm_clone.run_with_transport(transport).await;
-        });
-        self.runner_handle = Some(runner_handle);
-
-        // CRITICAL: Start the incoming processor to handle messages from routing task
-        let pm_incoming = pm.clone();
-        let incoming_handle = tokio::spawn(async move {
-            pm_incoming.run_incoming_processor().await;
-        });
-        self.incoming_handle = Some(incoming_handle);
 
         // Wrap VoidDelegate with PlumtreeNodeDelegate for automatic peer sync
         let void_delegate = memberlist::delegate::VoidDelegate::<NodeId, SocketAddr>::default();
@@ -920,11 +1014,10 @@ impl ChatNode {
         }));
 
         // Create NetTransport options
-        let mut transport_opts = NetTransportOptions::<
-            NodeId,
-            SocketAddrResolver<TokioRuntime>,
-            TokioTcp,
-        >::new(node_id.clone());
+        let mut transport_opts =
+            NetTransportOptions::<NodeId, SocketAddrResolver<TokioRuntime>, TokioTcp>::new(
+                node_id.clone(),
+            );
         transport_opts.add_bind_address(bind_addr);
 
         // Create Memberlist options (use local() preset for fast testing)
@@ -933,14 +1026,15 @@ impl ChatNode {
             .with_gossip_interval(Duration::from_millis(200));
 
         // Create Memberlist with the delegate
-        let memberlist = Memberlist::with_delegate(plumtree_delegate, transport_opts, memberlist_opts)
-            .await
-            .map_err(|e| format!("Failed to create memberlist: {}", e))?;
+        let memberlist =
+            Memberlist::with_delegate(plumtree_delegate, transport_opts, memberlist_opts)
+                .await
+                .map_err(|e| format!("Failed to create memberlist: {}", e))?;
 
         let advertise_addr = *memberlist.advertise_address();
-
+        let bridge = PlumtreeBridge::new(pm);
         // Create MemberlistStack from components
-        let stack = memberlist_plumtree::MemberlistStack::new(pm, memberlist, advertise_addr);
+        let stack = memberlist_plumtree::MemberlistStack::new(bridge, memberlist, advertise_addr);
 
         // Join cluster if we have a seed
         if let Some(seed) = self.seed_addr {
@@ -963,20 +1057,7 @@ impl ChatNode {
             return;
         }
 
-        // Unregister from router
-        self.router.unregister(&self.node_id).await;
-
-        // Abort the runner, routing, and incoming tasks
-        if let Some(handle) = self.runner_handle.take() {
-            handle.abort();
-        }
-        if let Some(handle) = self.routing_handle.take() {
-            handle.abort();
-        }
-        if let Some(handle) = self.incoming_handle.take() {
-            handle.abort();
-        }
-
+        // Shutdown the stack (which handles PlumtreeDiscovery and Memberlist)
         if let Some(stack) = self.stack.take() {
             let _ = stack.leave(Duration::from_secs(1)).await;
             let _ = stack.shutdown().await;
@@ -992,14 +1073,19 @@ impl ChatNode {
             return Err(memberlist_plumtree::Error::Shutdown);
         }
 
-        let stack = self.stack.as_ref().ok_or(memberlist_plumtree::Error::Shutdown)?;
+        let stack = self
+            .stack
+            .as_ref()
+            .ok_or(memberlist_plumtree::Error::Shutdown)?;
+
+        // Create chat message
         let msg = ChatMessage::new(format!("U{}", self.node_idx + 1), text);
         let payload = msg.encode();
-        self.delegate
-            .metrics
-            .messages_sent
-            .fetch_add(1, Ordering::SeqCst);
+
+        // Broadcast - compression is handled automatically inside PlumtreeDiscovery
         let msg_id = stack.broadcast(payload.clone()).await?;
+
+        // Deliver to self (for UI display)
         self.delegate.on_deliver(msg_id, payload);
         Ok(msg_id)
     }
@@ -1039,18 +1125,10 @@ impl ChatNode {
 #[derive(Clone)]
 struct AppState {
     broadcast_txs: Arc<Vec<mpsc::Sender<String>>>,
-    control_txs: Arc<Vec<mpsc::Sender<NodeCommand>>>,
     update_tx: broadcast::Sender<Value>,
     delegates: Arc<Vec<Arc<ChatPlumtreeDelegate>>>,
     nodes: Arc<Vec<Arc<RwLock<ChatNode>>>>,
-}
-
-#[derive(Debug, Clone)]
-enum NodeCommand {
-    PromoteAllEager,
-    DemoteAllToLazy,  // Reset all eager peers to lazy (to trigger GRAFTs)
-    GoOffline,
-    GoOnline,
+    prometheus_handle: PrometheusHandle,
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
@@ -1089,11 +1167,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             "peers": peers_json,
             "online": online
         });
-        if sender
-            .send(Message::Text(init.to_string().into()))
-            .await
-            .is_err()
-        {
+        if sender.send(Message::Text(init.to_string())).await.is_err() {
             return;
         }
     }
@@ -1102,7 +1176,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let send_task = tokio::spawn(async move {
         while let Ok(update) = update_rx.recv().await {
             if sender
-                .send(Message::Text(update.to_string().into()))
+                .send(Message::Text(update.to_string()))
                 .await
                 .is_err()
             {
@@ -1141,41 +1215,95 @@ async fn handle_ws_message(state: &AppState, data: &Value) {
         "toggle_online" => {
             let user = data["user"].as_u64().unwrap_or(0) as usize;
             if user < state.nodes.len() {
-                let current = state.nodes[user].read().await.is_online();
-                let cmd = if current {
-                    NodeCommand::GoOffline
-                } else {
-                    NodeCommand::GoOnline
-                };
-                let _ = state.control_txs[user].send(cmd).await;
+                let mut node_guard = state.nodes[user].write().await;
+                let is_online = node_guard.is_online();
+                if is_online {
+                    node_guard.stop().await;
+                } else if let Err(e) = node_guard.start().await {
+                    eprintln!("Failed to start node: {}", e);
+                }
+                let peers_json = node_guard.delegate.get_peers_json().await;
+                let _ = state.update_tx.send(json!({
+                    "type": "state",
+                    "node": user,
+                    "online": !is_online,
+                    "peers": peers_json
+                }));
             }
         }
         "promote_eager" => {
             let user = data["user"].as_u64().unwrap_or(0) as usize;
-            if user < state.control_txs.len() {
-                let _ = state.control_txs[user]
-                    .send(NodeCommand::PromoteAllEager)
-                    .await;
+            if user < state.nodes.len() {
+                let node_guard = state.nodes[user].read().await;
+                node_guard.promote_all_to_eager().await;
             }
         }
         "demote_lazy" => {
             // Demote all eager peers to lazy - useful for testing GRAFT flow
             let user = data["user"].as_u64().unwrap_or(0) as usize;
-            if user < state.control_txs.len() {
-                let _ = state.control_txs[user]
-                    .send(NodeCommand::DemoteAllToLazy)
-                    .await;
+            if user < state.nodes.len() {
+                let node_guard = state.nodes[user].read().await;
+                node_guard.demote_all_to_lazy().await;
             }
         }
         "reset_metrics" => {
+            // Prometheus metrics cannot be reset - just send current values
             let user = data["user"].as_u64().unwrap_or(0) as usize;
             if user < state.delegates.len() {
-                state.delegates[user].metrics.reset();
+                let prometheus_text = state.prometheus_handle.render();
                 let _ = state.update_tx.send(json!({
                     "type": "metrics",
                     "node": user,
-                    "metrics": state.delegates[user].metrics.to_json()
+                    "metrics": state.delegates[user].metrics.to_json_from_prometheus(&prometheus_text)
                 }));
+            }
+        }
+        "list_messages" => {
+            let user = data["user"].as_u64().unwrap_or(0) as usize;
+            let start_ts = data["start"].as_u64().unwrap_or(0);
+            let end_ts = data["end"].as_u64().unwrap_or(u64::MAX);
+            let limit = data["limit"].as_u64().unwrap_or(20).min(100) as usize;
+            let offset = data["offset"].as_u64().unwrap_or(0) as usize;
+
+            if user < state.nodes.len() {
+                let node_guard = state.nodes[user].read().await;
+                if let Some(ref stack) = node_guard.stack {
+                    match stack
+                        .plumtree()
+                        .list_messages(start_ts, end_ts, limit, offset)
+                        .await
+                    {
+                        Ok(page) => {
+                            let messages: Vec<Value> = page
+                                .messages
+                                .iter()
+                                .filter_map(|stored| {
+                                    ChatMessage::decode(&stored.payload).map(|chat| {
+                                        json!({
+                                            "id": format!("{:?}", stored.id),
+                                            "from": chat.from,
+                                            "text": chat.text,
+                                            "timestamp": chat.format_time(),
+                                            "timestamp_ms": stored.timestamp,
+                                        })
+                                    })
+                                })
+                                .collect();
+
+                            let _ = state.update_tx.send(json!({
+                                "type": "stored_messages",
+                                "node": user,
+                                "messages": messages,
+                                "has_more": page.has_more,
+                                "total": page.total,
+                                "pagination": { "limit": limit, "offset": offset }
+                            }));
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to list messages: {}", e);
+                        }
+                    }
+                }
             }
         }
         _ => {}
@@ -1309,18 +1437,139 @@ async fn api_node_peers(Path(node_id): Path<usize>, State(state): State<AppState
     }))
 }
 
+/// GET /metrics - Prometheus scrape endpoint (text format)
+async fn api_prometheus_metrics(State(state): State<AppState>) -> impl IntoResponse {
+    let metrics = state.prometheus_handle.render();
+    (
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        metrics,
+    )
+}
+
+/// GET /api/metrics - JSON metrics for Web UI
+async fn api_metrics_json(State(state): State<AppState>) -> Json<Value> {
+    let prometheus_text = state.prometheus_handle.render();
+    let mut metrics = parse_prometheus_metrics(&prometheus_text);
+
+    // Aggregate gauge metrics from all nodes (the global gauges fluctuate with 50 nodes)
+    let mut total_eager: usize = 0;
+    let mut total_lazy: usize = 0;
+    let mut total_cache: usize = 0;
+    let mut total_seen_map: usize = 0;
+
+    for node in state.nodes.iter() {
+        let node_guard = node.read().await;
+        if let Some(ref stack) = node_guard.stack {
+            let peer_stats = stack.peer_stats();
+            total_eager += peer_stats.eager_count;
+            total_lazy += peer_stats.lazy_count;
+
+            let cache_stats = stack.cache_stats();
+            total_cache += cache_stats.entries;
+
+            if let Some(seen_stats) = stack.seen_map_stats() {
+                total_seen_map += seen_stats.size;
+            }
+        }
+    }
+
+    // Override the fluctuating global gauges with aggregated values
+    if let Some(gauges) = metrics.get_mut("gauges").and_then(|v| v.as_object_mut()) {
+        gauges.insert("plumtree_eager_peers".to_string(), json!(total_eager));
+        gauges.insert("plumtree_lazy_peers".to_string(), json!(total_lazy));
+        gauges.insert(
+            "plumtree_total_peers".to_string(),
+            json!(total_eager + total_lazy),
+        );
+        gauges.insert("plumtree_cache_size".to_string(), json!(total_cache));
+        gauges.insert("plumtree_seen_map_size".to_string(), json!(total_seen_map));
+    }
+
+    Json(metrics)
+}
+
+/// Parse Prometheus text format into JSON
+fn parse_prometheus_metrics(text: &str) -> Value {
+    let mut counters = serde_json::Map::new();
+    let mut gauges = serde_json::Map::new();
+    let mut histograms = serde_json::Map::new();
+
+    for line in text.lines() {
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+
+        // Parse "metric_name value" or "metric_name{labels} value"
+        if let Some((name, value)) = parse_metric_line(line) {
+            // Categorize by metric name patterns
+            if name.contains("_total") {
+                counters.insert(name, json!(value));
+            } else if name.contains("_bucket") || name.contains("_sum") || name.contains("_count") {
+                // Histogram components
+                histograms.insert(name, json!(value));
+            } else {
+                gauges.insert(name, json!(value));
+            }
+        }
+    }
+
+    json!({
+        "counters": counters,
+        "gauges": gauges,
+        "histograms": histograms
+    })
+}
+
+/// Parse a single Prometheus metric line
+fn parse_metric_line(line: &str) -> Option<(String, f64)> {
+    // Handle metric lines like:
+    // "metric_name 123"
+    // "metric_name{label="value"} 123"
+    let line = line.trim();
+
+    // Find where the value starts (last space-separated token)
+    let last_space = line.rfind(' ')?;
+    let value_str = &line[last_space + 1..];
+    let name_part = &line[..last_space];
+
+    // Parse the value
+    let value: f64 = value_str.parse().ok()?;
+
+    // Extract metric name (without labels for simplicity, or with labels for uniqueness)
+    // For base metric name: remove everything after '{'
+    let name = if let Some(brace_pos) = name_part.find('{') {
+        // Keep labels for histogram buckets to differentiate them
+        if name_part.contains("_bucket") {
+            name_part.to_string()
+        } else {
+            name_part[..brace_pos].to_string()
+        }
+    } else {
+        name_part.to_string()
+    };
+
+    Some((name, value))
+}
+
 #[tokio::main]
 async fn main() {
     println!("Starting Plumtree Web Chat Demo with MemberlistStack...");
-    println!("Using {} nodes with REAL networking on ports {}-{}",
-        NUM_USERS, BASE_PORT, BASE_PORT + NUM_USERS as u16 - 1);
+    println!(
+        "Using {} nodes with REAL networking on ports {}-{}",
+        NUM_USERS,
+        BASE_PORT,
+        BASE_PORT + NUM_USERS as u16 - 1
+    );
     println!();
+
+    // Initialize Prometheus metrics recorder (must be done before any metrics are recorded)
+    let prometheus_handle = PrometheusBuilder::new()
+        .install_recorder()
+        .expect("failed to install Prometheus recorder");
+    println!("Prometheus metrics recorder installed");
 
     // Create broadcast channel for WebSocket updates
     let (update_tx, _) = broadcast::channel::<Value>(1000);
-
-    // Create shared message router
-    let router = Arc::new(MessageRouter::new());
 
     // Seed address is node 0
     let seed_addr: SocketAddr = format!("127.0.0.1:{}", BASE_PORT).parse().unwrap();
@@ -1332,7 +1581,7 @@ async fn main() {
     for i in 0..NUM_USERS {
         // First node (seed) has no seed_addr, others join via node 0
         let node_seed = if i == 0 { None } else { Some(seed_addr) };
-        let node = ChatNode::new(i, update_tx.clone(), node_seed, router.clone());
+        let node = ChatNode::new(i, update_tx.clone(), node_seed);
         delegates.push(node.delegate.clone());
         nodes.push(Arc::new(RwLock::new(node)));
     }
@@ -1365,10 +1614,17 @@ async fn main() {
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     // Print cluster status
-    let seed_members = nodes[0].read().await.stack.as_ref()
+    let seed_members = nodes[0]
+        .read()
+        .await
+        .stack
+        .as_ref()
         .map(|s| futures::executor::block_on(s.num_members()))
         .unwrap_or(0);
-    println!("Cluster formed with {} members discovered by seed", seed_members);
+    println!(
+        "Cluster formed with {} members discovered by seed",
+        seed_members
+    );
 
     // Print Plumtree peer topology for first few nodes
     println!("\nPlumtree peer topology (first 5 nodes):");
@@ -1376,72 +1632,31 @@ async fn main() {
         let node_guard = nodes[i].read().await;
         if let Some(ref stack) = node_guard.stack {
             let stats = stack.plumtree().peer_stats();
-            println!("  U{}: {} eager, {} lazy", i + 1, stats.eager_count, stats.lazy_count);
+            println!(
+                "  U{}: {} eager, {} lazy",
+                i + 1,
+                stats.eager_count,
+                stats.lazy_count
+            );
         }
     }
 
-    // Create control channels
+    // Create broadcast channels for sending messages
     let mut broadcast_txs = Vec::new();
-    let mut control_txs = Vec::new();
 
     for i in 0..NUM_USERS {
         let node = nodes[i].clone();
         let (broadcast_tx, mut broadcast_rx) = mpsc::channel::<String>(100);
-        let (control_tx, mut control_rx) = mpsc::channel::<NodeCommand>(100);
         broadcast_txs.push(broadcast_tx);
-        control_txs.push(control_tx);
 
-        let update_tx_clone = update_tx.clone();
-
-        // Message handling task
+        // Message handling task (only handles broadcast)
         tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    Some(text) = broadcast_rx.recv() => {
-                        let node_guard = node.read().await;
-                        if node_guard.is_online() {
-                            if let Err(e) = node_guard.broadcast(&text).await {
-                                eprintln!("Broadcast error: {}", e);
-                            }
-                        }
+            while let Some(text) = broadcast_rx.recv().await {
+                let node_guard = node.read().await;
+                if node_guard.is_online() {
+                    if let Err(e) = node_guard.broadcast(&text).await {
+                        eprintln!("Broadcast error: {}", e);
                     }
-                    Some(cmd) = control_rx.recv() => {
-                        match cmd {
-                            NodeCommand::PromoteAllEager => {
-                                let node_guard = node.read().await;
-                                node_guard.promote_all_to_eager().await;
-                            }
-                            NodeCommand::DemoteAllToLazy => {
-                                let node_guard = node.read().await;
-                                node_guard.demote_all_to_lazy().await;
-                            }
-                            NodeCommand::GoOffline => {
-                                let mut node_guard = node.write().await;
-                                node_guard.stop().await;
-                                let peers_json = node_guard.delegate.get_peers_json().await;
-                                let _ = update_tx_clone.send(json!({
-                                    "type": "state",
-                                    "node": node_guard.node_idx,
-                                    "online": false,
-                                    "peers": peers_json
-                                }));
-                            }
-                            NodeCommand::GoOnline => {
-                                let mut node_guard = node.write().await;
-                                if let Err(e) = node_guard.start().await {
-                                    eprintln!("Failed to start node: {}", e);
-                                }
-                                let peers_json = node_guard.delegate.get_peers_json().await;
-                                let _ = update_tx_clone.send(json!({
-                                    "type": "state",
-                                    "node": node_guard.node_idx,
-                                    "online": true,
-                                    "peers": peers_json
-                                }));
-                            }
-                        }
-                    }
-                    else => break,
                 }
             }
         });
@@ -1449,10 +1664,10 @@ async fn main() {
 
     let app_state = AppState {
         broadcast_txs: Arc::new(broadcast_txs),
-        control_txs: Arc::new(control_txs),
         update_tx,
         delegates: Arc::new(delegates),
         nodes: Arc::new(nodes),
+        prometheus_handle,
     };
 
     // Find the static directory
@@ -1465,6 +1680,8 @@ async fn main() {
         .route("/api/status", get(api_status))
         .route("/api/node/:id", get(api_node))
         .route("/api/node/:id/peers", get(api_node_peers))
+        .route("/metrics", get(api_prometheus_metrics))
+        .route("/api/metrics", get(api_metrics_json))
         .route("/ws", get(ws_handler))
         .nest_service("/", ServeDir::new(&static_dir))
         .with_state(app_state);
@@ -1472,12 +1689,19 @@ async fn main() {
     // Start server
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
     println!("\nServer running on http://localhost:3000");
+    println!("Prometheus metrics at http://localhost:3000/metrics");
+    println!("JSON metrics API at http://localhost:3000/api/metrics");
     println!("\nKey features demonstrated:");
     println!("  - MemberlistStack for real SWIM + Plumtree integration");
-    println!("  - Real UDP/TCP networking on localhost (ports {}-{})", BASE_PORT, BASE_PORT + NUM_USERS as u16 - 1);
+    println!(
+        "  - Real UDP/TCP networking on localhost (ports {}-{})",
+        BASE_PORT,
+        BASE_PORT + NUM_USERS as u16 - 1
+    );
     println!("  - Automatic peer discovery via SWIM gossip");
     println!("  - ChannelTransport routing for Plumtree messages between local nodes");
     println!("  - Online/offline toggle with proper shutdown/restart");
+    println!("  - Prometheus metrics with /metrics endpoint");
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();

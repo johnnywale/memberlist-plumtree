@@ -974,12 +974,10 @@ where
 
         // Cancel any pending Graft timer for this message
         // Returns true if a graft was actually sent and satisfied
+        // Note: graft_timer.message_received() internally records metrics (graft_success, latency)
         if self.inner.graft_timer.message_received(&msg_id) {
             // Record graft success for adaptive batcher to adjust batch sizes
             self.inner.adaptive_batcher.record_graft_received();
-
-            #[cfg(feature = "metrics")]
-            crate::metrics::record_graft_success();
         }
 
         // Check if already seen and track parent atomically (single shard lock)

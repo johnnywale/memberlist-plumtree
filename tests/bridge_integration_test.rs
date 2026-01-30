@@ -4,12 +4,19 @@
 //! from Memberlist to Plumtree's peer topology.
 
 use memberlist_plumtree::{
-    // Core protocol
-    NoopDelegate, PlumtreeConfig, PlumtreeDiscovery,
     // Bridge types
-    BridgeConfig, BridgeEventDelegate, PlumtreeBridge, PlumtreeStackBuilder,
+    BridgeConfig,
+    BridgeEventDelegate,
     // Transport for testing
-    ChannelTransport, PoolConfig, PooledTransport,
+    ChannelTransport,
+    // Core protocol
+    NoopDelegate,
+    PlumtreeBridge,
+    PlumtreeConfig,
+    PlumtreeDiscovery,
+    PlumtreeStackBuilder,
+    PoolConfig,
+    PooledTransport,
 };
 use std::sync::Arc;
 
@@ -178,8 +185,10 @@ async fn test_multi_node_topology_simulation() {
         })
         .collect();
 
-    let bridges: Vec<PlumtreeBridge<NodeId, NoopDelegate>> =
-        nodes.iter().map(|pm| PlumtreeBridge::new(pm.clone())).collect();
+    let bridges: Vec<PlumtreeBridge<NodeId, NoopDelegate>> = nodes
+        .iter()
+        .map(|pm| PlumtreeBridge::new(pm.clone()))
+        .collect();
 
     // Simulate full mesh discovery - each node discovers all others
     for (i, bridge) in bridges.iter().enumerate() {
@@ -196,7 +205,8 @@ async fn test_multi_node_topology_simulation() {
         let stats = bridge.peer_stats();
         let total_peers = stats.eager_count + stats.lazy_count;
         assert_eq!(
-            total_peers, 4,
+            total_peers,
+            4,
             "Node {} should have 4 peers, but has {}",
             i + 1,
             total_peers
@@ -355,7 +365,9 @@ async fn test_stack_builder_delegate_creation() {
 
     // Should be usable
     delegate.bridge().add_peer(2u64);
-    assert!(delegate.bridge().peer_stats().eager_count + delegate.bridge().peer_stats().lazy_count > 0);
+    assert!(
+        delegate.bridge().peer_stats().eager_count + delegate.bridge().peer_stats().lazy_count > 0
+    );
 }
 
 // ============================================================================
@@ -402,7 +414,10 @@ impl TrackingDelegate {
 
 impl PlumtreeDelegate<NodeId> for TrackingDelegate {
     fn on_deliver(&self, message_id: MessageId, payload: Bytes) {
-        self.inner.delivered_messages.lock().push((message_id, payload));
+        self.inner
+            .delivered_messages
+            .lock()
+            .push((message_id, payload));
         self.inner.delivered_ids.lock().insert(message_id);
     }
 }
@@ -655,7 +670,9 @@ async fn test_full_receive_ihave_graft_cycle() {
 /// Test full two-node communication with simulated network routing.
 #[tokio::test]
 async fn test_full_two_node_communication() {
-    use memberlist_plumtree::{decode_plumtree_envelope, ChannelTransport, PoolConfig, PooledTransport};
+    use memberlist_plumtree::{
+        decode_plumtree_envelope, ChannelTransport, PoolConfig, PooledTransport,
+    };
 
     let delegate1 = TrackingDelegate::new();
     let delegate2 = TrackingDelegate::new();
@@ -737,10 +754,7 @@ async fn test_full_two_node_communication() {
         sleep(Duration::from_millis(25)).await;
     }
 
-    assert!(
-        received,
-        "Node 2 should receive the broadcast from Node 1"
-    );
+    assert!(received, "Node 2 should receive the broadcast from Node 1");
 
     // Verify content
     let messages = delegate2.get_messages();

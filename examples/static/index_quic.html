@@ -1,0 +1,791 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Plumtree + QUIC Demo</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        .header {
+            background: #16213e;
+            padding: 12px 20px;
+            display: flex;
+            align-items: center;
+            gap: 20px;
+            border-bottom: 2px solid #0f3460;
+        }
+        .header h1 {
+            color: #00d9ff;
+            font-size: 1.3em;
+        }
+        .header h1 span {
+            color: #f39c12;
+            font-size: 0.8em;
+        }
+        .controls {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+        select, button {
+            padding: 6px 12px;
+            border-radius: 5px;
+            border: 1px solid #0f3460;
+            background: #16213e;
+            color: #eee;
+            cursor: pointer;
+            font-size: 13px;
+        }
+        select:hover, button:hover {
+            background: #1a3a5e;
+        }
+        button.active {
+            background: #e94560;
+            border-color: #e94560;
+        }
+        .status {
+            margin-left: auto;
+            display: flex;
+            gap: 15px;
+            align-items: center;
+        }
+        .status-item {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            font-size: 12px;
+        }
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+        }
+        .status-dot.online { background: #27ae60; }
+        .status-dot.offline { background: #e94560; }
+
+        .main-content {
+            flex: 1;
+            display: flex;
+            overflow: hidden;
+        }
+
+        /* Left panel - Tree visualization */
+        .tree-panel {
+            width: 350px;
+            min-width: 300px;
+            display: flex;
+            flex-direction: column;
+            border-right: 2px solid #0f3460;
+            background: #16213e;
+        }
+        .panel-header {
+            padding: 10px 15px;
+            font-weight: bold;
+            color: #00d9ff;
+            border-bottom: 1px solid #0f3460;
+            font-size: 13px;
+        }
+        .tree-canvas-container {
+            flex: 1;
+            position: relative;
+            overflow: hidden;
+        }
+        #treeCanvas {
+            width: 100%;
+            height: 100%;
+        }
+        .tree-legend {
+            padding: 10px;
+            border-top: 1px solid #0f3460;
+            font-size: 11px;
+            display: flex;
+            gap: 15px;
+            flex-wrap: wrap;
+        }
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+        .legend-color {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+        }
+        .legend-color.self { background: #00d9ff; border: 2px solid #fff; }
+        .legend-color.eager { background: #27ae60; }
+        .legend-color.lazy { background: #e67e22; }
+        .legend-color.offline { background: #e94560; }
+
+        /* Center panel - Chat */
+        .chat-panel {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            min-width: 300px;
+        }
+        .messages {
+            flex: 1;
+            overflow-y: auto;
+            padding: 10px;
+        }
+        .message {
+            padding: 8px 12px;
+            margin: 4px 0;
+            background: #16213e;
+            border-radius: 6px;
+            border-left: 3px solid #0f3460;
+            font-size: 13px;
+        }
+        .message.self { border-left-color: #9b59b6; }
+        .message.gossip { border-left-color: #3498db; }
+        .message.graft { border-left-color: #e67e22; }
+        .message-header {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 4px;
+            font-size: 11px;
+            color: #888;
+        }
+        .message-from {
+            color: #f39c12;
+            font-weight: bold;
+        }
+        .message-from.self { color: #9b59b6; }
+        .message-text { color: #eee; }
+        .message-delivery {
+            font-size: 10px;
+            color: #666;
+            margin-top: 4px;
+        }
+        .input-area {
+            display: flex;
+            padding: 10px;
+            background: #16213e;
+            border-top: 1px solid #0f3460;
+        }
+        .input-area input {
+            flex: 1;
+            padding: 10px 12px;
+            border-radius: 5px;
+            border: 1px solid #0f3460;
+            background: #1a1a2e;
+            color: #eee;
+            font-size: 13px;
+        }
+        .input-area button {
+            margin-left: 8px;
+            background: #00d9ff;
+            color: #1a1a2e;
+            font-weight: bold;
+        }
+
+        /* Right panel - Events & Metrics */
+        .side-panel {
+            width: 320px;
+            min-width: 280px;
+            display: flex;
+            flex-direction: column;
+            border-left: 2px solid #0f3460;
+        }
+        .events {
+            flex: 1;
+            overflow-y: auto;
+            padding: 8px;
+            font-size: 11px;
+            font-family: monospace;
+        }
+        .event {
+            padding: 4px 8px;
+            margin: 2px 0;
+            background: #16213e;
+            border-radius: 3px;
+        }
+        .event.sent { border-left: 3px solid #27ae60; }
+        .event.received { border-left: 3px solid #3498db; }
+        .event.graft { border-left: 3px solid #f39c12; }
+        .event.prune { border-left: 3px solid #e94560; }
+        .event.promote { border-left: 3px solid #27ae60; }
+        .event.demote { border-left: 3px solid #9b59b6; }
+        .event.offline { border-left: 3px solid #e94560; }
+        .event.online { border-left: 3px solid #27ae60; }
+        .event.quic_connect { border-left: 3px solid #00d9ff; }
+        .event.quic_disconnect { border-left: 3px solid #e74c3c; }
+        .event.quic_migrate { border-left: 3px solid #f39c12; }
+        .event-time { color: #666; }
+
+        .metrics {
+            padding: 10px;
+            background: #16213e;
+            border-top: 1px solid #0f3460;
+        }
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 6px;
+        }
+        .metric {
+            display: flex;
+            justify-content: space-between;
+            padding: 4px 8px;
+            background: #1a1a2e;
+            border-radius: 3px;
+            font-size: 11px;
+        }
+        .metric-label { color: #888; }
+        .metric-value {
+            font-weight: bold;
+            color: #00d9ff;
+        }
+
+        /* Peer details panel */
+        .peer-details {
+            padding: 10px;
+            background: #1a1a2e;
+            border-top: 1px solid #0f3460;
+            font-size: 11px;
+        }
+        .peer-details h4 {
+            color: #00d9ff;
+            margin-bottom: 8px;
+        }
+        .peer-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+        }
+        .peer-tag {
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 10px;
+        }
+        .peer-tag.eager {
+            background: #27ae60;
+            color: #fff;
+        }
+        .peer-tag.lazy {
+            background: #e67e22;
+            color: #fff;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Plumtree Protocol Demo <span>+ QUIC</span></h1>
+        <div class="controls">
+            <label>User:</label>
+            <select id="userSelect"></select>
+            <button id="failBtn">Go Offline</button>
+            <button id="eagerBtn">All Eager</button>
+            <button id="resetBtn">Reset</button>
+        </div>
+        <div class="status">
+            <div class="status-item">
+                <span class="status-dot" id="nodeStatus"></span>
+                <span id="nodeStatusText">Online</span>
+            </div>
+            <div class="status-item">
+                <span class="status-dot" id="wsStatus"></span>
+                <span>WS</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="main-content">
+        <!-- Left: Tree Visualization -->
+        <div class="tree-panel">
+            <div class="panel-header">Peer Tree - <span id="treeNodeName">U1</span></div>
+            <div class="tree-canvas-container">
+                <canvas id="treeCanvas"></canvas>
+            </div>
+            <div class="tree-legend">
+                <div class="legend-item"><span class="legend-color self"></span>Current</div>
+                <div class="legend-item"><span class="legend-color eager"></span>Eager</div>
+                <div class="legend-item"><span class="legend-color lazy"></span>Lazy</div>
+                <div class="legend-item"><span class="legend-color offline"></span>Offline</div>
+            </div>
+            <div class="peer-details">
+                <h4>Peer Summary</h4>
+                <div style="margin-bottom: 8px;">
+                    <strong>Eager Peers (<span id="eagerCount">0</span>):</strong>
+                    <div class="peer-list" id="eagerPeers"></div>
+                </div>
+                <div>
+                    <strong>Lazy Peers (<span id="lazyCount">0</span>):</strong>
+                    <div class="peer-list" id="lazyPeers"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Center: Chat -->
+        <div class="chat-panel">
+            <div class="panel-header">Messages</div>
+            <div class="messages" id="messages"></div>
+            <div class="input-area">
+                <input type="text" id="messageInput" placeholder="Type a message..." />
+                <button id="sendBtn">Send</button>
+            </div>
+        </div>
+
+        <!-- Right: Events & Metrics -->
+        <div class="side-panel">
+            <div class="panel-header">Event Log</div>
+            <div class="events" id="events"></div>
+            <div class="metrics">
+                <div class="panel-header" style="padding:8px 10px;border-bottom:1px solid #0f3460;margin:-10px -10px 10px -10px;">
+                    Protocol Metrics
+                </div>
+                <div class="metrics-grid">
+                    <div class="metric"><span class="metric-label">Sent</span><span class="metric-value" id="metricSent">0</span></div>
+                    <div class="metric"><span class="metric-label">Received</span><span class="metric-value" id="metricReceived">0</span></div>
+                    <div class="metric"><span class="metric-label">Grafts</span><span class="metric-value" id="metricGrafts">0</span></div>
+                    <div class="metric"><span class="metric-label">Prunes</span><span class="metric-value" id="metricPrunes">0</span></div>
+                    <div class="metric"><span class="metric-label">Promotions</span><span class="metric-value" id="metricPromotions">0</span></div>
+                    <div class="metric"><span class="metric-label">Demotions</span><span class="metric-value" id="metricDemotions">0</span></div>
+                </div>
+            </div>
+            <div class="metrics">
+                <div class="panel-header" style="padding:8px 10px;border-bottom:1px solid #0f3460;margin:-10px -10px 10px -10px;color:#f39c12;">
+                    QUIC Transport
+                </div>
+                <div class="metrics-grid">
+                    <div class="metric"><span class="metric-label">Connects</span><span class="metric-value" style="color:#27ae60;" id="metricQuicConnects">0</span></div>
+                    <div class="metric"><span class="metric-label">Disconnects</span><span class="metric-value" style="color:#e74c3c;" id="metricQuicDisconnects">0</span></div>
+                    <div class="metric"><span class="metric-label">Migrations</span><span class="metric-value" style="color:#f39c12;" id="metricQuicMigrations">0</span></div>
+                    <div class="metric"><span class="metric-label">Bytes Sent</span><span class="metric-value" id="metricQuicBytesSent">0</span></div>
+                    <div class="metric"><span class="metric-label">0-RTT Sent</span><span class="metric-value" id="metricQuic0RTT">0</span></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Configuration (fetched from server)
+        let NUM_USERS = 0;
+        let currentUser = 0;
+        let ws;
+        let initialized = false;
+
+        // State per user
+        let nodeOnline = [];
+        let messagesPerUser = [];
+        let eventsPerUser = [];
+        let metricsPerUser = [];
+        let peersPerUser = [];
+
+        // Initialize application
+        async function initApp() {
+            try {
+                const configRes = await fetch('/api/config');
+                const config = await configRes.json();
+                NUM_USERS = config.num_users;
+
+                // Initialize state arrays
+                nodeOnline = new Array(NUM_USERS).fill(true);
+                messagesPerUser = new Array(NUM_USERS).fill(null).map(() => []);
+                eventsPerUser = new Array(NUM_USERS).fill(null).map(() => []);
+                metricsPerUser = new Array(NUM_USERS).fill(null).map(() => ({
+                    sent: 0, received: 0, grafts: 0, prunes: 0, promotions: 0, demotions: 0,
+                    quic: { connections: 0, disconnections: 0, migrations: 0, bytes_sent: 0, zero_rtt_sent: 0 }
+                }));
+                peersPerUser = new Array(NUM_USERS).fill(null).map(() => ({ eager: [], lazy: [] }));
+
+                // Initialize user select dropdown
+                const userSelect = document.getElementById('userSelect');
+                userSelect.innerHTML = '';
+                for (let i = 0; i < NUM_USERS; i++) {
+                    const opt = document.createElement('option');
+                    opt.value = i;
+                    opt.textContent = `User ${i + 1}`;
+                    userSelect.appendChild(opt);
+                }
+
+                // Fetch initial status
+                const statusRes = await fetch('/api/status');
+                const status = await statusRes.json();
+
+                for (const node of status.nodes) {
+                    const idx = node.id;
+                    nodeOnline[idx] = node.online;
+                    if (node.peers) peersPerUser[idx] = node.peers;
+                    if (node.metrics) metricsPerUser[idx] = node.metrics;
+                }
+
+                initialized = true;
+                connectWS();
+                updateUI();
+
+                console.log(`Initialized with ${NUM_USERS} users (QUIC transport)`);
+            } catch (error) {
+                console.error('Failed to initialize:', error);
+                setTimeout(initApp, 2000);
+            }
+        }
+
+        document.getElementById('userSelect').addEventListener('change', async (e) => {
+            currentUser = parseInt(e.target.value);
+            updateUI();
+            await fetchPeerTree(currentUser);
+        });
+
+        async function fetchPeerTree(nodeId) {
+            try {
+                const res = await fetch(`/api/node/${nodeId}/peers`);
+                const data = await res.json();
+
+                if (!data.error) {
+                    peersPerUser[nodeId] = {
+                        eager: data.eager.map(p => p.name),
+                        lazy: data.lazy.map(p => p.name)
+                    };
+                    if (nodeId === currentUser) {
+                        updateUI();
+                    } else {
+                        drawTree();
+                    }
+                }
+            } catch (error) {
+                console.error('Failed to fetch peer tree:', error);
+            }
+        }
+
+        // Canvas setup
+        const canvas = document.getElementById('treeCanvas');
+        const ctx = canvas.getContext('2d');
+        let canvasWidth, canvasHeight;
+
+        function resizeCanvas() {
+            const container = canvas.parentElement;
+            canvasWidth = container.clientWidth;
+            canvasHeight = container.clientHeight;
+            canvas.width = canvasWidth * window.devicePixelRatio;
+            canvas.height = canvasHeight * window.devicePixelRatio;
+            canvas.style.width = canvasWidth + 'px';
+            canvas.style.height = canvasHeight + 'px';
+            ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+            drawTree();
+        }
+
+        window.addEventListener('resize', resizeCanvas);
+        setTimeout(resizeCanvas, 100);
+
+        function drawTree() {
+            ctx.clearRect(0, 0, canvasWidth, canvasHeight);
+
+            if (!initialized || !peersPerUser[currentUser]) {
+                ctx.fillStyle = '#666';
+                ctx.font = '14px Segoe UI';
+                ctx.textAlign = 'center';
+                ctx.fillText('Loading...', canvasWidth / 2, canvasHeight / 2);
+                return;
+            }
+
+            const peers = peersPerUser[currentUser];
+            const centerX = canvasWidth / 2;
+            const centerY = canvasHeight / 2;
+            const radius = Math.min(canvasWidth, canvasHeight) * 0.35;
+
+            const allPeers = [...peers.eager, ...peers.lazy];
+            const totalPeers = allPeers.length;
+
+            if (totalPeers === 0) {
+                drawNode(centerX, centerY, `U${currentUser + 1}`, 'self', nodeOnline[currentUser]);
+                return;
+            }
+
+            const peerPositions = [];
+            for (let i = 0; i < totalPeers; i++) {
+                const angle = (i / totalPeers) * 2 * Math.PI - Math.PI / 2;
+                const x = centerX + radius * Math.cos(angle);
+                const y = centerY + radius * Math.sin(angle);
+                const peerId = allPeers[i];
+                const isEager = peers.eager.includes(peerId);
+                peerPositions.push({ x, y, peerId, isEager });
+            }
+
+            // Draw connections
+            peerPositions.forEach(peer => {
+                ctx.beginPath();
+                ctx.moveTo(centerX, centerY);
+                ctx.lineTo(peer.x, peer.y);
+                ctx.strokeStyle = peer.isEager ? '#27ae60' : '#e67e2288';
+                ctx.lineWidth = peer.isEager ? 2 : 1;
+                if (!peer.isEager) {
+                    ctx.setLineDash([4, 4]);
+                } else {
+                    ctx.setLineDash([]);
+                }
+                ctx.stroke();
+                ctx.setLineDash([]);
+            });
+
+            // Draw peer nodes
+            peerPositions.forEach(peer => {
+                const peerIndex = parseInt(peer.peerId.substring(1)) - 1;
+                const isOnline = nodeOnline[peerIndex];
+                const type = peer.isEager ? 'eager' : 'lazy';
+                drawNode(peer.x, peer.y, peer.peerId, type, isOnline);
+            });
+
+            drawNode(centerX, centerY, `U${currentUser + 1}`, 'self', nodeOnline[currentUser]);
+        }
+
+        function drawNode(x, y, label, type, isOnline) {
+            const nodeRadius = 18;
+
+            ctx.beginPath();
+            ctx.arc(x, y, nodeRadius, 0, 2 * Math.PI);
+
+            if (!isOnline) {
+                ctx.fillStyle = '#e94560';
+            } else if (type === 'self') {
+                ctx.fillStyle = '#00d9ff';
+            } else if (type === 'eager') {
+                ctx.fillStyle = '#27ae60';
+            } else {
+                ctx.fillStyle = '#e67e22';
+            }
+            ctx.fill();
+
+            if (type === 'self') {
+                ctx.strokeStyle = '#fff';
+                ctx.lineWidth = 3;
+                ctx.stroke();
+            }
+
+            ctx.fillStyle = type === 'self' ? '#1a1a2e' : '#fff';
+            ctx.font = 'bold 11px Segoe UI';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(label, x, y);
+        }
+
+        // WebSocket connection
+        function connectWS() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+
+            ws.onopen = () => {
+                document.getElementById('wsStatus').className = 'status-dot online';
+            };
+
+            ws.onclose = () => {
+                document.getElementById('wsStatus').className = 'status-dot offline';
+                setTimeout(connectWS, 1000);
+            };
+
+            ws.onmessage = (e) => {
+                const data = JSON.parse(e.data);
+                handleUpdate(data);
+            };
+        }
+
+        function handleUpdate(data) {
+            const nodeIdx = data.node;
+
+            if (data.type === 'message') {
+                messagesPerUser[nodeIdx].push(data.message);
+                if (messagesPerUser[nodeIdx].length > 100) {
+                    messagesPerUser[nodeIdx].shift();
+                }
+                if (data.metrics) metricsPerUser[nodeIdx] = data.metrics;
+                if (data.peers) peersPerUser[nodeIdx] = data.peers;
+            } else if (data.type === 'event') {
+                eventsPerUser[nodeIdx].push(data.event);
+                if (eventsPerUser[nodeIdx].length > 100) {
+                    eventsPerUser[nodeIdx].shift();
+                }
+                if (data.metrics) metricsPerUser[nodeIdx] = data.metrics;
+                if (data.peers) peersPerUser[nodeIdx] = data.peers;
+            } else if (data.type === 'state') {
+                nodeOnline[nodeIdx] = data.online;
+                if (data.peers) peersPerUser[nodeIdx] = data.peers;
+            } else if (data.type === 'metrics') {
+                metricsPerUser[nodeIdx] = data.metrics;
+            } else if (data.type === 'peers') {
+                peersPerUser[nodeIdx] = data.peers;
+            } else if (data.type === 'init') {
+                if (data.messages) messagesPerUser[nodeIdx] = data.messages;
+                if (data.events) eventsPerUser[nodeIdx] = data.events;
+                if (data.metrics) metricsPerUser[nodeIdx] = data.metrics;
+                if (data.peers) peersPerUser[nodeIdx] = data.peers;
+                nodeOnline[nodeIdx] = data.online !== false;
+            }
+
+            if (nodeIdx === currentUser) {
+                updateUI();
+            } else {
+                drawTree();
+            }
+        }
+
+        function updateUI() {
+            if (!initialized) return;
+
+            // Update tree node name
+            document.getElementById('treeNodeName').textContent = `U${currentUser + 1}`;
+
+            // Update node status
+            const online = nodeOnline[currentUser];
+            document.getElementById('nodeStatus').className = `status-dot ${online ? 'online' : 'offline'}`;
+            document.getElementById('nodeStatusText').textContent = online ? 'Online' : 'Offline';
+            document.getElementById('failBtn').textContent = online ? 'Go Offline' : 'Go Online';
+            document.getElementById('failBtn').className = online ? '' : 'active';
+
+            // Update peer details
+            const peers = peersPerUser[currentUser];
+            document.getElementById('eagerCount').textContent = peers.eager.length;
+            document.getElementById('lazyCount').textContent = peers.lazy.length;
+
+            document.getElementById('eagerPeers').innerHTML = peers.eager
+                .map(p => `<span class="peer-tag eager">${p}</span>`).join('');
+            document.getElementById('lazyPeers').innerHTML = peers.lazy
+                .map(p => `<span class="peer-tag lazy">${p}</span>`).join('');
+
+            // Update messages
+            const messagesDiv = document.getElementById('messages');
+            messagesDiv.innerHTML = messagesPerUser[currentUser].map(msg => {
+                const isSelf = msg.from === `U${currentUser + 1}`;
+                const deliveryType = msg.delivery.includes('GOSSIP') ? 'gossip' :
+                                    msg.delivery.includes('GRAFT') ? 'graft' : 'self';
+                return `
+                    <div class="message ${isSelf ? 'self' : ''} ${deliveryType}">
+                        <div class="message-header">
+                            <span class="message-from ${isSelf ? 'self' : ''}">${msg.from}</span>
+                            <span>${msg.timestamp}</span>
+                        </div>
+                        <div class="message-text">${escapeHtml(msg.text)}</div>
+                        <div class="message-delivery">${msg.delivery}</div>
+                    </div>
+                `;
+            }).join('');
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+
+            // Update events
+            const eventsDiv = document.getElementById('events');
+            eventsDiv.innerHTML = eventsPerUser[currentUser].map(evt => {
+                let text = formatEvent(evt);
+                return `<div class="event ${evt.type}"><span class="event-time">[${evt.time}]</span> ${text}</div>`;
+            }).join('');
+            eventsDiv.scrollTop = eventsDiv.scrollHeight;
+
+            // Update metrics
+            const m = metricsPerUser[currentUser];
+            document.getElementById('metricSent').textContent = m.sent || 0;
+            document.getElementById('metricReceived').textContent = m.received || 0;
+            document.getElementById('metricGrafts').textContent = m.grafts || 0;
+            document.getElementById('metricPrunes').textContent = m.prunes || 0;
+            document.getElementById('metricPromotions').textContent = m.promotions || 0;
+            document.getElementById('metricDemotions').textContent = m.demotions || 0;
+
+            // Update QUIC metrics
+            if (m.quic) {
+                document.getElementById('metricQuicConnects').textContent = m.quic.connections || 0;
+                document.getElementById('metricQuicDisconnects').textContent = m.quic.disconnections || 0;
+                document.getElementById('metricQuicMigrations').textContent = m.quic.migrations || 0;
+                document.getElementById('metricQuicBytesSent').textContent = formatBytes(m.quic.bytes_sent || 0);
+                document.getElementById('metricQuic0RTT').textContent = m.quic.zero_rtt_sent || 0;
+            }
+
+            drawTree();
+        }
+
+        function formatEvent(evt) {
+            switch (evt.type) {
+                case 'sent': return `SENT to [${evt.peers.join(', ')}]`;
+                case 'received': return `RECV from ${evt.from} via ${evt.method}`;
+                case 'graft': return `GRAFT to ${evt.to} for ${evt.msg_id}...`;
+                case 'prune': return `PRUNE to ${evt.to}`;
+                case 'promote': return `PROMOTE ${evt.peer} to eager`;
+                case 'demote': return `DEMOTE ${evt.peer} to lazy`;
+                case 'offline': return `NODE WENT OFFLINE`;
+                case 'online': return `NODE CAME ONLINE`;
+                case 'quic_connect': return `QUIC CONNECT to ${evt.peer} (RTT: ${evt.rtt_ms}ms)`;
+                case 'quic_disconnect': return `QUIC DISCONNECT from ${evt.peer}: ${evt.reason}`;
+                case 'quic_migrate': return `QUIC MIGRATE ${evt.peer} to ${evt.new_addr}`;
+                default: return JSON.stringify(evt);
+            }
+        }
+
+        function formatBytes(bytes) {
+            if (bytes === 0) return '0';
+            if (bytes < 1024) return bytes + 'B';
+            if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + 'KB';
+            return (bytes / (1024 * 1024)).toFixed(1) + 'MB';
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // Send message
+        function sendMessage() {
+            const input = document.getElementById('messageInput');
+            const text = input.value.trim();
+            if (text && ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    type: 'send',
+                    user: currentUser,
+                    text: text
+                }));
+                input.value = '';
+            }
+        }
+
+        document.getElementById('sendBtn').addEventListener('click', sendMessage);
+        document.getElementById('messageInput').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') sendMessage();
+        });
+
+        // Control buttons
+        document.getElementById('failBtn').addEventListener('click', () => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    type: 'toggle_online',
+                    user: currentUser
+                }));
+            }
+        });
+
+        document.getElementById('eagerBtn').addEventListener('click', () => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    type: 'promote_eager',
+                    user: currentUser
+                }));
+            }
+        });
+
+        document.getElementById('resetBtn').addEventListener('click', () => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    type: 'reset_metrics',
+                    user: currentUser
+                }));
+                metricsPerUser[currentUser] = {
+                    sent: 0, received: 0, grafts: 0, prunes: 0, promotions: 0, demotions: 0,
+                    quic: { connections: 0, disconnections: 0, migrations: 0, bytes_sent: 0, zero_rtt_sent: 0 }
+                };
+                updateUI();
+            }
+        });
+
+        // Start
+        initApp();
+    </script>
+</body>
+</html>

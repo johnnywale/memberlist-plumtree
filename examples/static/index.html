@@ -284,6 +284,7 @@
             <button id="lossBtn">Loss: OFF</button>
             <button id="eagerBtn">All Eager</button>
             <button id="resetBtn">Reset</button>
+            <button id="historyBtn">History</button>
         </div>
         <div class="status">
             <div class="status-item">
@@ -338,6 +339,9 @@
             <div class="panel-header">Event Log</div>
             <div class="events" id="events"></div>
             <div class="metrics">
+                <div class="panel-header" style="padding:8px 10px;border-bottom:1px solid #0f3460;margin:-10px -10px 10px -10px;">
+                    App Metrics
+                </div>
                 <div class="metrics-grid">
                     <div class="metric"><span class="metric-label">Sent</span><span class="metric-value" id="metricSent">0</span></div>
                     <div class="metric"><span class="metric-label">Received</span><span class="metric-value" id="metricReceived">0</span></div>
@@ -347,6 +351,114 @@
                     <div class="metric"><span class="metric-label">Demotions</span><span class="metric-value" id="metricDemotions">0</span></div>
                 </div>
             </div>
+            <div class="metrics" id="protocolMetricsPanel">
+                <div class="panel-header" style="padding:8px 10px;border-bottom:1px solid #0f3460;margin:-10px -10px 10px -10px;display:flex;justify-content:space-between;align-items:center;">
+                    <span>Protocol Metrics (Global)</span>
+                    <button id="refreshMetrics" style="padding:2px 8px;font-size:10px;background:#0f3460;">Refresh</button>
+                </div>
+                <!-- Message Counters -->
+                <div class="metrics-section" style="margin-bottom:10px;">
+                    <div style="font-size:10px;color:#888;margin-bottom:4px;text-transform:uppercase;">Messages</div>
+                    <div class="metrics-grid">
+                        <div class="metric"><span class="metric-label">Broadcasts</span><span class="metric-value" id="metricBroadcasts">0</span></div>
+                        <div class="metric"><span class="metric-label">Delivered</span><span class="metric-value" id="metricDelivered">0</span></div>
+                        <div class="metric"><span class="metric-label">Duplicates</span><span class="metric-value" id="metricDuplicates">0</span></div>
+                        <div class="metric"><span class="metric-label">Gossip Sent</span><span class="metric-value" id="metricGossipSent">0</span></div>
+                        <div class="metric"><span class="metric-label">IHave Sent</span><span class="metric-value" id="metricIHaveSent">0</span></div>
+                        <div class="metric"><span class="metric-label">Prune Sent</span><span class="metric-value" id="metricPruneSent">0</span></div>
+                    </div>
+                </div>
+                <!-- Graft Counters -->
+                <div class="metrics-section" style="margin-bottom:10px;">
+                    <div style="font-size:10px;color:#888;margin-bottom:4px;text-transform:uppercase;">Graft</div>
+                    <div class="metrics-grid">
+                        <div class="metric"><span class="metric-label">Graft Sent</span><span class="metric-value" id="metricGraftSent">0</span></div>
+                        <div class="metric"><span class="metric-label">Graft OK</span><span class="metric-value" id="metricGraftSuccess">0</span></div>
+                        <div class="metric"><span class="metric-label">Graft Fail</span><span class="metric-value" id="metricGraftFailed">0</span></div>
+                        <div class="metric"><span class="metric-label">Graft Retries</span><span class="metric-value" id="metricGraftRetries">0</span></div>
+                    </div>
+                </div>
+                <!-- Peer Counters -->
+                <div class="metrics-section" style="margin-bottom:10px;">
+                    <div style="font-size:10px;color:#888;margin-bottom:4px;text-transform:uppercase;">Peers</div>
+                    <div class="metrics-grid">
+                        <div class="metric"><span class="metric-label">Promotions</span><span class="metric-value" id="metricPromotionsTotal">0</span></div>
+                        <div class="metric"><span class="metric-label">Demotions</span><span class="metric-value" id="metricDemotionsTotal">0</span></div>
+                        <div class="metric"><span class="metric-label">Peers Added</span><span class="metric-value" id="metricPeersAdded">0</span></div>
+                        <div class="metric"><span class="metric-label">Peers Removed</span><span class="metric-value" id="metricPeersRemoved">0</span></div>
+                    </div>
+                </div>
+                <!-- Gauges -->
+                <div class="metrics-section" style="margin-bottom:10px;">
+                    <div style="font-size:10px;color:#888;margin-bottom:4px;text-transform:uppercase;">Current State</div>
+                    <div class="metrics-grid">
+                        <div class="metric"><span class="metric-label">Eager Peers</span><span class="metric-value" id="metricEagerPeers">0</span></div>
+                        <div class="metric"><span class="metric-label">Lazy Peers</span><span class="metric-value" id="metricLazyPeers">0</span></div>
+                        <div class="metric"><span class="metric-label">Total Peers</span><span class="metric-value" id="metricTotalPeers">0</span></div>
+                        <div class="metric"><span class="metric-label">Cache Size</span><span class="metric-value" id="metricCacheSize">0</span></div>
+                        <div class="metric"><span class="metric-label">Seen Map</span><span class="metric-value" id="metricSeenMap">0</span></div>
+                        <div class="metric"><span class="metric-label">Pending Grafts</span><span class="metric-value" id="metricPendingGrafts">0</span></div>
+                        <div class="metric"><span class="metric-label">IHave Queue</span><span class="metric-value" id="metricIHaveQueue">0</span></div>
+                        <div class="metric"><span class="metric-label">Seen Evictions</span><span class="metric-value" id="metricSeenEvictions">0</span></div>
+                    </div>
+                </div>
+                <!-- Histograms (averages) -->
+                <div class="metrics-section" style="margin-bottom:10px;">
+                    <div style="font-size:10px;color:#888;margin-bottom:4px;text-transform:uppercase;">Histograms (avg)</div>
+                    <div class="metrics-grid">
+                        <div class="metric"><span class="metric-label">Graft Latency</span><span class="metric-value" id="metricGraftLatency">-</span></div>
+                        <div class="metric"><span class="metric-label">Msg Size</span><span class="metric-value" id="metricMsgSize">-</span></div>
+                        <div class="metric"><span class="metric-label">Msg Hops</span><span class="metric-value" id="metricMsgHops">-</span></div>
+                        <div class="metric"><span class="metric-label">IHave Batch</span><span class="metric-value" id="metricIHaveBatch">-</span></div>
+                    </div>
+                </div>
+                <!-- Phase 1 Features: Compression -->
+                <div class="metrics-section" style="margin-bottom:10px;">
+                    <div style="font-size:10px;color:#00d9ff;margin-bottom:4px;text-transform:uppercase;">Compression</div>
+                    <div class="metrics-grid">
+                        <div class="metric"><span class="metric-label">Bytes In</span><span class="metric-value" id="metricBytesCompressed">0</span></div>
+                        <div class="metric"><span class="metric-label">Bytes Saved</span><span class="metric-value" id="metricBytesSaved">0</span></div>
+                    </div>
+                </div>
+                <!-- Phase 1 Features: Priority Queue -->
+                <div class="metrics-section" style="margin-bottom:10px;">
+                    <div style="font-size:10px;color:#00d9ff;margin-bottom:4px;text-transform:uppercase;">Priority Queue</div>
+                    <div class="metrics-grid">
+                        <div class="metric"><span class="metric-label">Critical</span><span class="metric-value" id="metricPriorityCritical">0</span></div>
+                        <div class="metric"><span class="metric-label">High</span><span class="metric-value" id="metricPriorityHigh">0</span></div>
+                        <div class="metric"><span class="metric-label">Normal</span><span class="metric-value" id="metricPriorityNormal">0</span></div>
+                        <div class="metric"><span class="metric-label">Low</span><span class="metric-value" id="metricPriorityLow">0</span></div>
+                    </div>
+                </div>
+                <!-- Phase 1 Features: Peer Health -->
+                <div class="metrics-section">
+                    <div style="font-size:10px;color:#00d9ff;margin-bottom:4px;text-transform:uppercase;">Peer Health</div>
+                    <div class="metrics-grid">
+                        <div class="metric"><span class="metric-label">Healthy</span><span class="metric-value" style="color:#27ae60;" id="metricPeersHealthy">0</span></div>
+                        <div class="metric"><span class="metric-label">Degraded</span><span class="metric-value" style="color:#f39c12;" id="metricPeersDegraded">0</span></div>
+                        <div class="metric"><span class="metric-label">Zombie</span><span class="metric-value" style="color:#e74c3c;" id="metricPeersZombie">0</span></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- History Modal -->
+    <div id="historyModal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);z-index:1000;justify-content:center;align-items:center;">
+        <div style="background:#16213e;border-radius:8px;width:80%;max-width:600px;max-height:80vh;display:flex;flex-direction:column;border:2px solid #0f3460;">
+            <div style="padding:15px 20px;border-bottom:1px solid #0f3460;display:flex;justify-content:space-between;align-items:center;">
+                <h3 style="color:#00d9ff;margin:0;">Message History - <span id="historyNode">U1</span></h3>
+                <button id="closeHistoryBtn" style="background:none;border:none;color:#888;font-size:24px;cursor:pointer;">&times;</button>
+            </div>
+            <div style="padding:15px 20px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #0f3460;">
+                <span style="color:#888;">Total: <strong id="historyTotal" style="color:#00d9ff;">0</strong></span>
+                <div style="display:flex;align-items:center;gap:10px;">
+                    <button id="historyPrev" disabled>&lt; Prev</button>
+                    <span id="historyPage" style="color:#888;">1/1</span>
+                    <button id="historyNext">Next &gt;</button>
+                </div>
+            </div>
+            <div id="historyList" style="padding:15px 20px;overflow-y:auto;flex:1;min-height:200px;max-height:50vh;"></div>
         </div>
     </div>
 
@@ -365,6 +477,10 @@
         let metricsPerUser = [];
         // Peer state: { eager: [NodeId], lazy: [NodeId] }
         let peersPerUser = [];
+
+        // History modal state
+        let historyOffset = 0;
+        const historyLimit = 20;
 
         // Initialize application by fetching config and status from API
         async function initApp() {
@@ -640,6 +756,8 @@
                 if (data.metrics) metricsPerUser[nodeIdx] = data.metrics;
                 if (data.peers) peersPerUser[nodeIdx] = data.peers;
                 nodeOnline[nodeIdx] = data.online !== false;
+            } else if (data.type === 'stored_messages' && data.node === currentUser) {
+                displayStoredMessages(data);
             }
 
             if (nodeIdx === currentUser) {
@@ -710,6 +828,27 @@
             document.getElementById('metricPrunes').textContent = m.prunes || 0;
             document.getElementById('metricPromotions').textContent = m.promotions || 0;
             document.getElementById('metricDemotions').textContent = m.demotions || 0;
+
+            // Update Phase 1 metrics - Compression
+            if (m.compression) {
+                document.getElementById('metricBytesCompressed').textContent = m.compression.bytes_in || 0;
+                document.getElementById('metricBytesSaved').textContent = m.compression.bytes_saved || 0;
+            }
+
+            // Update Phase 1 metrics - Priority Queue
+            if (m.priority_queue) {
+                document.getElementById('metricPriorityCritical').textContent = m.priority_queue.critical || 0;
+                document.getElementById('metricPriorityHigh').textContent = m.priority_queue.high || 0;
+                document.getElementById('metricPriorityNormal').textContent = m.priority_queue.normal || 0;
+                document.getElementById('metricPriorityLow').textContent = m.priority_queue.low || 0;
+            }
+
+            // Update Phase 1 metrics - Peer Health
+            if (m.peer_health) {
+                document.getElementById('metricPeersHealthy').textContent = m.peer_health.healthy || 0;
+                document.getElementById('metricPeersDegraded').textContent = m.peer_health.degraded || 0;
+                document.getElementById('metricPeersZombie').textContent = m.peer_health.zombie || 0;
+            }
 
             // Redraw tree
             drawTree();
@@ -792,11 +931,195 @@
                     user: currentUser
                 }));
                 metricsPerUser[currentUser] = {
-                    sent: 0, received: 0, grafts: 0, prunes: 0, promotions: 0, demotions: 0
+                    sent: 0, received: 0, grafts: 0, prunes: 0, promotions: 0, demotions: 0,
+                    compression: { bytes_in: 0, bytes_saved: 0 },
+                    priority_queue: { critical: 0, high: 0, normal: 0, low: 0 },
+                    peer_health: { healthy: 0, degraded: 0, zombie: 0 }
                 };
                 updateUI();
             }
         });
+
+        // History modal functions
+        function displayStoredMessages(data) {
+            document.getElementById('historyTotal').textContent = data.total;
+            const page = Math.floor(historyOffset / historyLimit) + 1;
+            const pages = Math.ceil(data.total / historyLimit) || 1;
+            document.getElementById('historyPage').textContent = `${page}/${pages}`;
+            document.getElementById('historyPrev').disabled = historyOffset === 0;
+            document.getElementById('historyNext').disabled = !data.has_more;
+
+            const list = document.getElementById('historyList');
+            if (data.messages.length === 0) {
+                list.innerHTML = '<div style="color:#888;text-align:center;padding:40px;">No messages stored</div>';
+            } else {
+                list.innerHTML = data.messages.map(m => `
+                    <div style="padding:10px;margin-bottom:8px;background:#1a1a2e;border-radius:6px;border-left:3px solid #0f3460;">
+                        <div style="display:flex;justify-content:space-between;font-size:11px;color:#888;">
+                            <span style="color:#f39c12;font-weight:bold;">${escapeHtml(m.from)}</span>
+                            <span>${m.timestamp}</span>
+                        </div>
+                        <div style="color:#eee;margin-top:4px;">${escapeHtml(m.text)}</div>
+                    </div>
+                `).join('');
+            }
+        }
+
+        function fetchHistory() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    type: 'list_messages',
+                    user: currentUser,
+                    limit: historyLimit,
+                    offset: historyOffset
+                }));
+            }
+        }
+
+        document.getElementById('historyBtn').addEventListener('click', () => {
+            historyOffset = 0;
+            document.getElementById('historyNode').textContent = `U${currentUser + 1}`;
+            document.getElementById('historyModal').style.display = 'flex';
+            fetchHistory();
+        });
+
+        document.getElementById('closeHistoryBtn').addEventListener('click', () => {
+            document.getElementById('historyModal').style.display = 'none';
+        });
+
+        document.getElementById('historyPrev').addEventListener('click', () => {
+            if (historyOffset >= historyLimit) {
+                historyOffset -= historyLimit;
+                fetchHistory();
+            }
+        });
+
+        document.getElementById('historyNext').addEventListener('click', () => {
+            historyOffset += historyLimit;
+            fetchHistory();
+        });
+
+        // Close modal on escape key or click outside
+        document.getElementById('historyModal').addEventListener('click', (e) => {
+            if (e.target.id === 'historyModal') {
+                document.getElementById('historyModal').style.display = 'none';
+            }
+        });
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') {
+                document.getElementById('historyModal').style.display = 'none';
+            }
+        });
+
+        // Protocol metrics fetching
+        async function fetchProtocolMetrics() {
+            try {
+                const res = await fetch('/api/metrics');
+                const data = await res.json();
+                updateProtocolMetrics(data);
+            } catch (e) {
+                console.error('Failed to fetch protocol metrics:', e);
+            }
+        }
+
+        function updateProtocolMetrics(data) {
+            const c = data.counters || {};
+            const g = data.gauges || {};
+            const h = data.histograms || {};
+
+            // Helper to set metric value
+            const setMetric = (id, value) => {
+                const el = document.getElementById(id);
+                if (el) el.textContent = Math.round(value) || 0;
+            };
+
+            // Helper to set metric with formatting
+            const setMetricFmt = (id, value, fmt) => {
+                const el = document.getElementById(id);
+                if (el) el.textContent = value !== undefined && value !== null ? fmt(value) : '-';
+            };
+
+            // Message Counters
+            setMetric('metricBroadcasts', c['plumtree_messages_broadcast_total']);
+            setMetric('metricDelivered', c['plumtree_messages_delivered_total']);
+            setMetric('metricDuplicates', c['plumtree_messages_duplicate_total']);
+            setMetric('metricGossipSent', c['plumtree_gossip_sent_total']);
+            setMetric('metricIHaveSent', c['plumtree_ihave_sent_total']);
+            setMetric('metricPruneSent', c['plumtree_prune_sent_total']);
+
+            // Graft Counters
+            setMetric('metricGraftSent', c['plumtree_graft_sent_total']);
+            setMetric('metricGraftSuccess', c['plumtree_graft_success_total']);
+            setMetric('metricGraftFailed', c['plumtree_graft_failed_total']);
+            setMetric('metricGraftRetries', c['plumtree_graft_retries_total']);
+
+            // Peer Counters
+            setMetric('metricPromotionsTotal', c['plumtree_peer_promotions_total']);
+            setMetric('metricDemotionsTotal', c['plumtree_peer_demotions_total']);
+            setMetric('metricPeersAdded', c['plumtree_peer_added_total']);
+            setMetric('metricPeersRemoved', c['plumtree_peer_removed_total']);
+
+            // Gauges
+            setMetric('metricEagerPeers', g['plumtree_eager_peers']);
+            setMetric('metricLazyPeers', g['plumtree_lazy_peers']);
+            setMetric('metricTotalPeers', g['plumtree_total_peers']);
+            setMetric('metricCacheSize', g['plumtree_cache_size']);
+            setMetric('metricSeenMap', g['plumtree_seen_map_size']);
+            setMetric('metricPendingGrafts', g['plumtree_pending_grafts']);
+            setMetric('metricIHaveQueue', g['plumtree_ihave_queue_size']);
+            setMetric('metricSeenEvictions', c['plumtree_seen_map_evictions_total']);
+
+            // Histograms - compute average from _sum and _count
+            const getHistogramAvg = (name) => {
+                const sum = h[name + '_sum'];
+                const count = h[name + '_count'];
+                if (sum !== undefined && count !== undefined && count > 0) {
+                    return sum / count;
+                }
+                return null;
+            };
+
+            // Graft latency (in ms)
+            const latencyAvg = getHistogramAvg('plumtree_graft_latency_seconds');
+            setMetricFmt('metricGraftLatency', latencyAvg, v => (v * 1000).toFixed(1) + 'ms');
+
+            // Message size (in bytes)
+            const sizeAvg = getHistogramAvg('plumtree_message_size_bytes');
+            setMetricFmt('metricMsgSize', sizeAvg, v => Math.round(v) + 'B');
+
+            // Message hops
+            const hopsAvg = getHistogramAvg('plumtree_message_hops');
+            setMetricFmt('metricMsgHops', hopsAvg, v => v.toFixed(1));
+
+            // IHave batch size
+            const batchAvg = getHistogramAvg('plumtree_ihave_batch_size');
+            setMetricFmt('metricIHaveBatch', batchAvg, v => v.toFixed(1));
+
+            // Phase 1 Features - Compression (from per-node metrics aggregated)
+            setMetric('metricBytesCompressed', c['plumtree_compression_bytes_in_total'] || 0);
+            setMetric('metricBytesSaved', c['plumtree_compression_bytes_saved_total'] || 0);
+
+            // Phase 1 Features - Priority Queue
+            setMetric('metricPriorityCritical', c['plumtree_priority_critical_total'] || 0);
+            setMetric('metricPriorityHigh', c['plumtree_priority_high_total'] || 0);
+            setMetric('metricPriorityNormal', c['plumtree_priority_normal_total'] || 0);
+            setMetric('metricPriorityLow', c['plumtree_priority_low_total'] || 0);
+
+            // Phase 1 Features - Peer Health
+            setMetric('metricPeersHealthy', g['plumtree_peers_healthy'] || 0);
+            setMetric('metricPeersDegraded', g['plumtree_peers_degraded'] || 0);
+            setMetric('metricPeersZombie', g['plumtree_peers_zombie'] || 0);
+        }
+
+        // Auto-refresh protocol metrics every 2 seconds
+        setInterval(fetchProtocolMetrics, 2000);
+
+        // Manual refresh button
+        document.getElementById('refreshMetrics').addEventListener('click', fetchProtocolMetrics);
+
+        // Initial fetch of protocol metrics
+        setTimeout(fetchProtocolMetrics, 1000);
 
         // Start - initialize from API first
         initApp();

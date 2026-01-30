@@ -110,8 +110,8 @@ impl MessageId {
             return None;
         }
 
-        let mut cursor = std::io::Cursor::new(data);
-        Self::decode(&mut cursor)
+        let mut buf = data;
+        Self::decode(&mut buf)
     }
 }
 

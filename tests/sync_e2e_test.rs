@@ -1,3 +1,5 @@
+#![allow(clippy::needless_as_bytes)]
+
 //! End-to-End Tests for Anti-Entropy Sync and Persistence.
 //!
 //! These tests verify that the `PlumtreeDiscovery` correctly handles:
@@ -26,7 +28,7 @@ use memberlist::net::NetTransportOptions;
 use memberlist::tokio::{TokioRuntime, TokioSocketAddrResolver, TokioTcp};
 use memberlist::{Memberlist, Options as MemberlistOptions};
 use memberlist_plumtree::{
-    IdCodec, MessageId, PlumtreeConfig, PlumtreeDelegate, PlumtreeDiscovery,
+    IdCodec, MessageId, PlumtreeBridge, PlumtreeConfig, PlumtreeDelegate, PlumtreeDiscovery,
     PlumtreeNodeDelegate, StorageConfig, SyncConfig,
 };
 use nodecraft::resolver::socket_addr::SocketAddrResolver;
@@ -296,8 +298,11 @@ impl RealStack {
 
         let advertise_addr = *memberlist.advertise_address();
 
+        // Wrap PlumtreeDiscovery in PlumtreeBridge
+        let bridge = PlumtreeBridge::new(pm);
+
         let stack = Arc::new(memberlist_plumtree::MemberlistStack::new(
-            pm,
+            bridge,
             memberlist,
             advertise_addr,
         ));
@@ -350,7 +355,6 @@ impl RealStack {
         self.stack.plumtree().store().len()
     }
 }
-
 
 // ============================================================================
 // Test Scenario 1: Basic Anti-Entropy Recovery (One-Way)
@@ -422,7 +426,10 @@ async fn test_sync_recovery_late_joiner() {
 
     // Debug: Print stored messages on Node B before sync
     let b_stored_before = node_b.stored_message_count();
-    println!("Node B has {} messages in storage before sync", b_stored_before);
+    println!(
+        "Node B has {} messages in storage before sync",
+        b_stored_before
+    );
 
     // 4. Wait for Sync Cycles (Allow multiple intervals)
     sleep(Duration::from_secs(2)).await;
@@ -519,7 +526,10 @@ async fn test_bidirectional_entropy_resolution() {
     // 4. Verify Union
     let a_count = node_a.delegate.delivered_count();
     let b_count = node_b.delegate.delivered_count();
-    println!("Node A has {} messages, Node B has {} messages", a_count, b_count);
+    println!(
+        "Node A has {} messages, Node B has {} messages",
+        a_count, b_count
+    );
 
     assert!(
         node_a.delegate.has_message(&id_b1),
@@ -851,8 +861,14 @@ async fn test_sync_after_partition() {
     println!("Node C partitioned (shutdown)");
 
     // 3. A and B broadcast messages while C is partitioned
-    let id_a = node_a.broadcast(Bytes::from("during-partition-a")).await.unwrap();
-    let id_b = node_b.broadcast(Bytes::from("during-partition-b")).await.unwrap();
+    let id_a = node_a
+        .broadcast(Bytes::from("during-partition-a"))
+        .await
+        .unwrap();
+    let id_b = node_b
+        .broadcast(Bytes::from("during-partition-b"))
+        .await
+        .unwrap();
 
     println!("Broadcast during partition: {:?}, {:?}", id_a, id_b);
 
@@ -948,10 +964,7 @@ async fn test_edge_zero_retention_ttl() {
     let b_has_msg = node_b.delegate.has_message(&msg_id);
     println!("Node B has pruned message: {} (expected: false)", b_has_msg);
 
-    assert!(
-        !b_has_msg,
-        "Message should have been pruned before sync"
-    );
+    assert!(!b_has_msg, "Message should have been pruned before sync");
 
     println!("=== Test Passed: Short retention TTL works ===");
 
@@ -1286,13 +1299,25 @@ async fn test_edge_disjoint_clusters_merge() {
 
     // All nodes should have all messages
     for id in &cluster1_ids {
-        assert!(node_c.delegate.has_message(id), "C missing cluster1 message");
-        assert!(node_d.delegate.has_message(id), "D missing cluster1 message");
+        assert!(
+            node_c.delegate.has_message(id),
+            "C missing cluster1 message"
+        );
+        assert!(
+            node_d.delegate.has_message(id),
+            "D missing cluster1 message"
+        );
     }
 
     for id in &cluster2_ids {
-        assert!(node_a.delegate.has_message(id), "A missing cluster2 message");
-        assert!(node_b.delegate.has_message(id), "B missing cluster2 message");
+        assert!(
+            node_a.delegate.has_message(id),
+            "A missing cluster2 message"
+        );
+        assert!(
+            node_b.delegate.has_message(id),
+            "B missing cluster2 message"
+        );
     }
 
     println!("=== Test Passed: Disjoint clusters merge works ===");
@@ -1338,7 +1363,10 @@ async fn test_edge_single_message_difference() {
     sleep(Duration::from_millis(200)).await;
 
     // A broadcasts ONE more message
-    let extra_id = node_a.broadcast(Bytes::from("extra-message")).await.unwrap();
+    let extra_id = node_a
+        .broadcast(Bytes::from("extra-message"))
+        .await
+        .unwrap();
     println!("A broadcast extra message {:?}", extra_id);
 
     sleep(Duration::from_millis(200)).await;
@@ -1416,7 +1444,10 @@ async fn test_edge_empty_sync_already_synced() {
     println!("  Node B delivered: {}", b_count_before);
 
     // B should have received all 5 messages
-    assert_eq!(b_count_before, 5, "B should have received 5 messages via gossip");
+    assert_eq!(
+        b_count_before, 5,
+        "B should have received 5 messages via gossip"
+    );
 
     // Wait for more sync cycles (should be no-ops since B already has all messages)
     sleep(Duration::from_secs(2)).await;
@@ -1427,7 +1458,10 @@ async fn test_edge_empty_sync_already_synced() {
     println!("  Node B delivered: {}", b_count_after);
 
     // Count should not increase (no duplicate deliveries from sync)
-    assert_eq!(b_count_after, b_count_before, "Sync should not re-deliver messages");
+    assert_eq!(
+        b_count_after, b_count_before,
+        "Sync should not re-deliver messages"
+    );
 
     println!("=== Test Passed: Empty sync (already synced) works ===");
 
@@ -1858,13 +1892,9 @@ async fn test_edge_rapid_node_flapping() {
 
     // Rapid flapping: join, leave, join, leave...
     for round in 0..3 {
-        let flapper = RealStack::new_with_config(
-            &format!("flap-b-{}", round),
-            0,
-            config.clone(),
-        )
-        .await
-        .unwrap();
+        let flapper = RealStack::new_with_config(&format!("flap-b-{}", round), 0, config.clone())
+            .await
+            .unwrap();
 
         flapper.join(node_a.memberlist_addr()).await.unwrap();
         sleep(Duration::from_millis(200)).await;

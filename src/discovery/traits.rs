@@ -98,6 +98,17 @@ where
     fn local_addr(&self) -> Option<SocketAddr> {
         None
     }
+
+    /// Get the initial list of peers from the discovery configuration.
+    ///
+    /// This is used by `PlumtreeStack` to populate the resolver and peer state
+    /// before the discovery background task is started.
+    ///
+    /// The default implementation returns an empty list, which is appropriate
+    /// for discovery mechanisms that don't have pre-configured peers (e.g., mDNS).
+    fn initial_peers(&self) -> Vec<(I, SocketAddr)> {
+        Vec::new()
+    }
 }
 
 /// Simple handle that uses an atomic bool for stopping.

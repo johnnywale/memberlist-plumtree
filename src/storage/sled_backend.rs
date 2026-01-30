@@ -121,8 +121,7 @@ impl SledStore {
         let timestamp = u64::from_be_bytes(key[0..8].try_into().unwrap());
 
         // Extract message ID from key
-        let id = MessageId::decode_from_slice(&key[8..32])
-            .ok_or_else(|| "invalid message id")?;
+        let id = MessageId::decode_from_slice(&key[8..32]).ok_or("invalid message id")?;
 
         // Extract round and payload from value
         let round = u32::from_le_bytes(value[0..4].try_into().unwrap());
@@ -167,7 +166,7 @@ impl MessageStore for SledStore {
         // This is O(n) - for better performance, maintain a secondary index
         for item in self.db.iter() {
             let (key, value) = item?;
-            if key.len() >= 32 && &key[8..32] == &id_bytes[..] {
+            if key.len() >= 32 && key[8..32] == id_bytes[..] {
                 let msg = Self::deserialize(&key, &value)?;
                 return Ok(Some(msg));
             }
@@ -338,12 +337,29 @@ mod tests {
             let store = SledStore::open(dir.path()).unwrap();
             store.insert(&msg).await.unwrap();
             store.flush().await.unwrap();
+            // Explicit drop to release lock
+            drop(store);
         }
 
-        // Reopen and verify
-        {
-            let store = SledStore::open(dir.path()).unwrap();
-            assert!(store.contains(&id).await.unwrap());
-        }
+        // Reopen with retry - sled may take time to release file locks on some platforms
+        let store = {
+            let path = dir.path().to_path_buf();
+            let mut attempts = 0;
+            loop {
+                match SledStore::open(&path) {
+                    Ok(s) => break s,
+                    Err(_) if attempts < 50 => {
+                        attempts += 1;
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    Err(e) => panic!(
+                        "Failed to reopen store after {} attempts: {:?}",
+                        attempts, e
+                    ),
+                }
+            }
+        };
+
+        assert!(store.contains(&id).await.unwrap());
     }
 }

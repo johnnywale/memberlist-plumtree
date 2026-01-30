@@ -280,8 +280,8 @@ impl PlumtreeMessage {
 
     /// Decode a message from a byte slice.
     pub fn decode_from_slice(data: &[u8]) -> Option<Self> {
-        let mut cursor = std::io::Cursor::new(data);
-        Self::decode(&mut cursor)
+        let mut buf = data;
+        Self::decode(&mut buf)
     }
 
     /// Check if this is a Gossip message.
@@ -506,8 +506,8 @@ impl SyncMessage {
 
     /// Decode a sync message from a byte slice.
     pub fn decode_from_slice(data: &[u8]) -> Option<Self> {
-        let mut cursor = std::io::Cursor::new(data);
-        Self::decode(&mut cursor)
+        let mut buf = data;
+        Self::decode(&mut buf)
     }
 
     /// Get the message tag.
