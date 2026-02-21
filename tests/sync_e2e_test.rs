@@ -23,7 +23,7 @@
 mod common;
 
 use bytes::{Buf, BufMut, Bytes};
-use common::allocate_port;
+use common::{allocate_port, eventually};
 use memberlist::net::NetTransportOptions;
 use memberlist::tokio::{TokioRuntime, TokioSocketAddrResolver, TokioTcp};
 use memberlist::{Memberlist, Options as MemberlistOptions};
@@ -391,31 +391,21 @@ async fn test_sync_recovery_late_joiner() {
         b_stored_before
     );
 
-    // 4. Wait for Sync Cycles (Allow multiple intervals)
-    sleep(Duration::from_secs(2)).await;
+    // 4. Wait for Sync Cycles - verify Node B received all messages via Sync
+    eventually(Duration::from_secs(10), || async {
+        expected_ids
+            .iter()
+            .all(|id| node_b.delegate.has_message(id))
+    })
+    .await
+    .expect("Node B should receive all messages via Anti-Entropy sync");
 
-    // Debug: Print stored messages after sync
-    let b_stored_after = node_b.stored_message_count();
-    println!(
-        "Node B has {} messages in storage after sync (waiting 2s)",
-        b_stored_after
-    );
-
-    // 5. Verify Node B received the messages via Sync
     let b_count = node_b.delegate.delivered_count();
     println!(
         "Node B received {}/{} messages",
         b_count,
         expected_ids.len()
     );
-
-    for id in &expected_ids {
-        assert!(
-            node_b.delegate.has_message(id),
-            "Node B failed to sync message {:?} via Anti-Entropy",
-            id
-        );
-    }
 
     println!("=== Test Passed: Late joiner recovery works ===");
 
@@ -481,7 +471,14 @@ async fn test_bidirectional_entropy_resolution() {
     println!("Nodes connected, waiting for convergence...");
 
     // 3. Wait for Convergence (multiple sync cycles)
-    sleep(Duration::from_secs(3)).await;
+    eventually(Duration::from_secs(10), || async {
+        node_a.delegate.has_message(&id_b1)
+            && node_a.delegate.has_message(&id_b2)
+            && node_b.delegate.has_message(&id_a1)
+            && node_b.delegate.has_message(&id_a2)
+    })
+    .await
+    .expect("Both nodes should converge to the union of all messages");
 
     // 4. Verify Union
     let a_count = node_a.delegate.delivered_count();
@@ -491,14 +488,6 @@ async fn test_bidirectional_entropy_resolution() {
         a_count, b_count
     );
 
-    assert!(
-        node_a.delegate.has_message(&id_b1),
-        "Node A missing B's message 1"
-    );
-    assert!(
-        node_a.delegate.has_message(&id_b2),
-        "Node A missing B's message 2"
-    );
     assert!(
         node_b.delegate.has_message(&id_a1),
         "Node B missing A's message 1"

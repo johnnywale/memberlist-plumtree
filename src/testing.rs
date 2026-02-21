@@ -740,11 +740,13 @@ impl<I: Clone, M: Clone> MessageReorderer<I, M> {
         let mut ready = Vec::new();
 
         // Drain all messages whose deliver_at has passed
-        while let Some(msg) = queue.front() {
-            if msg.deliver_at <= now {
-                ready.push(queue.pop_front().unwrap());
+        // Messages may have different random delays, so we can't assume ordering
+        let mut i = 0;
+        while i < queue.len() {
+            if queue[i].deliver_at <= now {
+                ready.push(queue.remove(i).unwrap());
             } else {
-                break;
+                i += 1;
             }
         }
 
@@ -957,6 +959,8 @@ impl<I: Clone + Eq + Hash, M: Clone> EnhancedChaosController<I, M> {
                 self.partition.partition(node.clone(), other.clone());
             }
             failed.push(node);
+            // Uses std::thread::sleep intentionally: this is a sync function used in
+            // test/simulation contexts where blocking the thread is acceptable.
             std::thread::sleep(delay_between);
         }
         failed

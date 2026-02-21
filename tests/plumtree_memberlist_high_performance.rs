@@ -10,7 +10,10 @@
 //! - Use memberlist's gossip for broadcast messages
 //! - Have fine-grained control over concurrency and queueing
 
+mod common;
+
 use bytes::{Buf, BufMut, Bytes};
+use common::eventually;
 use memberlist_plumtree::{
     decode_plumtree_envelope, encode_plumtree_envelope, ChannelTransport, IdCodec, MessageId,
     PlumtreeConfig, PlumtreeDelegate, PlumtreeDiscovery, PlumtreeMessage, PoolConfig,
@@ -281,16 +284,11 @@ async fn test_high_performance_basic_broadcast() {
     }
 
     // Wait for message propagation
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // Verify all nodes received the message
-    for (i, delegate) in delegates.iter().enumerate().skip(1) {
-        assert!(
-            delegate.has_message(&msg_id),
-            "Node {} should have received the message",
-            i
-        );
-    }
+    eventually(Duration::from_secs(5), || async {
+        delegates.iter().skip(1).all(|d| d.has_message(&msg_id))
+    })
+    .await
+    .expect("all nodes should have received the message");
 
     // Shutdown all nodes
     for pm in &nodes {

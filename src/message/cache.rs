@@ -6,7 +6,7 @@
 use bytes::Bytes;
 use parking_lot::RwLock;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -45,7 +45,7 @@ struct CacheInner {
     /// Map from message ID to cache entry.
     entries: HashMap<MessageId, CacheEntry>,
     /// Insertion order for LRU eviction (oldest first).
-    insertion_order: Vec<(MessageId, Instant)>,
+    insertion_order: VecDeque<(MessageId, Instant)>,
 }
 
 impl MessageCache {
@@ -54,7 +54,7 @@ impl MessageCache {
         Self {
             inner: RwLock::new(CacheInner {
                 entries: HashMap::with_capacity(max_size.min(1024)),
-                insertion_order: Vec::with_capacity(max_size.min(1024)),
+                insertion_order: VecDeque::with_capacity(max_size.min(1024)),
             }),
             ttl,
             max_size,
@@ -81,9 +81,8 @@ impl MessageCache {
 
         // Evict oldest if still over capacity
         while inner.entries.len() >= self.max_size {
-            if let Some((old_id, _)) = inner.insertion_order.first().cloned() {
+            if let Some((old_id, _)) = inner.insertion_order.pop_front() {
                 inner.entries.remove(&old_id);
-                inner.insertion_order.remove(0);
             } else {
                 break;
             }
@@ -98,7 +97,7 @@ impl MessageCache {
                 access_count: 0,
             },
         );
-        inner.insertion_order.push((id, now));
+        inner.insertion_order.push_back((id, now));
     }
 
     /// Get a message from the cache.

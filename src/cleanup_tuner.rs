@@ -896,9 +896,14 @@ impl CleanupTuner {
             Duration::ZERO
         };
 
-        let final_interval = base_interval
-            .max(min_ttl_interval)
-            .max(self.config.min_interval);
+        let final_interval = if matches!(&reason, CleanupReason::CriticalUtilization { backpressure } if matches!(backpressure, BackpressureHint::BlockNew | BackpressureHint::DropMost))
+        {
+            base_interval.max(min_ttl_interval) // Skip min_interval clamp for extreme pressure
+        } else {
+            base_interval
+                .max(min_ttl_interval)
+                .max(self.config.min_interval)
+        };
 
         CleanupParameters {
             interval: final_interval,
@@ -990,7 +995,7 @@ impl CleanupTuner {
     pub fn stats(&self) -> CleanupStats {
         let mut state = self.state.lock();
         let avg_duration = if state.cleanup_cycles > 0 {
-            state.total_cleanup_duration / state.cleanup_cycles as u32
+            state.total_cleanup_duration / (state.cleanup_cycles.min(u32::MAX as u64) as u32)
         } else {
             Duration::ZERO
         };

@@ -24,6 +24,78 @@
 
 use std::time::{Duration, Instant};
 
+/// Configuration for health check thresholds.
+///
+/// Controls when the protocol is considered degraded or unhealthy.
+/// All rate thresholds are in the range 0.0 to 1.0.
+///
+/// ## Example
+///
+/// ```
+/// use memberlist_plumtree::HealthConfig;
+///
+/// let config = HealthConfig {
+///     graft_failure_rate_unhealthy: 0.9,
+///     min_peers_degraded: 5,
+///     ..HealthConfig::default()
+/// };
+/// ```
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct HealthConfig {
+    /// Graft failure rate threshold for Unhealthy status (0.0-1.0).
+    ///
+    /// When the graft failure rate exceeds this value, the protocol is
+    /// considered unhealthy.
+    ///
+    /// Default: 0.8
+    pub graft_failure_rate_unhealthy: f64,
+
+    /// Graft failure rate threshold for Degraded status (0.0-1.0).
+    ///
+    /// When the graft failure rate exceeds this value (but is below
+    /// the unhealthy threshold), the protocol is considered degraded.
+    ///
+    /// Default: 0.3
+    pub graft_failure_rate_degraded: f64,
+
+    /// Pending grafts threshold for Degraded status.
+    ///
+    /// When the number of pending grafts exceeds this value, the protocol
+    /// is considered degraded.
+    ///
+    /// Default: 50
+    pub pending_grafts_degraded: usize,
+
+    /// Cache utilization threshold for Degraded status (0.0-1.0).
+    ///
+    /// When cache utilization exceeds this value, the protocol is
+    /// considered degraded.
+    ///
+    /// Default: 0.95
+    pub cache_utilization_degraded: f64,
+
+    /// Minimum peer count below which status is Degraded.
+    ///
+    /// When the total peer count falls below this value, the protocol
+    /// is considered degraded.
+    ///
+    /// Default: 3
+    pub min_peers_degraded: usize,
+}
+
+impl Default for HealthConfig {
+    fn default() -> Self {
+        Self {
+            graft_failure_rate_unhealthy: 0.8,
+            graft_failure_rate_degraded: 0.3,
+            pending_grafts_degraded: 50,
+            cache_utilization_degraded: 0.95,
+            min_peers_degraded: 3,
+        }
+    }
+}
+
 /// Overall health status of the Plumtree protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HealthStatus {
@@ -84,14 +156,16 @@ pub struct HealthReport {
 }
 
 impl HealthReport {
-    /// Create a new health report.
+    /// Create a new health report using the provided health configuration thresholds.
     pub fn new(
         peers: PeerHealth,
         delivery: DeliveryHealth,
         cache: CacheHealth,
         is_shutdown: bool,
+        health_config: &HealthConfig,
     ) -> Self {
-        let (status, message) = Self::compute_status(&peers, &delivery, is_shutdown);
+        let (status, message) =
+            Self::compute_status(&peers, &delivery, &cache, is_shutdown, health_config);
 
         Self {
             status,
@@ -108,7 +182,9 @@ impl HealthReport {
     fn compute_status(
         peers: &PeerHealth,
         delivery: &DeliveryHealth,
+        cache: &CacheHealth,
         is_shutdown: bool,
+        config: &HealthConfig,
     ) -> (HealthStatus, String) {
         if is_shutdown {
             return (
@@ -122,7 +198,7 @@ impl HealthReport {
             return (HealthStatus::Unhealthy, "No peers connected".to_string());
         }
 
-        if delivery.graft_failure_rate > 0.8 {
+        if delivery.graft_failure_rate > config.graft_failure_rate_unhealthy {
             return (
                 HealthStatus::Unhealthy,
                 format!(
@@ -140,7 +216,7 @@ impl HealthReport {
             );
         }
 
-        if delivery.graft_failure_rate > 0.3 {
+        if delivery.graft_failure_rate > config.graft_failure_rate_degraded {
             return (
                 HealthStatus::Degraded,
                 format!(
@@ -150,7 +226,7 @@ impl HealthReport {
             );
         }
 
-        if delivery.pending_grafts > 50 {
+        if delivery.pending_grafts > config.pending_grafts_degraded {
             return (
                 HealthStatus::Degraded,
                 format!(
@@ -160,7 +236,23 @@ impl HealthReport {
             );
         }
 
-        if peers.total_peers < 3 {
+        // Check cache utilization
+        if cache.max_capacity > 0 {
+            let utilization = cache.cached_messages as f64 / cache.max_capacity as f64;
+            if utilization > config.cache_utilization_degraded {
+                return (
+                    HealthStatus::Degraded,
+                    format!(
+                        "Cache nearly full: {:.0}% utilization ({}/{})",
+                        utilization * 100.0,
+                        cache.cached_messages,
+                        cache.max_capacity
+                    ),
+                );
+            }
+        }
+
+        if peers.total_peers < config.min_peers_degraded {
             return (
                 HealthStatus::Degraded,
                 format!("Low peer count: {} peers", peers.total_peers),
@@ -288,6 +380,7 @@ pub struct HealthReportBuilder {
     max_cache_capacity: usize,
     cache_ttl: Duration,
     is_shutdown: bool,
+    health_config: Option<HealthConfig>,
 }
 
 impl HealthReportBuilder {
@@ -327,6 +420,14 @@ impl HealthReportBuilder {
         self
     }
 
+    /// Set the health configuration for threshold evaluation.
+    ///
+    /// If not set, [`HealthConfig::default()`] is used.
+    pub fn with_health_config(mut self, config: HealthConfig) -> Self {
+        self.health_config = Some(config);
+        self
+    }
+
     /// Build the health report.
     pub fn build(self) -> HealthReport {
         let peers = PeerHealth {
@@ -348,7 +449,8 @@ impl HealthReportBuilder {
             ttl: self.cache_ttl,
         };
 
-        HealthReport::new(peers, delivery, cache, self.is_shutdown)
+        let health_config = self.health_config.unwrap_or_default();
+        HealthReport::new(peers, delivery, cache, self.is_shutdown, &health_config)
     }
 }
 

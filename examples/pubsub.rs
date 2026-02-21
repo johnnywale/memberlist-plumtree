@@ -287,6 +287,12 @@ impl PlumtreeDelegate<NodeId> for PubSubDelegate {
             return;
         };
 
+        // Check subscription - use blocking_read since on_deliver is sync
+        if !self.subscriptions.blocking_read().contains(&msg.topic) {
+            self.stats.record_filtered();
+            return;
+        }
+
         let node_id = self.node_id;
         let stats = self.stats.clone();
         let topic = msg.topic.clone();

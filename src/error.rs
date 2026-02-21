@@ -220,6 +220,8 @@ impl Error {
     /// Check if this is a rate limiting or resource exhaustion error.
     pub fn is_resource_exhausted(&self) -> bool {
         match self {
+            // String matching is a fallback for async_channel errors which don't have
+            // structured error variants for capacity issues
             Error::Channel(msg) => msg.contains("full") || msg.contains("capacity"),
             Error::QueueFull { .. } => true,
             Error::NoPeers => true,

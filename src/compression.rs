@@ -584,4 +584,79 @@ mod tests {
         stats.record(100, 100); // No benefit
         assert_eq!(stats.messages_skipped, 1);
     }
+
+    #[test]
+    fn test_compress_decompress_payload_no_compression() {
+        let config = CompressionConfig::default(); // disabled
+        let original = b"Hello, world!";
+
+        let (compressed, stats) = compress_payload(original, &config);
+        assert!(stats.is_none(), "No compression stats when disabled");
+
+        let decompressed = decompress_payload(&compressed).unwrap();
+        assert_eq!(decompressed.as_ref(), original);
+    }
+
+    #[cfg(feature = "compression")]
+    #[test]
+    fn test_compress_decompress_payload_zstd_end_to_end() {
+        let config = CompressionConfig::zstd(3).with_min_size(10);
+
+        // Create a payload large enough to trigger compression and benefit from it
+        let original: Vec<u8> = (0..500)
+            .flat_map(|_| b"repetitive data for compression test ".iter().copied())
+            .collect();
+
+        let (compressed, stats) = compress_payload(&original, &config);
+
+        // Should have compression stats since payload exceeds min_size
+        assert!(stats.is_some(), "Should compress data above threshold");
+        let (orig_size, compressed_size) = stats.unwrap();
+        assert_eq!(orig_size, original.len());
+        assert!(
+            compressed_size < original.len(),
+            "Compressed size {} should be less than original {}",
+            compressed_size,
+            original.len()
+        );
+
+        // Decompress and verify round-trip
+        let decompressed = decompress_payload(&compressed).unwrap();
+        assert_eq!(decompressed.as_ref(), original.as_slice());
+    }
+
+    #[cfg(feature = "compression")]
+    #[test]
+    fn test_compress_decompress_payload_gzip_end_to_end() {
+        let config = CompressionConfig::gzip(6).with_min_size(10);
+
+        let original: Vec<u8> = (0..500)
+            .flat_map(|_| b"repetitive data for gzip test ".iter().copied())
+            .collect();
+
+        let (compressed, stats) = compress_payload(&original, &config);
+        assert!(stats.is_some(), "Should compress data above threshold");
+
+        let decompressed = decompress_payload(&compressed).unwrap();
+        assert_eq!(decompressed.as_ref(), original.as_slice());
+    }
+
+    #[cfg(feature = "compression")]
+    #[test]
+    fn test_compress_payload_below_threshold_skips_compression() {
+        let config = CompressionConfig::zstd(3).with_min_size(1000);
+
+        // Payload is below min_payload_size
+        let original = b"small payload";
+
+        let (compressed, stats) = compress_payload(original, &config);
+        assert!(
+            stats.is_none(),
+            "Should skip compression for small payloads"
+        );
+
+        // Should still decompress correctly (passes through uncompressed)
+        let decompressed = decompress_payload(&compressed).unwrap();
+        assert_eq!(decompressed.as_ref(), original.as_slice());
+    }
 }

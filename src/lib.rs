@@ -140,7 +140,8 @@ pub use error::{Error, ErrorKind, Result};
 
 // Re-export health types
 pub use health::{
-    CacheHealth, DeliveryHealth, HealthReport, HealthReportBuilder, HealthStatus, PeerHealth,
+    CacheHealth, DeliveryHealth, HealthConfig, HealthReport, HealthReportBuilder, HealthStatus,
+    PeerHealth,
 };
 
 // Re-export message types

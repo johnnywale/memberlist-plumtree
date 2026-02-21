@@ -715,6 +715,8 @@ impl Default for AdaptiveBatcher {
 }
 
 impl Clone for AdaptiveBatcher {
+    /// Clone creates a new AdaptiveBatcher with fresh state.
+    /// Accumulated metrics (message counts, batch size adjustments) are reset.
     fn clone(&self) -> Self {
         Self {
             config: self.config.clone(),

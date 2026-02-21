@@ -139,10 +139,12 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sync")]
     fn test_noop_strategy_still_tracks_state() {
         let strategy = NoOpSyncStrategy::<u64, MemoryStore>::new();
 
         // Should still track messages for potential future use
+        // Note: SyncState::insert only computes hashes when the "sync" feature is enabled.
         let id = MessageId::new();
         strategy.record_message(id, b"test");
 

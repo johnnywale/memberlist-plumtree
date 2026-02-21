@@ -205,11 +205,11 @@ pub struct PooledTransport<T, I> {
     /// Configuration.
     config: PoolConfig,
     /// Per-peer state.
-    peers: Mutex<HashMap<I, Arc<PeerState>>>,
+    peers: Arc<Mutex<HashMap<I, Arc<PeerState>>>>,
     /// Global concurrency semaphore.
     global_semaphore: Arc<Semaphore>,
     /// Statistics.
-    stats: PoolStatsInner,
+    stats: Arc<PoolStatsInner>,
 }
 
 /// Internal statistics tracking.
@@ -233,9 +233,9 @@ where
         Self {
             inner,
             config,
-            peers: Mutex::new(HashMap::new()),
+            peers: Arc::new(Mutex::new(HashMap::new())),
             global_semaphore,
-            stats: PoolStatsInner::default(),
+            stats: Arc::new(PoolStatsInner::default()),
         }
     }
 
@@ -372,9 +372,9 @@ where
         Self {
             inner: self.inner.clone(),
             config: self.config.clone(),
-            peers: Mutex::new(HashMap::new()),
-            global_semaphore: Arc::new(Semaphore::new(self.config.max_concurrent_global)),
-            stats: PoolStatsInner::default(),
+            peers: self.peers.clone(),
+            global_semaphore: self.global_semaphore.clone(),
+            stats: self.stats.clone(),
         }
     }
 }

@@ -3,7 +3,10 @@
 //! These tests verify the end-to-end behavior of Plumtree broadcast,
 //! including message delivery, deduplication, and tree repair.
 
+mod common;
+
 use bytes::{BufMut, Bytes};
+use common::eventually;
 use memberlist_plumtree::{
     MessageId, PeerTopology, Plumtree, PlumtreeConfig, PlumtreeDelegate, PlumtreeDiscovery,
     PlumtreeMessage,
@@ -1379,11 +1382,12 @@ async fn test_plumtree_memberlist_no_messages_after_disconnect() {
         .await
         .unwrap();
 
-    // Wait a bit for message propagation
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Node 2 should have received the second message (still connected)
-    assert_eq!(node2.delegate.delivered_count(), 2);
+    // Wait for message propagation
+    eventually(Duration::from_secs(5), || async {
+        node2.delegate.delivered_count() == 2
+    })
+    .await
+    .expect("node2 should have received the second message (still connected)");
 
     // Node 3 should NOT have received the second message directly from node 1
     // (though it might receive it from node 2 if node 2 forwards)
@@ -1491,16 +1495,16 @@ async fn test_plumtree_memberlist_chain_propagation() {
     // Start with chain topology instead of fully connected
     cluster.start_chain();
 
-    // Wait for chain topology to be established
-    // End nodes (1 and 5) have 1 peer, middle nodes have 2 peers
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
     let node1 = cluster.get_node(MemberlistNodeId(1)).unwrap();
     let node5 = cluster.get_node(MemberlistNodeId(5)).unwrap();
 
-    // Verify chain topology
-    assert_eq!(node1.pm.peers().topology().total(), 1); // Only knows node 2
-    assert_eq!(node5.pm.peers().topology().total(), 1); // Only knows node 4
+    // Wait for chain topology to be established
+    // End nodes (1 and 5) have 1 peer, middle nodes have 2 peers
+    eventually(Duration::from_secs(5), || async {
+        node1.pm.peers().topology().total() == 1 && node5.pm.peers().topology().total() == 1
+    })
+    .await
+    .expect("chain topology should be established (end nodes have 1 peer each)");
 
     // Node 1 broadcasts
     let msg_id = node1
@@ -1609,19 +1613,25 @@ async fn test_plumtree_memberlist_dynamic_peer_join() {
         .broadcast(Bytes::from("before join"))
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
 
-    assert_eq!(node2.delegate.delivered_count(), 1);
+    eventually(Duration::from_secs(5), || async {
+        node2.delegate.delivered_count() == 1
+    })
+    .await
+    .expect("node2 should receive 1 message");
+
     assert_eq!(node3.delegate.delivered_count(), 0); // Not connected yet
 
     // Now add node 3 to the network
     node2.pm.add_peer(MemberlistNodeId(3));
     node3.pm.add_peer(MemberlistNodeId(2));
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
     // Verify node 3 is now connected
-    assert_eq!(node3.pm.peers().topology().total(), 1);
+    eventually(Duration::from_secs(5), || async {
+        node3.pm.peers().topology().total() == 1
+    })
+    .await
+    .expect("node3 should have 1 peer after joining the network");
 
     // Broadcast from node 1 - now node 3 should also receive via node 2
     let _msg_id2 = node1.pm.broadcast(Bytes::from("after join")).await.unwrap();
@@ -1694,7 +1704,14 @@ async fn test_plumtree_memberlist_10_nodes_max_peers_6() {
     }
 
     // Wait for topology to stabilize
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    eventually(Duration::from_secs(5), || async {
+        nodes.iter().all(|node| {
+            let topo = node.pm.peers().topology();
+            topo.total() <= max_peers && topo.total() >= eager_fanout
+        })
+    })
+    .await
+    .expect("all nodes should have between eager_fanout and max_peers peers");
 
     // Verify each node has at most 6 peers (due to max_peers constraint)
     for node in &nodes {

@@ -2037,6 +2037,7 @@ dependencies = [
  "bytes",
  "crossbeam-queue",
  "crossterm",
+ "event-listener",
  "flate2",
  "futures",
  "futures-timer",

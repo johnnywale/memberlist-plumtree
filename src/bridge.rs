@@ -76,6 +76,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -440,10 +441,19 @@ where
             pm_incoming.run_incoming_processor().await;
         });
 
+        // 6. Create shutdown flag and function for graceful shutdown
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let pm_shutdown = self.pm.clone();
+        let shutdown_fn: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            pm_shutdown.shutdown();
+        });
+
         BridgeTaskHandle {
             routing_handle,
             runner_handle,
             incoming_handle,
+            shutdown,
+            shutdown_fn,
         }
     }
 }
@@ -628,19 +638,81 @@ pub struct BridgeTaskHandle {
     routing_handle: tokio::task::JoinHandle<()>,
     runner_handle: tokio::task::JoinHandle<()>,
     incoming_handle: tokio::task::JoinHandle<()>,
+    /// Shutdown flag shared with the bridge.
+    shutdown: Arc<AtomicBool>,
+    /// Type-erased shutdown function that triggers PlumtreeDiscovery shutdown.
+    /// This closes internal channels, causing background tasks to exit gracefully.
+    shutdown_fn: Arc<dyn Fn() + Send + Sync>,
 }
 
 #[cfg(feature = "tokio")]
 impl BridgeTaskHandle {
-    /// Stop all background tasks.
+    /// Stop all background tasks by signaling shutdown and then aborting.
     ///
-    /// This aborts the routing, runner, and incoming processor tasks.
+    /// This first signals the shutdown flag and triggers graceful shutdown
+    /// of internal channels, then immediately aborts any remaining tasks.
+    /// For a graceful shutdown with a timeout, use [`stop_graceful()`](Self::stop_graceful).
+    ///
     /// After calling this, you should also call `bridge.shutdown()` to
     /// clean up the underlying Plumtree instance.
     pub fn stop(&self) {
+        self.shutdown.store(true, Ordering::Release);
+        (self.shutdown_fn)();
+        self.abort();
+    }
+
+    /// Abort all background tasks immediately without signaling shutdown.
+    ///
+    /// This forcibly cancels the routing, runner, and incoming processor tasks
+    /// without giving them a chance to complete in-progress work.
+    /// Prefer [`stop()`](Self::stop) or [`stop_graceful()`](Self::stop_graceful) instead.
+    pub fn abort(&self) {
         self.routing_handle.abort();
         self.runner_handle.abort();
         self.incoming_handle.abort();
+    }
+
+    /// Stop all background tasks gracefully with a timeout fallback.
+    ///
+    /// This first signals shutdown by setting the shutdown flag and closing
+    /// internal channels, then waits for tasks to complete within the given
+    /// timeout. If tasks don't finish in time, they are forcibly aborted.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - Maximum time to wait for graceful shutdown before aborting.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let handle = bridge.start(&router).await;
+    ///
+    /// // ... use the bridge ...
+    ///
+    /// // Graceful shutdown with 1 second timeout
+    /// handle.stop_graceful(Duration::from_secs(1)).await;
+    /// bridge.shutdown();
+    /// ```
+    pub async fn stop_graceful(&self, timeout: Duration) {
+        // Signal shutdown
+        self.shutdown.store(true, Ordering::Release);
+        (self.shutdown_fn)();
+
+        // Poll for task completion with timeout
+        let start = tokio::time::Instant::now();
+        loop {
+            if self.is_finished() {
+                return;
+            }
+            if start.elapsed() >= timeout {
+                // Timeout exceeded - abort remaining tasks
+                self.abort();
+                // Yield to let the runtime process cancellations
+                tokio::task::yield_now().await;
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     /// Check if all tasks are finished.
@@ -650,6 +722,11 @@ impl BridgeTaskHandle {
         self.routing_handle.is_finished()
             && self.runner_handle.is_finished()
             && self.incoming_handle.is_finished()
+    }
+
+    /// Check if shutdown has been signaled.
+    pub fn is_shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::Acquire)
     }
 
     /// Wait for all tasks to complete.
@@ -779,9 +856,15 @@ pub mod persistence {
     /// Atomically update the peer persistence file.
     ///
     /// Writes to a temp file first, then renames to avoid corruption.
+    /// On Windows, `fs::rename` fails if the target already exists,
+    /// so we remove it first.
     pub fn save_peers_atomic(path: &Path, peers: &[SocketAddr]) -> Result<(), PersistenceError> {
         let temp_path = path.with_extension("tmp");
         save_peers(&temp_path, peers)?;
+        // On Windows, rename fails if target exists; remove it first
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
         fs::rename(&temp_path, path)?;
         Ok(())
     }
@@ -807,7 +890,7 @@ pub struct LazarusStats {
 /// Handle for controlling the Lazarus background task.
 #[derive(Clone)]
 pub struct LazarusHandle {
-    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    shutdown: Arc<AtomicBool>,
     stats: Arc<parking_lot::RwLock<LazarusStats>>,
 }
 
@@ -815,20 +898,19 @@ impl LazarusHandle {
     /// Create a new Lazarus handle.
     fn new() -> Self {
         Self {
-            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            shutdown: Arc::new(AtomicBool::new(false)),
             stats: Arc::new(parking_lot::RwLock::new(LazarusStats::default())),
         }
     }
 
     /// Signal the Lazarus task to shutdown.
     pub fn shutdown(&self) {
-        self.shutdown
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.shutdown.store(true, Ordering::Release);
     }
 
     /// Check if shutdown has been requested.
     pub fn is_shutdown(&self) -> bool {
-        self.shutdown.load(std::sync::atomic::Ordering::Acquire)
+        self.shutdown.load(Ordering::Acquire)
     }
 
     /// Get current Lazarus statistics.
@@ -1179,5 +1261,76 @@ mod tests {
         bridge1.shutdown();
         bridge2.shutdown();
         bridge3.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_bridge_stop_graceful() {
+        let router = BridgeRouter::<u64>::new();
+        let bridge = PlumtreeBridge::create(1u64, PlumtreeConfig::lan(), NoopDelegate);
+
+        // Start the bridge
+        let handle = bridge.start(&router).await;
+
+        // Tasks should be running
+        assert!(!handle.is_finished());
+        assert!(!handle.is_shutdown());
+
+        // Graceful stop with short timeout (will fall back to abort since
+        // background tasks have long sleep intervals, but the mechanism works)
+        handle.stop_graceful(Duration::from_millis(200)).await;
+
+        // After graceful stop, shutdown should be signaled and tasks finished
+        assert!(handle.is_shutdown());
+        assert!(handle.is_finished());
+
+        // Bridge should also be shutdown (shutdown_fn calls pm.shutdown())
+        assert!(bridge.is_shutdown());
+
+        // Cleanup
+        router.unregister(&1u64).await;
+    }
+
+    #[tokio::test]
+    async fn test_bridge_abort() {
+        let router = BridgeRouter::<u64>::new();
+        let bridge = PlumtreeBridge::create(1u64, PlumtreeConfig::default(), NoopDelegate);
+
+        // Start the bridge
+        let handle = bridge.start(&router).await;
+
+        // abort() should not set shutdown flag
+        handle.abort();
+
+        // Give tasks a moment to be cancelled
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Tasks should be finished (aborted)
+        assert!(handle.is_finished());
+
+        // But shutdown flag was not set by abort()
+        assert!(!handle.is_shutdown());
+
+        // Cleanup
+        bridge.shutdown();
+        router.unregister(&1u64).await;
+    }
+
+    #[tokio::test]
+    async fn test_bridge_stop_sets_shutdown_flag() {
+        let router = BridgeRouter::<u64>::new();
+        let bridge = PlumtreeBridge::create(1u64, PlumtreeConfig::default(), NoopDelegate);
+
+        // Start the bridge
+        let handle = bridge.start(&router).await;
+
+        // stop() should set shutdown flag
+        handle.stop();
+        assert!(handle.is_shutdown());
+
+        // Bridge should also be shutdown (shutdown_fn calls pm.shutdown())
+        assert!(bridge.is_shutdown());
+
+        // Cleanup
+        router.unregister(&1u64).await;
     }
 }

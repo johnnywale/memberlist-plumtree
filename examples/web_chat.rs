@@ -829,13 +829,14 @@ async fn main() {
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     // Print cluster status
-    let seed_members = nodes[0]
-        .read()
-        .await
-        .stack
-        .as_ref()
-        .map(|s| futures::executor::block_on(s.num_members()))
-        .unwrap_or(0);
+    let seed_members = {
+        let node_guard = nodes[0].read().await;
+        if let Some(ref stack) = node_guard.stack {
+            stack.num_members().await
+        } else {
+            0
+        }
+    };
     println!(
         "Cluster formed with {} members discovered by seed",
         seed_members

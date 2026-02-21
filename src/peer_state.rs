@@ -390,7 +390,7 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
     }
 
     /// Get or compute the sorted ring from known_peers + local_id.
-    fn get_or_compute_ring(&self, inner: &PeerStateInner<I>) -> Vec<I> {
+    fn get_or_compute_ring(&self, inner: &mut PeerStateInner<I>) -> Vec<I> {
         if let Some(ref cached) = inner.cached_ring {
             return cached.clone();
         }
@@ -399,7 +399,9 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
         if let Some(ref local) = self.local_id {
             all.push(local.clone());
         }
-        sort_by_hash_stable(&all)
+        let ring = sort_by_hash_stable(&all);
+        inner.cached_ring = Some(ring.clone());
+        ring
     }
 
     /// Compute ring neighbors for the local node.
@@ -407,7 +409,7 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
     /// - 0: No protection
     /// - 2: Adjacent (i±1)
     /// - 4: Adjacent + second-nearest (i±1, i±2)
-    fn compute_ring_neighbors(&self, inner: &PeerStateInner<I>) -> HashSet<I> {
+    fn compute_ring_neighbors(&self, inner: &mut PeerStateInner<I>) -> HashSet<I> {
         // Only compute ring neighbors when hash ring is explicitly enabled
         // and protection is enabled
         if !self.use_hash_ring || !self.protect_ring_neighbors || self.max_protected_neighbors == 0
@@ -653,9 +655,9 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
     /// Returns None if local_id is not set.
     pub fn hash_ring_neighbors(&self) -> Option<Vec<(I, HashRingConnection)>> {
         let local_id = self.local_id.as_ref()?;
-        let inner = self.inner.read();
+        let mut inner = self.inner.write();
 
-        let sorted_ring = self.get_or_compute_ring(&inner);
+        let sorted_ring = self.get_or_compute_ring(&mut inner);
         let ring_size = sorted_ring.len();
 
         if ring_size <= 1 {
@@ -1352,7 +1354,7 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
                 // Promote lazy peers to eager
                 let promote_count = (target_eager - current_eager).min(inner.lazy.len());
                 let to_promote =
-                    self.select_peers_for_promotion_scored(&inner, promote_count, &scorer);
+                    self.select_peers_for_promotion_scored(&mut inner, promote_count, &scorer);
 
                 for peer in to_promote {
                     inner.lazy.remove(&peer);
@@ -1376,7 +1378,7 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
     /// The `scorer` closure provides the network performance score (0.0-1.0).
     fn select_peers_for_promotion_scored<F>(
         &self,
-        inner: &PeerStateInner<I>,
+        inner: &mut PeerStateInner<I>,
         count: usize,
         scorer: &F,
     ) -> Vec<I>
@@ -1517,7 +1519,8 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
         if current_eager < target_eager {
             // Need to promote some lazy peers to eager
             let promote_count = target_eager - current_eager;
-            let to_promote = self.select_peers_for_promotion_scored(&inner, promote_count, &scorer);
+            let to_promote =
+                self.select_peers_for_promotion_scored(&mut inner, promote_count, &scorer);
 
             for peer in to_promote {
                 inner.lazy.remove(&peer);
@@ -1531,7 +1534,8 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
             // Need to demote some eager peers to lazy
             // Ring neighbors are protected
             let demote_count = current_eager - target_eager;
-            let to_demote = self.select_peers_for_demotion_scored(&inner, demote_count, &scorer);
+            let to_demote =
+                self.select_peers_for_demotion_scored(&mut inner, demote_count, &scorer);
 
             for peer in to_demote {
                 inner.eager.remove(&peer);
@@ -1552,7 +1556,7 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
     /// Ring neighbors are always protected.
     fn select_peers_for_demotion_scored<F>(
         &self,
-        inner: &PeerStateInner<I>,
+        inner: &mut PeerStateInner<I>,
         count: usize,
         scorer: &F,
     ) -> Vec<I>
@@ -1600,7 +1604,7 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
     ///
     /// - topology_score: 1.0 for immediate neighbor, decays with ring distance
     /// - network_score: From scorer closure (0.0-1.0, higher = better RTT/reliability)
-    fn calculate_hybrid_score<F>(&self, peer: &I, inner: &PeerStateInner<I>, scorer: &F) -> f64
+    fn calculate_hybrid_score<F>(&self, peer: &I, inner: &mut PeerStateInner<I>, scorer: &F) -> f64
     where
         F: Fn(&I) -> f64,
     {
@@ -1659,7 +1663,11 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
     }
 
     /// Calculate hash ring distance without acquiring read lock (for use when holding write lock).
-    fn hash_ring_distance_internal(&self, peer: &I, inner: &PeerStateInner<I>) -> Option<usize> {
+    fn hash_ring_distance_internal(
+        &self,
+        peer: &I,
+        inner: &mut PeerStateInner<I>,
+    ) -> Option<usize> {
         let local_id = self.local_id.as_ref()?;
 
         if !inner.known_peers.contains(peer) {
@@ -1699,7 +1707,7 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
         }
 
         let peer_to_promote = if let Some(local_id) = &self.local_id {
-            let sorted_ring = self.get_or_compute_ring(&inner);
+            let sorted_ring = self.get_or_compute_ring(&mut inner);
             let ring_size = sorted_ring.len();
 
             if let Some(local_pos) = find_position_in_ring(&sorted_ring, local_id) {
@@ -1753,13 +1761,13 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
     /// This can be used to prioritize topology decisions.
     pub fn hash_ring_distance(&self, peer: &I) -> Option<usize> {
         let local_id = self.local_id.as_ref()?;
-        let inner = self.inner.read();
+        let mut inner = self.inner.write();
 
         if !inner.known_peers.contains(peer) {
             return None;
         }
 
-        let sorted_ring = self.get_or_compute_ring(&inner);
+        let sorted_ring = self.get_or_compute_ring(&mut inner);
         let ring_size = sorted_ring.len();
 
         let local_pos = find_position_in_ring(&sorted_ring, local_id)?;

@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use crate::compression::CompressionConfig;
+use crate::health::HealthConfig;
 use crate::priority::PriorityConfig;
 
 /// Configuration options for the Plumtree protocol.
@@ -261,6 +262,14 @@ pub struct PlumtreeConfig {
     /// Default: enabled with weighted fair scheduling
     #[cfg_attr(feature = "serde", serde(default))]
     pub priority: PriorityConfig,
+
+    /// Health check threshold configuration.
+    ///
+    /// Controls when the protocol reports degraded or unhealthy status.
+    ///
+    /// Default: [`HealthConfig::default()`]
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub health: HealthConfig,
 }
 
 impl Default for PlumtreeConfig {
@@ -292,6 +301,7 @@ impl Default for PlumtreeConfig {
             storage: None,
             compression: CompressionConfig::default(),
             priority: PriorityConfig::default(),
+            health: HealthConfig::default(),
         }
     }
 }
@@ -337,6 +347,7 @@ impl PlumtreeConfig {
             storage: None,
             compression: CompressionConfig::default(), // Disabled for LAN
             priority: PriorityConfig::default(),
+            health: HealthConfig::default(),
         }
     }
 
@@ -381,6 +392,7 @@ impl PlumtreeConfig {
                 min_payload_size: 256,
             },
             priority: PriorityConfig::default(),
+            health: HealthConfig::default(),
         }
     }
 
@@ -419,6 +431,7 @@ impl PlumtreeConfig {
             storage: None,
             compression: CompressionConfig::default(),
             priority: PriorityConfig::default(),
+            health: HealthConfig::default(),
         }
     }
 
@@ -464,6 +477,7 @@ impl PlumtreeConfig {
                 min_payload_size: 256,
             },
             priority: PriorityConfig::default(),
+            health: HealthConfig::default(),
         }
     }
 
@@ -503,6 +517,7 @@ impl PlumtreeConfig {
             storage: None,
             compression: CompressionConfig::default(),
             priority: PriorityConfig::default(),
+            health: HealthConfig::default(),
         }
     }
 
@@ -766,6 +781,58 @@ impl PlumtreeConfig {
     pub fn with_compression(mut self, compression: CompressionConfig) -> Self {
         self.compression = compression;
         self
+    }
+
+    /// Set the health check threshold configuration (builder pattern).
+    ///
+    /// Controls when the protocol reports degraded or unhealthy status.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use memberlist_plumtree::{PlumtreeConfig, HealthConfig};
+    ///
+    /// let config = PlumtreeConfig::default()
+    ///     .with_health(HealthConfig {
+    ///         graft_failure_rate_unhealthy: 0.9,
+    ///         min_peers_degraded: 5,
+    ///         ..HealthConfig::default()
+    ///     });
+    /// ```
+    pub fn with_health(mut self, health: HealthConfig) -> Self {
+        self.health = health;
+        self
+    }
+
+    /// Validate the configuration.
+    ///
+    /// Returns an error string if any parameter is invalid.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.eager_fanout == 0 {
+            return Err("eager_fanout must be > 0".into());
+        }
+        if self.lazy_fanout == 0 {
+            return Err("lazy_fanout must be > 0".into());
+        }
+        if self.graft_timeout.is_zero() {
+            return Err("graft_timeout must be > 0".into());
+        }
+        if self.ihave_interval.is_zero() {
+            return Err("ihave_interval must be > 0".into());
+        }
+        if self.message_cache_max_size == 0 {
+            return Err("message_cache_max_size must be > 0".into());
+        }
+        if self.message_cache_ttl.is_zero() {
+            return Err("message_cache_ttl must be > 0".into());
+        }
+        if self.ihave_batch_size == 0 {
+            return Err("ihave_batch_size must be > 0".into());
+        }
+        if self.max_message_size == 0 {
+            return Err("max_message_size must be > 0".into());
+        }
+        Ok(())
     }
 }
 

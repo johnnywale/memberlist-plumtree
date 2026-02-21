@@ -1575,18 +1575,15 @@ async fn test_ring_topology_node_removal() {
     let (removed_id, _) = cluster.kill_node(3).await;
     println!("Removed node {}", removed_id);
 
-    // Wait for topology to adjust
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Verify ring reconnects - all remaining nodes should still have peers
-    for node in &cluster.nodes {
-        let stats = node.peer_stats();
-        assert!(
-            stats.eager_count > 0 || stats.lazy_count > 0,
-            "Node {} became isolated after ring node removal",
-            node.node_id
-        );
-    }
+    // Wait for topology to adjust - verify ring reconnects
+    eventually(Duration::from_secs(5), || async {
+        cluster
+            .nodes
+            .iter()
+            .all(|n| n.peer_stats().eager_count > 0 || n.peer_stats().lazy_count > 0)
+    })
+    .await
+    .expect("all remaining nodes should still have peers after ring node removal");
 
     // Broadcast should still work
     let msg2 = cluster.nodes[0]
@@ -2073,26 +2070,25 @@ async fn test_seen_map_saturation() {
     }
 
     // Wait for messages to propagate
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
-    // Verify system didn't panic or deadlock
-    // Check that most messages were delivered
-    let mut total_delivered = 0;
-    for (i, node) in cluster.nodes.iter().enumerate() {
-        let count = node.delegate.delivery_count();
-        println!("Node {} received {} messages", i, count);
-        total_delivered += count;
-    }
-
     // Each message should be delivered to (NUM_NODES - 1) nodes
     // Allow some tolerance for timing/race conditions
     let expected_min = (NUM_MESSAGES * (NUM_NODES - 1)) * 80 / 100; // 80% delivery rate
-    assert!(
-        total_delivered >= expected_min,
-        "Too few messages delivered: {} < {}",
-        total_delivered,
-        expected_min
-    );
+    eventually(Duration::from_secs(15), || async {
+        let total: usize = cluster
+            .nodes
+            .iter()
+            .map(|n| n.delegate.delivery_count())
+            .sum();
+        total >= expected_min
+    })
+    .await
+    .expect("at least 80% of messages should be delivered");
+
+    // Print delivery stats per node
+    for (i, node) in cluster.nodes.iter().enumerate() {
+        let count = node.delegate.delivery_count();
+        println!("Node {} received {} messages", i, count);
+    }
 
     // Verify nodes are still healthy
     for node in &cluster.nodes {

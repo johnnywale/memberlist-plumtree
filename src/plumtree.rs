@@ -13,7 +13,7 @@ use std::{
     fmt::Debug,
     hash::Hash,
     sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc,
     },
 };
@@ -449,6 +449,12 @@ struct PlumtreeInner<I, D> {
     /// - Cleanup iterates through shards one at a time, yielding between shards
     /// - This prevents the cleanup task from blocking all message processing
     seen: ShardedSeenMap<I>,
+
+    /// Counter for successful grafts (IHave -> Graft -> received message).
+    successful_grafts: AtomicU64,
+
+    /// Counter for failed grafts (max retries exceeded).
+    failed_grafts: AtomicU64,
 }
 
 impl<I: Clone, D> PlumtreeInner<I, D> {
@@ -602,6 +608,11 @@ where
     /// - `config`: Plumtree configuration
     /// - `delegate`: Event handler
     pub fn new(local_id: I, config: PlumtreeConfig, delegate: D) -> (Self, PlumtreeHandle<I>) {
+        // Validate configuration
+        if let Err(e) = config.validate() {
+            panic!("Invalid PlumtreeConfig: {}", e);
+        }
+
         // Initialize metrics descriptions (safe to call multiple times)
         #[cfg(feature = "metrics")]
         crate::metrics::init_metrics();
@@ -650,7 +661,11 @@ where
                 config.ihave_batch_size,
                 10000,
             )),
-            graft_timer: Arc::new(GraftTimer::new(config.graft_timeout)),
+            graft_timer: Arc::new(GraftTimer::with_backoff(
+                config.graft_timeout,
+                config.graft_timeout * 8,
+                config.graft_max_retries,
+            )),
             graft_rate_limiter,
             peer_scoring: Arc::new(PeerScoring::new(ScoringConfig::default())),
             cleanup_tuner: Arc::new(CleanupTuner::new(CleanupConfig::default())),
@@ -664,6 +679,8 @@ where
             outgoing_notify,
             incoming_tx,
             seen: ShardedSeenMap::new(),
+            successful_grafts: AtomicU64::new(0),
+            failed_grafts: AtomicU64::new(0),
         });
 
         let plumtree = Self {
@@ -779,11 +796,8 @@ where
         let cache_stats = self.inner.cache.stats();
         let pending_grafts = self.inner.graft_timer.pending_count();
 
-        // For now, we don't track successful/failed grafts in the struct
-        // This would need additional atomic counters to track properly
-        // For the initial implementation, we'll use 0/0 which results in 0% failure rate
-        let successful_grafts = 0_u64;
-        let failed_grafts = 0_u64;
+        let successful_grafts = self.inner.successful_grafts.load(Ordering::Relaxed);
+        let failed_grafts = self.inner.failed_grafts.load(Ordering::Relaxed);
 
         let total_peers = peer_stats.eager_count + peer_stats.lazy_count;
 
@@ -801,6 +815,7 @@ where
                 self.inner.config.message_cache_ttl,
             )
             .shutdown(self.inner.shutdown.load(Ordering::Acquire))
+            .with_health_config(self.inner.config.health.clone())
             .build()
     }
 
@@ -879,9 +894,15 @@ where
     /// New peers always start as lazy. They are promoted to eager
     /// via the Graft mechanism if needed.
     ///
-    /// This bypasses the `max_peers` limit check and auto-classification.
+    /// If `max_peers` is configured, the peer will not be added if the limit is reached.
     pub fn add_peer_lazy(&self, peer: I) {
         if peer != self.inner.local_id {
+            if let Some(max) = self.inner.config.max_peers {
+                let stats = self.inner.peers.stats();
+                if stats.eager_count + stats.lazy_count >= max {
+                    return;
+                }
+            }
             self.inner.peers.add_peer(peer.clone());
 
             #[cfg(feature = "metrics")]
@@ -1038,12 +1059,13 @@ where
             // Still return the message ID since it was cached and IHave was queued.
             // The message can still reach peers via lazy push (IHave/Graft).
             // But warn the caller about backpressure so they can throttle.
-            if dropped_count == eager_count {
-                // All messages dropped - this is severe backpressure
-                return Err(Error::QueueFull {
-                    dropped: dropped_count,
-                    capacity: self.inner.config.priority.queue_depths.iter().sum(),
-                });
+            if dropped_count == eager_count && eager_count > 0 {
+                // All eager messages dropped - severe backpressure
+                // Message still propagates via lazy path (IHave was queued above)
+                warn!(
+                    message_id = %msg_id,
+                    "all eager pushes dropped due to backpressure, relying on lazy path"
+                );
             }
         }
 
@@ -1130,6 +1152,7 @@ where
         if self.inner.graft_timer.message_received(&msg_id) {
             // Record graft success for adaptive batcher to adjust batch sizes
             self.inner.adaptive_batcher.record_graft_received();
+            self.inner.successful_grafts.fetch_add(1, Ordering::Relaxed);
         }
 
         // Check if already seen and track parent atomically (single shard lock)
@@ -1455,8 +1478,7 @@ where
     pub async fn run_ihave_scheduler(&self) {
         info!("IHave scheduler started with adaptive batching");
         let ihave_interval = self.inner.config.ihave_interval;
-        // Check for early flush more frequently (every 10ms)
-        let check_interval = std::time::Duration::from_millis(10);
+        let notifier = self.inner.scheduler.queue().notifier();
         let mut last_flush = std::time::Instant::now();
         let mut last_batch_size_update = std::time::Instant::now();
         let batch_size_update_interval = std::time::Duration::from_secs(5);
@@ -1490,8 +1512,14 @@ where
                 self.flush_ihave_batch().await;
                 last_flush = std::time::Instant::now();
             } else {
-                // Wait for a short check period before checking again
-                Delay::new(check_interval).await;
+                // Wait for either: a new item notification, or the interval to elapse.
+                // This replaces the previous 10ms polling loop with an event-driven
+                // approach that wakes immediately when new items are pushed.
+                let remaining = ihave_interval.saturating_sub(last_flush.elapsed());
+                let listen = notifier.listen();
+                let delay = Delay::new(remaining);
+                futures::pin_mut!(listen, delay);
+                futures::future::select(listen, delay).await;
             }
         }
     }
@@ -1604,6 +1632,7 @@ where
                 self.inner
                     .delegate
                     .on_graft_failed(&failed_graft.message_id, &failed_graft.original_peer);
+                self.inner.failed_grafts.fetch_add(1, Ordering::Relaxed);
 
                 #[cfg(feature = "metrics")]
                 crate::metrics::record_graft_failed();
@@ -2211,5 +2240,101 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(Error::MessageTooLarge { .. })));
+    }
+
+    /// Delegate that tracks on_graft_failed calls for testing.
+    struct GraftFailedTrackingDelegate {
+        delivered: parking_lot::Mutex<Vec<(MessageId, Bytes)>>,
+        graft_failed: parking_lot::Mutex<Vec<(MessageId, TestNodeId)>>,
+    }
+
+    impl GraftFailedTrackingDelegate {
+        fn new() -> Self {
+            Self {
+                delivered: parking_lot::Mutex::new(Vec::new()),
+                graft_failed: parking_lot::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn graft_failed_count(&self) -> usize {
+            self.graft_failed.lock().len()
+        }
+
+        fn graft_failed_entries(&self) -> Vec<(MessageId, TestNodeId)> {
+            self.graft_failed.lock().clone()
+        }
+    }
+
+    impl PlumtreeDelegate<TestNodeId> for GraftFailedTrackingDelegate {
+        fn on_deliver(&self, message_id: MessageId, payload: Bytes) {
+            self.delivered.lock().push((message_id, payload));
+        }
+
+        fn on_graft_failed(&self, message_id: &MessageId, peer: &TestNodeId) {
+            self.graft_failed.lock().push((*message_id, peer.clone()));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_on_graft_failed_after_max_retries() {
+        // Use very short graft timeout and low max retries for fast test
+        let config = PlumtreeConfig::default()
+            .with_graft_timeout(std::time::Duration::from_millis(20))
+            .with_graft_max_retries(2);
+        let delegate = Arc::new(GraftFailedTrackingDelegate::new());
+        let (plumtree, _handle) = Plumtree::new(TestNodeId(1), config, delegate.clone());
+
+        // Add a lazy peer that will send IHave
+        plumtree.add_peer_lazy(TestNodeId(2));
+
+        // Simulate receiving an IHave for a message we don't have.
+        // This triggers a Graft request and starts the graft timer.
+        let unknown_msg_id = MessageId::new();
+        plumtree
+            .handle_message(
+                TestNodeId(2),
+                PlumtreeMessage::IHave {
+                    message_ids: smallvec::smallvec![unknown_msg_id],
+                    round: 0,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Spawn the graft timer background task
+        let pt = plumtree.clone();
+        let graft_task = tokio::spawn(async move {
+            pt.run_graft_timer().await;
+        });
+
+        // Wait for the graft retries to exhaust without delivering the message.
+        // With graft_timeout=20ms, max_retries=2, and backoff:
+        //   retry_count starts at 1 (initial graft already sent)
+        //   The graft timer check_interval = graft_timeout / 2 = 10ms
+        //   retry 1 fires after ~20ms (base timeout)
+        //   retry_count becomes 2
+        //   retry 2 fires after ~40ms (2x backoff)
+        //   retry_count becomes 3 which exceeds max_retries=2 -> on_graft_failed
+        // Use async polling to avoid blocking the runtime.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if delegate.graft_failed_count() > 0 {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("on_graft_failed should be called after max retries exhausted");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // Verify the callback was called with correct parameters
+        let entries = delegate.graft_failed_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, unknown_msg_id);
+        assert_eq!(entries[0].1, TestNodeId(2));
+
+        // Shut down
+        plumtree.shutdown();
+        let _ = graft_task.await;
     }
 }

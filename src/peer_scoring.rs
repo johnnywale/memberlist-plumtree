@@ -267,7 +267,7 @@ impl PeerScore {
 
     /// Apply exponential decay to effective failure weight based on time elapsed.
     fn apply_decay(&mut self, now: Instant, config: &ScoringConfig) {
-        if self.effective_failure > 0.0 {
+        if self.effective_failure > 0.0 && config.failure_decay_halflife > 0.0 {
             let elapsed = now.duration_since(self.last_failure_update).as_secs_f64();
 
             if elapsed > 0.0 {

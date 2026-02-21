@@ -48,7 +48,7 @@
 mod common;
 
 use bytes::{Buf, BufMut, Bytes};
-use common::allocate_port;
+use common::{allocate_port, eventually};
 use memberlist::net::NetTransportOptions;
 use memberlist::tokio::{TokioRuntime, TokioSocketAddrResolver, TokioTcp};
 use memberlist::{Memberlist, Options as MemberlistOptions};
@@ -467,41 +467,28 @@ async fn test_e2e_autonomous_cluster_formation() {
     // 3. Execute JOIN - triggers automatic discovery
     node_b.join(seed_addr).await.expect("Join should succeed");
 
-    // 4. Wait for SWIM gossip to propagate
-    sleep(Duration::from_secs(2)).await;
+    // 4. Wait for SWIM gossip to propagate and verify memberlist discovered peers
+    eventually(Duration::from_secs(10), || async {
+        node_a.num_members().await >= 2 && node_b.num_members().await >= 2
+    })
+    .await
+    .expect("Memberlist should have discovered peers on both nodes");
 
-    // 5. Verify memberlist discovered peers
-    assert!(
-        node_a.num_members().await >= 2,
-        "Memberlist should have discovered Node B: got {} members",
-        node_a.num_members().await
-    );
-    assert!(
-        node_b.num_members().await >= 2,
-        "Memberlist should have discovered Node A: got {} members",
-        node_b.num_members().await
-    );
+    // 5. Wait for Plumtree topology to be AUTOMATICALLY updated
+    eventually(Duration::from_secs(10), || async {
+        let a_peers = node_a.peer_stats().eager_count + node_a.peer_stats().lazy_count;
+        let b_peers = node_b.peer_stats().eager_count + node_b.peer_stats().lazy_count;
+        a_peers >= 1 && b_peers >= 1
+    })
+    .await
+    .expect("Both nodes should have at least 1 Plumtree peer after memberlist discovery");
 
-    // 6. Verify Plumtree topology was AUTOMATICALLY updated
     let final_a_peers = node_a.peer_stats().eager_count + node_a.peer_stats().lazy_count;
     let final_b_peers = node_b.peer_stats().eager_count + node_b.peer_stats().lazy_count;
 
     tracing::info!(
         "Final state: Node A peers = {}, Node B peers = {}",
         final_a_peers,
-        final_b_peers
-    );
-
-    // The key assertion: after discovery, both nodes should have at least 1 peer
-    assert!(
-        final_a_peers >= 1,
-        "Node A should have at least 1 Plumtree peer after memberlist discovery (got {})",
-        final_a_peers
-    );
-
-    assert!(
-        final_b_peers >= 1,
-        "Node B should have at least 1 Plumtree peer after memberlist discovery (got {})",
         final_b_peers
     );
 
@@ -535,15 +522,12 @@ async fn test_e2e_zero_config_broadcast() {
         .expect("Failed to create Node C");
     node_c.join(seed_addr).await.expect("Join should succeed");
 
-    // Wait for cluster to stabilize
-    sleep(Duration::from_secs(3)).await;
-
-    // Verify 3-node cluster
-    assert!(
-        node_a.num_members().await >= 3,
-        "Should have 3 members: got {}",
-        node_a.num_members().await
-    );
+    // Wait for cluster to stabilize and verify 3-node cluster
+    eventually(Duration::from_secs(10), || async {
+        node_a.num_members().await >= 3
+    })
+    .await
+    .expect("Should have 3 members in the cluster");
 
     // Note: Actual broadcast propagation would require running the Plumtree
     // background tasks and having a transport. For now, we verify the topology
@@ -581,10 +565,11 @@ async fn test_e2e_self_healing() {
     node_c.join(seed_addr).await.expect("Join should succeed");
 
     // Wait for stable cluster
-    sleep(Duration::from_secs(3)).await;
-
-    let initial_members = node_a.num_members().await;
-    assert!(initial_members >= 3, "Should have 3 members initially");
+    eventually(Duration::from_secs(10), || async {
+        node_a.num_members().await >= 3
+    })
+    .await
+    .expect("Should have 3 members initially");
 
     // Simulate Node B failure (shutdown)
     node_b.shutdown().await;
@@ -940,15 +925,11 @@ async fn test_e2e_peer_topology_after_node_restart() {
     }
 
     // Wait for cluster to stabilize
-    sleep(Duration::from_secs(3)).await;
-
-    // Verify cluster formed with all 6 nodes
-    let member_count = nodes[0].num_members().await;
-    assert!(
-        member_count >= total,
-        "Should have 6 members, got {}",
-        member_count
-    );
+    eventually(Duration::from_secs(15), || async {
+        nodes[0].num_members().await >= total
+    })
+    .await
+    .expect(&format!("Should have {} members in the cluster", total));
 
     println!("\n=== Initial Topology ({} nodes) ===", total);
     for (i, node) in nodes.iter().enumerate() {
@@ -1727,15 +1708,11 @@ async fn test_e2e_lazarus_seed_recovery() {
     node_2.join(seed_addr).await.expect("Join should succeed");
 
     // Wait for cluster to stabilize
-    sleep(Duration::from_secs(2)).await;
-
-    // Verify cluster formed
-    let member_count = node_1.num_members().await;
-    assert!(
-        member_count >= 3,
-        "Should have 3 members, got {}",
-        member_count
-    );
+    eventually(Duration::from_secs(10), || async {
+        node_1.num_members().await >= 3
+    })
+    .await
+    .expect("Should have 3 members in the cluster");
 
     println!("\n=== Cluster Formed (3 nodes) ===");
 
@@ -1770,21 +1747,12 @@ async fn test_e2e_lazarus_seed_recovery() {
 
     println!("Initial Lazarus stats: probes=0, reconnections=0");
 
-    // Wait for first probe cycle to verify seed is alive
-    sleep(Duration::from_secs(3)).await;
-
-    // At this point, Lazarus should have checked and found seed alive (missing_seeds=0)
-    let stats_1 = handle_1.stats();
-    println!(
-        "After first cycle - Node 1: probes={}, missing_seeds={}",
-        stats_1.probes_sent, stats_1.missing_seeds
-    );
-
-    // Since seed is alive, no probes should have been sent
-    assert_eq!(
-        stats_1.missing_seeds, 0,
-        "Should have 0 missing seeds while seed is alive"
-    );
+    // Wait for first probe cycle to verify seed is alive (missing_seeds=0)
+    eventually(Duration::from_secs(10), || async {
+        handle_1.stats().missing_seeds == 0 && handle_1.stats().probes_sent == 0
+    })
+    .await
+    .expect("Should have 0 missing seeds while seed is alive");
 
     // 4. Shutdown the seed node
     println!("\n=== Shutting down seed node ===");
@@ -1792,7 +1760,13 @@ async fn test_e2e_lazarus_seed_recovery() {
 
     // 5. Wait for Lazarus to detect missing seed
     // Lazarus interval is 2s, so wait a few cycles
-    sleep(Duration::from_secs(5)).await;
+    eventually(Duration::from_secs(15), || async {
+        let s1 = handle_1.stats();
+        let s2 = handle_2.stats();
+        (s1.probes_sent + s2.probes_sent >= 1) && (s1.missing_seeds >= 1 || s2.missing_seeds >= 1)
+    })
+    .await
+    .expect("At least one node should have sent probes and report missing seed");
 
     // 6. Verify Lazarus stats show probes sent
     let stats_1 = handle_1.stats();
@@ -1805,20 +1779,6 @@ async fn test_e2e_lazarus_seed_recovery() {
     println!(
         "After seed shutdown - Node 2: probes={}, failures={}, missing_seeds={}",
         stats_2.probes_sent, stats_2.failures, stats_2.missing_seeds
-    );
-
-    // At least one node should have sent probes (or both)
-    let total_probes = stats_1.probes_sent + stats_2.probes_sent;
-    assert!(
-        total_probes >= 1,
-        "At least one probe should have been sent, got {}",
-        total_probes
-    );
-
-    // Both should report missing seed
-    assert!(
-        stats_1.missing_seeds >= 1 || stats_2.missing_seeds >= 1,
-        "At least one node should report missing seed"
     );
 
     // 7. Restart seed node (create new instance with same name)
@@ -1843,17 +1803,14 @@ async fn test_e2e_lazarus_seed_recovery() {
         .expect("Rejoin should succeed");
 
     // Wait for cluster to reform
-    sleep(Duration::from_secs(3)).await;
+    eventually(Duration::from_secs(10), || async {
+        node_1.num_members().await >= 3
+    })
+    .await
+    .expect("Should have 3 members after restart");
 
-    // Verify cluster reformed
     let member_count = node_1.num_members().await;
     println!("Cluster reformed with {} members", member_count);
-
-    assert!(
-        member_count >= 3,
-        "Should have 3 members after restart, got {}",
-        member_count
-    );
 
     // 8. Verify Lazarus handles can be shut down gracefully
     handle_1.shutdown();
@@ -2035,14 +1992,11 @@ async fn test_e2e_lazarus_multiple_seeds() {
     node_4.join(seed_0_addr).await.expect("Node 4 join failed");
 
     // Wait for cluster to stabilize
-    sleep(Duration::from_secs(3)).await;
-
-    let member_count = seed_0.num_members().await;
-    assert!(
-        member_count >= 5,
-        "Should have 5 members, got {}",
-        member_count
-    );
+    eventually(Duration::from_secs(10), || async {
+        seed_0.num_members().await >= 5
+    })
+    .await
+    .expect("Should have 5 members in the cluster");
 
     println!("\n=== Cluster Formed (5 nodes) ===");
 
@@ -2056,17 +2010,11 @@ async fn test_e2e_lazarus_multiple_seeds() {
     let handle_4 = node_4.spawn_lazarus_task(lazarus_config);
 
     // Initial check - all seeds should be alive
-    sleep(Duration::from_secs(3)).await;
-
-    let stats_3 = handle_3.stats();
-    println!(
-        "Initial - Node 3: missing_seeds={}, probes={}",
-        stats_3.missing_seeds, stats_3.probes_sent
-    );
-    assert_eq!(
-        stats_3.missing_seeds, 0,
-        "Should have 0 missing seeds initially"
-    );
+    eventually(Duration::from_secs(10), || async {
+        handle_3.stats().missing_seeds == 0
+    })
+    .await
+    .expect("Should have 0 missing seeds initially");
 
     // 3. Shutdown 2 of the 3 seeds (keep seed_0 alive)
     println!("\n=== Shutting down seeds 1 and 2 ===");
@@ -2074,7 +2022,13 @@ async fn test_e2e_lazarus_multiple_seeds() {
     seed_2.shutdown().await;
 
     // 4. Wait for Lazarus to detect missing seeds
-    sleep(Duration::from_secs(5)).await;
+    eventually(Duration::from_secs(15), || async {
+        let s3 = handle_3.stats();
+        let s4 = handle_4.stats();
+        s3.probes_sent > 0 || s4.probes_sent > 0
+    })
+    .await
+    .expect("At least one node should have sent probes after seed shutdown");
 
     let stats_3 = handle_3.stats();
     let stats_4 = handle_4.stats();
@@ -2086,13 +2040,6 @@ async fn test_e2e_lazarus_multiple_seeds() {
     println!(
         "After shutdown - Node 4: missing_seeds={}, probes={}, failures={}",
         stats_4.missing_seeds, stats_4.probes_sent, stats_4.failures
-    );
-
-    // Should detect 2 missing seeds
-    // Note: The exact count depends on timing and what the node can see
-    assert!(
-        stats_3.probes_sent > 0 || stats_4.probes_sent > 0,
-        "At least one node should have sent probes"
     );
 
     // 5. Verify remaining cluster is still connected

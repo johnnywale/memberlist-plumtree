@@ -4,6 +4,7 @@
 //! using a lock-free queue for efficient producer/consumer pattern.
 
 use crossbeam_queue::SegQueue;
+use event_listener::Event;
 use smallvec::SmallVec;
 use std::{
     sync::{
@@ -27,7 +28,9 @@ pub struct PendingIHave {
 /// Lock-free queue for pending IHave announcements.
 ///
 /// Uses crossbeam's SegQueue for efficient concurrent access
-/// without lock contention in the hot path.
+/// without lock contention in the hot path. An [`Event`] is used
+/// to wake the scheduler when new items are pushed, replacing the
+/// previous 10ms polling loop with an event-driven approach.
 #[derive(Debug)]
 pub struct IHaveQueue {
     /// Lock-free queue of pending announcements.
@@ -40,6 +43,8 @@ pub struct IHaveQueue {
     accepting: AtomicBool,
     /// Threshold for early flush notification.
     flush_threshold: AtomicUsize,
+    /// Event to notify the scheduler when new items are pushed.
+    notify: Event,
 }
 
 impl IHaveQueue {
@@ -51,6 +56,7 @@ impl IHaveQueue {
             max_size,
             accepting: AtomicBool::new(true),
             flush_threshold: AtomicUsize::new(16), // Default batch size
+            notify: Event::new(),
         }
     }
 
@@ -62,6 +68,7 @@ impl IHaveQueue {
             max_size,
             accepting: AtomicBool::new(true),
             flush_threshold: AtomicUsize::new(flush_threshold),
+            notify: Event::new(),
         }
     }
 
@@ -74,6 +81,10 @@ impl IHaveQueue {
     ///
     /// Returns `true` if the item was queued, `false` if the queue is full
     /// or not accepting new items.
+    ///
+    /// Note: The length check is approximate due to lock-free design. The queue
+    /// may slightly exceed `max_size` under high concurrency, which is acceptable
+    /// for IHave announcements.
     pub fn push(&self, message_id: MessageId, round: u32) -> bool {
         // Check if accepting
         if !self.accepting.load(Ordering::Acquire) {
@@ -89,6 +100,10 @@ impl IHaveQueue {
         // Push to queue
         self.queue.push(PendingIHave { message_id, round });
         self.len.fetch_add(1, Ordering::Relaxed);
+
+        // Wake the scheduler so it can check for early flush
+        self.notify.notify(1);
+
         true
     }
 
@@ -104,6 +119,14 @@ impl IHaveQueue {
     /// Get the current flush threshold.
     pub fn flush_threshold(&self) -> usize {
         self.flush_threshold.load(Ordering::Relaxed)
+    }
+
+    /// Get a reference to the notification event.
+    ///
+    /// The scheduler can listen on this event to be woken when new items
+    /// are pushed, avoiding the need for polling.
+    pub fn notifier(&self) -> &Event {
+        &self.notify
     }
 
     /// Pop a batch of IHave announcements from the queue.
@@ -516,12 +539,9 @@ impl<I: Clone + Send + Sync + 'static> GraftTimer<I> {
                     continue;
                 }
 
-                // Determine which peer to try
-                let peer = if entry.retry_count == 0 {
-                    // First attempt: use original sender
-                    entry.from.clone()
-                } else {
-                    // Subsequent attempts: try alternatives in round-robin
+                // Determine which peer to try (round-robin through alternatives)
+                // retry_count starts at 1 since initial Graft is sent before timer starts
+                let peer = {
                     let alt_idx =
                         (entry.retry_count - 1) as usize % entry.alternative_peers.len().max(1);
                     if alt_idx < entry.alternative_peers.len() {
@@ -549,10 +569,6 @@ impl<I: Clone + Send + Sync + 'static> GraftTimer<I> {
                         original_peer: entry.from.clone(),
                         total_retries: entry.retry_count,
                     });
-
-                    // Record failure metric
-                    #[cfg(feature = "metrics")]
-                    crate::metrics::record_graft_failed();
 
                     // Mark for removal
                     to_remove.push(message_id);

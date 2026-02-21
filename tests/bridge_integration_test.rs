@@ -3,6 +3,9 @@
 //! These tests verify that the bridge correctly synchronizes membership events
 //! from Memberlist to Plumtree's peer topology.
 
+mod common;
+
+use common::eventually;
 use memberlist_plumtree::{
     // Bridge types
     BridgeConfig,
@@ -609,15 +612,11 @@ async fn test_full_receive_duplicate_rejection() {
         .unwrap();
 
     // Wait for processing
-    sleep(Duration::from_millis(100)).await;
-
-    // Should only be delivered once despite multiple sends
-    assert_eq!(
-        delegate.delivered_count(),
-        1,
-        "Duplicate messages should be rejected, but delivered {} times",
-        delegate.delivered_count()
-    );
+    eventually(Duration::from_secs(5), || async {
+        delegate.delivered_count() == 1
+    })
+    .await
+    .expect("Duplicate messages should be rejected, exactly 1 delivery expected");
 
     pm.shutdown();
 }
@@ -656,18 +655,14 @@ async fn test_full_receive_ihave_graft_cycle() {
     pm.incoming_sender().send((99u64, ihave)).await.unwrap();
 
     // Wait for Graft timer to fire and request the message
-    sleep(Duration::from_millis(200)).await;
-
     // The message won't be delivered because we only sent IHave (no actual Gossip with payload)
     // But we can verify the Graft mechanism was triggered by checking that
     // the peer was promoted to eager (since it had a message we wanted)
-    let topology = pm.peers().topology();
-
-    // Peer 99 should have been promoted to eager after we sent Graft
-    assert!(
-        topology.eager.contains(&99u64),
-        "Peer should be promoted to eager after IHave triggers Graft"
-    );
+    eventually(Duration::from_secs(5), || async {
+        pm.peers().topology().eager.contains(&99u64)
+    })
+    .await
+    .expect("Peer should be promoted to eager after IHave triggers Graft");
 
     pm.shutdown();
 }

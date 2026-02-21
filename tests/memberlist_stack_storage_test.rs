@@ -20,7 +20,7 @@
 mod common;
 
 use bytes::{Buf, BufMut, Bytes};
-use common::allocate_port;
+use common::{allocate_port, eventually};
 use memberlist::net::NetTransportOptions;
 use memberlist::tokio::{TokioRuntime, TokioSocketAddrResolver, TokioTcp};
 use memberlist::{Memberlist, Options as MemberlistOptions};
@@ -355,7 +355,13 @@ async fn test_memberlist_stack_message_delivery() {
 
     // Wait for SWIM gossip to propagate and Plumtree to sync peers
     println!("\nWaiting for cluster formation...");
-    sleep(Duration::from_secs(3)).await;
+    eventually(Duration::from_secs(10), || async {
+        let sa = node_a.stack.peer_stats();
+        let sb = node_b.stack.peer_stats();
+        (sa.eager_count + sa.lazy_count) >= 1 && (sb.eager_count + sb.lazy_count) >= 1
+    })
+    .await
+    .expect("Both nodes should have at least 1 peer after cluster formation");
 
     // Verify peers are connected
     let stats_a = node_a.stack.peer_stats();
@@ -413,24 +419,18 @@ async fn test_memberlist_stack_message_delivery() {
 
     // Wait for message to propagate
     println!("\nWaiting for message delivery...");
-    sleep(Duration::from_secs(3)).await;
+    eventually(Duration::from_secs(10), || async {
+        node_b.received(payload)
+    })
+    .await
+    .expect("Node B should have received the message");
 
-    // Check delivery on Node B
     let b_delivered = node_b.delivered_count();
-    let b_received = node_b.received(payload);
     println!("Node B delivered count: {}", b_delivered);
-    println!("Node B received payload: {}", b_received);
 
     // Cleanup
     node_a.shutdown().await;
     node_b.shutdown().await;
-
-    // Verify delivery
-    assert!(
-        b_received,
-        "Node B should have received the message. Delivered count: {}",
-        b_delivered
-    );
 }
 
 /// Test that messages are stored in the storage backend.
@@ -451,7 +451,13 @@ async fn test_memberlist_stack_message_storage() {
     node_b.join(seed_addr).await.expect("Node B failed to join");
 
     // Wait for cluster formation
-    sleep(Duration::from_secs(2)).await;
+    eventually(Duration::from_secs(10), || async {
+        let sa = node_a.stack.peer_stats();
+        let sb = node_b.stack.peer_stats();
+        (sa.eager_count + sa.lazy_count) >= 1 && (sb.eager_count + sb.lazy_count) >= 1
+    })
+    .await
+    .expect("Both nodes should have at least 1 peer after cluster formation");
 
     // Verify peers
     let stats_a = node_a.stack.peer_stats();
@@ -474,7 +480,11 @@ async fn test_memberlist_stack_message_storage() {
     println!("Broadcast msg_id: {:?}", msg_id);
 
     // Wait for delivery and storage
-    sleep(Duration::from_secs(2)).await;
+    eventually(Duration::from_secs(10), || async {
+        node_b.received(payload)
+    })
+    .await
+    .expect("Node B should have received the message");
 
     // Check storage on Node A (sender stores on broadcast)
     let a_stored_count = node_a.stored_message_count().await;

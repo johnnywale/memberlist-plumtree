@@ -43,6 +43,10 @@ impl<K: Clone + Eq + Hash> RateLimiter<K> {
     /// * `max_tokens` - Maximum tokens per bucket (burst capacity)
     /// * `refill_rate` - Tokens added per second
     pub fn new(max_tokens: u32, refill_rate: f64) -> Self {
+        assert!(
+            refill_rate > 0.0 && refill_rate.is_finite(),
+            "refill_rate must be positive and finite"
+        );
         Self {
             buckets: Mutex::new(HashMap::new()),
             max_tokens,

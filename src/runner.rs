@@ -63,13 +63,23 @@ where
     }
 
     /// Run all background tasks.
+    ///
+    /// This spawns the IHave scheduler, Graft timer, outgoing message processor,
+    /// seen map cleanup, maintenance loop, and anti-entropy sync tasks.
+    ///
+    /// Note: Anti-entropy sync is a no-op at the core Plumtree layer unless
+    /// sync is configured. Full sync protocol implementation (with storage)
+    /// is in `PlumtreeDiscovery::run_anti_entropy_sync()`.
     pub async fn run(self) {
-        futures::future::join5(
-            self.run_ihave_scheduler(),
-            self.run_graft_timer(),
-            self.run_outgoing_processor(),
-            self.run_seen_cleanup(),
-            self.run_maintenance_loop(),
+        futures::future::join(
+            futures::future::join5(
+                self.run_ihave_scheduler(),
+                self.run_graft_timer(),
+                self.run_outgoing_processor(),
+                self.run_seen_cleanup(),
+                self.run_maintenance_loop(),
+            ),
+            self.run_anti_entropy_sync(),
         )
         .await;
     }
@@ -95,6 +105,16 @@ where
     /// and promotes lazy peers to restore the spanning tree.
     pub async fn run_maintenance_loop(&self) {
         self.plumtree.run_maintenance_loop().await;
+    }
+
+    /// Run the anti-entropy sync task.
+    ///
+    /// At the core Plumtree layer, this is a lightweight loop that picks
+    /// random peers for sync. The full sync protocol (with message exchange
+    /// over transport) is implemented in `PlumtreeDiscovery` and must be
+    /// spawned separately when using storage-backed sync.
+    pub async fn run_anti_entropy_sync(&self) {
+        self.plumtree.run_anti_entropy_sync().await;
     }
 
     /// Run the outgoing message processor with proper unicast delivery.
@@ -344,6 +364,7 @@ where
 #[allow(deprecated)]
 mod tests {
     use super::*;
+    use crate::transport::{ChannelTransport, NoopTransport};
     use crate::{NoopDelegate, PlumtreeConfig};
 
     #[test]
@@ -365,5 +386,77 @@ mod tests {
             .build();
 
         assert!(runner.is_some());
+    }
+
+    #[test]
+    fn test_runner_with_noop_transport_construction() {
+        let (plumtree, handle) = Plumtree::new(1u64, PlumtreeConfig::default(), NoopDelegate);
+
+        let runner = PlumtreeRunnerWithTransport::new(plumtree, handle, NoopTransport);
+
+        assert_eq!(*runner.plumtree().local_id(), 1u64);
+        assert!(!runner.handle().is_closed());
+    }
+
+    #[test]
+    fn test_runner_with_channel_transport_construction() {
+        let (plumtree, handle) = Plumtree::new(1u64, PlumtreeConfig::default(), NoopDelegate);
+
+        let (transport, _rx) = ChannelTransport::<u64>::bounded(1024);
+        let runner = PlumtreeRunnerWithTransport::new(plumtree, handle, transport);
+
+        assert_eq!(*runner.plumtree().local_id(), 1u64);
+        assert!(!runner.handle().is_closed());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_runner_with_transport_broadcast_flows_through() {
+        use crate::message::PlumtreeMessage;
+
+        let (plumtree, handle) = Plumtree::new(1u64, PlumtreeConfig::default(), NoopDelegate);
+
+        // Add an eager peer so broadcast sends Gossip to it
+        plumtree.add_peer(2u64);
+
+        let (transport, transport_rx) = ChannelTransport::<u64>::bounded(1024);
+        let runner = PlumtreeRunnerWithTransport::new(plumtree.clone(), handle, transport);
+
+        // Spawn only the outgoing processor (not the full runner) to avoid
+        // waiting for all background tasks on shutdown.
+        let runner_task = tokio::spawn(async move {
+            runner.run_outgoing_processor().await;
+        });
+
+        // Broadcast a message
+        let _msg_id = plumtree
+            .broadcast(bytes::Bytes::from_static(b"hello from runner test"))
+            .await
+            .unwrap();
+
+        // The runner's outgoing processor should encode and send the message
+        // via the channel transport. Wait for it to arrive.
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(5), transport_rx.recv()).await;
+
+        assert!(result.is_ok(), "Should receive message via transport");
+        let (target, data) = result.unwrap().unwrap();
+        assert_eq!(target, 2u64);
+        assert!(!data.is_empty(), "Encoded message should not be empty");
+
+        // Verify the encoded data can be decoded as a PlumtreeMessage
+        let decoded = crate::decode_plumtree_message(&data);
+        assert!(decoded.is_some(), "Should decode as PlumtreeMessage");
+        match decoded.unwrap() {
+            PlumtreeMessage::Gossip { payload, .. } => {
+                // The payload includes compression header byte even when
+                // compression is disabled (flags byte = 0x00 followed by raw data)
+                assert!(!payload.is_empty());
+            }
+            other => panic!("Expected Gossip message, got {:?}", other.type_name()),
+        }
+
+        // Shutdown
+        plumtree.shutdown();
+        let _ = runner_task.await;
     }
 }

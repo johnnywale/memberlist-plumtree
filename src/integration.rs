@@ -188,6 +188,11 @@ impl IdCodec for u128 {
 impl IdCodec for String {
     fn encode_id(&self, buf: &mut impl BufMut) {
         let bytes = self.as_bytes();
+        assert!(
+            bytes.len() <= u16::MAX as usize,
+            "String ID too long for IdCodec (max {} bytes)",
+            u16::MAX
+        );
         buf.put_u16(bytes.len() as u16);
         buf.put_slice(bytes);
     }
@@ -1426,12 +1431,10 @@ where
         // Fire-and-forget storage write - spawn a background task
         // This is safe because the sync state is already updated (for hash comparison)
         // and the message is already in the Plumtree cache (for Graft requests)
-        std::thread::spawn(move || {
-            futures::executor::block_on(async {
-                if let Err(e) = store.insert(&msg).await {
-                    tracing::warn!("failed to store message: {}", e);
-                }
-            });
+        tokio::task::spawn(async move {
+            if let Err(e) = store.insert(&msg).await {
+                tracing::warn!("failed to store message: {}", e);
+            }
         });
 
         // Forward to user delegate (with original decompressed payload)
