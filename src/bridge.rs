@@ -569,8 +569,13 @@ where
             while let Ok((target, data)) = transport_rx.recv().await {
                 // Decode the envelope to get sender and message
                 if let Some((_envelope_sender, message)) = decode_plumtree_envelope::<I>(&data) {
-                    let senders = router.read().await;
-                    if let Some(tx) = senders.get(&target) {
+                    // Clone the sender and drop the lock before sending,
+                    // so we don't hold the read lock across an await point
+                    let tx = {
+                        let senders = router.read().await;
+                        senders.get(&target).cloned()
+                    };
+                    if let Some(tx) = tx {
                         let _ = tx.send((sender_id.clone(), message)).await;
                     }
                 }

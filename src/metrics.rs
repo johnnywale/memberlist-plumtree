@@ -26,6 +26,13 @@
 //! - `plumtree_message_hops` - Number of hops (rounds) messages travel
 //! - `plumtree_ihave_batch_size` - Size of IHave batches sent
 //!
+//! ### Counters (continued)
+//! - `plumtree_seen_map_evictions_total` - Total emergency evictions from seen map
+//! - `plumtree_compression_bytes_in_total` - Total bytes before compression
+//! - `plumtree_compression_bytes_saved_total` - Total bytes saved by compression
+//! - `plumtree_compression_messages_total` - Total messages that were compressed
+//! - `plumtree_compression_skipped_total` - Total messages skipped (too small or no benefit)
+//!
 //! ### Gauges
 //! - `plumtree_eager_peers` - Current number of eager peers
 //! - `plumtree_lazy_peers` - Current number of lazy peers
@@ -34,11 +41,6 @@
 //! - `plumtree_seen_map_size` - Current number of entries in the deduplication map
 //! - `plumtree_ihave_queue_size` - Current number of pending IHave announcements
 //! - `plumtree_pending_grafts` - Current number of pending Graft requests
-//! - `plumtree_seen_map_evictions_total` - Total emergency evictions from seen map
-//! - `plumtree_compression_bytes_in_total` - Total bytes before compression
-//! - `plumtree_compression_bytes_saved_total` - Total bytes saved by compression
-//! - `plumtree_compression_messages_total` - Total messages that were compressed
-//! - `plumtree_compression_skipped_total` - Total messages skipped (too small or no benefit)
 //! - `plumtree_priority_critical` - Messages with critical priority
 //! - `plumtree_priority_high` - Messages with high priority
 //! - `plumtree_priority_normal` - Messages with normal priority

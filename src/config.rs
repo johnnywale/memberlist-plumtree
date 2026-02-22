@@ -832,6 +832,28 @@ impl PlumtreeConfig {
         if self.max_message_size == 0 {
             return Err("max_message_size must be > 0".into());
         }
+        if self.graft_rate_limit_per_second <= 0.0 || !self.graft_rate_limit_per_second.is_finite()
+        {
+            return Err("graft_rate_limit_per_second must be positive and finite".into());
+        }
+        if self.graft_rate_limit_burst == 0 {
+            return Err("graft_rate_limit_burst must be > 0".into());
+        }
+        if let Some(max) = self.max_peers {
+            if max == 0 {
+                return Err("max_peers must be > 0 when set".into());
+            }
+        }
+        if let Some(max) = self.max_eager_peers {
+            if max == 0 {
+                return Err("max_eager_peers must be > 0 when set".into());
+            }
+        }
+        if let Some(max) = self.max_lazy_peers {
+            if max == 0 {
+                return Err("max_lazy_peers must be > 0 when set".into());
+            }
+        }
         Ok(())
     }
 }

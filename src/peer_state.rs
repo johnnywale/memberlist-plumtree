@@ -65,6 +65,19 @@ pub enum AddPeerResult {
     LimitReached,
 }
 
+impl AddPeerResult {
+    /// Returns true if the peer was added (new or already existed).
+    pub fn is_added(&self) -> bool {
+        matches!(
+            self,
+            AddPeerResult::AddedEager
+                | AddPeerResult::AddedLazy
+                | AddPeerResult::AddedAfterEviction
+                | AddPeerResult::AlreadyExists
+        )
+    }
+}
+
 /// Result of removing a peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemovePeerResult {
@@ -1761,19 +1774,33 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
     /// This can be used to prioritize topology decisions.
     pub fn hash_ring_distance(&self, peer: &I) -> Option<usize> {
         let local_id = self.local_id.as_ref()?;
-        let mut inner = self.inner.write();
 
+        // Try read lock first for the fast path (cached ring)
+        {
+            let inner = self.inner.read();
+            if !inner.known_peers.contains(peer) {
+                return None;
+            }
+            if let Some(ref cached) = inner.cached_ring {
+                return Self::compute_ring_distance(cached, local_id, peer);
+            }
+        }
+
+        // Slow path: need write lock to compute and cache the ring
+        let mut inner = self.inner.write();
         if !inner.known_peers.contains(peer) {
             return None;
         }
-
         let sorted_ring = self.get_or_compute_ring(&mut inner);
-        let ring_size = sorted_ring.len();
+        Self::compute_ring_distance(&sorted_ring, local_id, peer)
+    }
 
-        let local_pos = find_position_in_ring(&sorted_ring, local_id)?;
-        let peer_pos = find_position_in_ring(&sorted_ring, peer)?;
+    /// Compute the minimum distance between two nodes on a hash ring.
+    fn compute_ring_distance(ring: &[I], local_id: &I, peer: &I) -> Option<usize> {
+        let ring_size = ring.len();
+        let local_pos = find_position_in_ring(ring, local_id)?;
+        let peer_pos = find_position_in_ring(ring, peer)?;
 
-        // Calculate minimum distance (can go either direction on ring)
         let forward = if peer_pos >= local_pos {
             peer_pos - local_pos
         } else {

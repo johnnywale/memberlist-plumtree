@@ -1,30 +1,42 @@
-//! Pub/Sub example using PlumtreeDiscovery.
+//! Pub/Sub example using PlumtreeStack with QUIC transport.
 //!
 //! This example demonstrates a topic-based publish/subscribe system
-//! built on top of PlumtreeDiscovery for efficient O(n) message broadcast.
+//! built on top of PlumtreeStack for efficient O(n) message broadcast
+//! over real QUIC networking.
 //!
 //! Features demonstrated:
 //! - Topic-based message routing
 //! - Message serialization/deserialization
-//! - Subscriber management
+//! - QUIC transport with self-signed certificates
+//! - Static peer discovery
 //! - Statistics and monitoring
 //! - Graceful shutdown
 //!
-//! Run with: cargo run --example pubsub
+//! Run with: cargo run --example pubsub --features "tokio,quic,metrics"
 
 use bytes::Bytes;
 use memberlist_plumtree::{
-    CacheStats, MessageId, PeerStats, PlumtreeConfig, PlumtreeDelegate, PlumtreeDiscovery,
+    discovery::{StaticDiscovery, StaticDiscoveryConfig},
+    CacheStats, MessageId, PeerStats, PlumtreeConfig, PlumtreeDelegate, PlumtreeStack,
+    PlumtreeStackConfig, QuicConfig,
 };
+use parking_lot::RwLock;
 use std::{
     collections::HashSet,
+    net::SocketAddr,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
     time::Duration,
 };
-use tokio::sync::RwLock;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+/// Base port for QUIC transport (each node binds to BASE_PORT + index).
+const BASE_PORT: u16 = 18000;
 
 // ============================================================================
 // Node Identifier (using u64 for simplicity with nodecraft::Id)
@@ -41,6 +53,13 @@ fn node_name(id: NodeId) -> &'static str {
         5 => "client-b",
         _ => "unknown",
     }
+}
+
+/// Get the QUIC bind address for a node ID.
+fn node_addr(id: NodeId) -> SocketAddr {
+    format!("127.0.0.1:{}", BASE_PORT + id as u16 - 1)
+        .parse()
+        .unwrap()
 }
 
 // ============================================================================
@@ -255,24 +274,27 @@ impl PubSubDelegate {
         self.stats.clone()
     }
 
-    async fn subscribe(&self, topic: Topic) {
-        self.subscriptions.write().await.insert(topic);
+    fn subscribe(&self, topic: Topic) {
+        self.subscriptions.write().insert(topic);
     }
 
-    async fn unsubscribe(&self, topic: &Topic) {
-        self.subscriptions.write().await.remove(topic);
+    fn unsubscribe(&self, topic: &Topic) {
+        self.subscriptions.write().remove(topic);
     }
 
-    async fn is_subscribed(&self, topic: &Topic) -> bool {
-        self.subscriptions.read().await.contains(topic)
+    #[allow(dead_code)]
+    fn is_subscribed(&self, topic: &Topic) -> bool {
+        self.subscriptions.read().contains(topic)
     }
 
-    async fn get_messages(&self) -> Vec<PubSubMessage> {
-        self.messages.read().await.clone()
+    #[allow(dead_code)]
+    fn get_messages(&self) -> Vec<PubSubMessage> {
+        self.messages.read().clone()
     }
 
-    async fn store_message(&self, msg: PubSubMessage) {
-        self.messages.write().await.push(msg);
+    #[allow(dead_code)]
+    fn store_message(&self, msg: PubSubMessage) {
+        self.messages.write().push(msg);
     }
 }
 
@@ -287,8 +309,8 @@ impl PlumtreeDelegate<NodeId> for PubSubDelegate {
             return;
         };
 
-        // Check subscription - use blocking_read since on_deliver is sync
-        if !self.subscriptions.blocking_read().contains(&msg.topic) {
+        // Check subscription
+        if !self.subscriptions.read().contains(&msg.topic) {
             self.stats.record_filtered();
             return;
         }
@@ -332,34 +354,75 @@ impl PlumtreeDelegate<NodeId> for PubSubDelegate {
 }
 
 // ============================================================================
-// Pub/Sub Node
+// Pub/Sub Node (using PlumtreeStack with QUIC)
 // ============================================================================
 
-/// A pub/sub node using PlumtreeDiscovery.
+/// A pub/sub node using PlumtreeStack with QUIC transport.
 struct PubSubNode {
     /// Node identifier.
     id: NodeId,
-    /// PlumtreeDiscovery instance.
-    memberlist: PlumtreeDiscovery<NodeId, Arc<PubSubDelegate>>,
     /// Delegate for message handling.
     delegate: Arc<PubSubDelegate>,
+    /// PlumtreeStack instance (created on start).
+    stack: Option<PlumtreeStack<NodeId, Arc<PubSubDelegate>>>,
     /// Sequence number for published messages.
     sequence: AtomicU64,
+    /// QUIC bind port.
+    port: u16,
 }
 
 #[allow(dead_code)]
 impl PubSubNode {
-    /// Create a new pub/sub node.
-    fn new(id: NodeId, config: PlumtreeConfig) -> Self {
+    /// Create a new pub/sub node (not yet started).
+    fn new(id: NodeId) -> Self {
         let delegate = Arc::new(PubSubDelegate::new(id));
-        let memberlist = PlumtreeDiscovery::new(id, config, delegate.clone());
+        let port = BASE_PORT + id as u16 - 1;
 
         Self {
             id,
-            memberlist,
             delegate,
+            stack: None,
             sequence: AtomicU64::new(0),
+            port,
         }
+    }
+
+    /// Start the node with QUIC transport and static discovery.
+    async fn start(&mut self, all_ids: &[NodeId]) -> Result<(), String> {
+        let bind_addr = node_addr(self.id);
+
+        // Build discovery config with all other nodes as seeds
+        let mut discovery_config = StaticDiscoveryConfig::new();
+        for &peer_id in all_ids {
+            if peer_id != self.id {
+                discovery_config = discovery_config.with_seed(peer_id, node_addr(peer_id));
+            }
+        }
+        let discovery = StaticDiscovery::new(discovery_config).with_local_addr(bind_addr);
+
+        // Build PlumtreeStack config
+        let config = PlumtreeStackConfig::new(self.id, bind_addr)
+            .with_plumtree(
+                PlumtreeConfig::default()
+                    .with_eager_fanout(2)
+                    .with_lazy_fanout(4)
+                    .with_ihave_interval(Duration::from_millis(50))
+                    .with_graft_timeout(Duration::from_millis(200))
+                    .with_message_cache_ttl(Duration::from_secs(30))
+                    .with_protect_ring_neighbors(false)
+                    .with_max_eager_peers(3)
+                    .with_max_lazy_peers(10),
+            )
+            .with_quic(QuicConfig::insecure_dev())
+            .with_discovery(discovery);
+
+        let stack = config
+            .build(self.delegate.clone())
+            .await
+            .map_err(|e| format!("Failed to build stack: {}", e))?;
+
+        self.stack = Some(stack);
+        Ok(())
     }
 
     /// Get the node ID.
@@ -367,24 +430,14 @@ impl PubSubNode {
         self.id
     }
 
-    /// Add a peer node.
-    fn add_peer(&self, peer: NodeId) {
-        self.memberlist.add_peer(peer);
-    }
-
-    /// Remove a peer node.
-    fn remove_peer(&self, peer: &NodeId) {
-        self.memberlist.remove_peer(peer);
-    }
-
     /// Subscribe to a topic.
-    async fn subscribe(&self, topic: Topic) {
-        self.delegate.subscribe(topic).await;
+    fn subscribe(&self, topic: Topic) {
+        self.delegate.subscribe(topic);
     }
 
     /// Unsubscribe from a topic.
-    async fn unsubscribe(&self, topic: &Topic) {
-        self.delegate.unsubscribe(topic).await;
+    fn unsubscribe(&self, topic: &Topic) {
+        self.delegate.unsubscribe(topic);
     }
 
     /// Publish a message to a topic.
@@ -398,17 +451,35 @@ impl PubSubNode {
         let encoded = msg.encode();
 
         self.delegate.stats.record_publish(encoded.len());
-        self.memberlist.broadcast(encoded).await
+
+        let stack = self
+            .stack
+            .as_ref()
+            .ok_or(memberlist_plumtree::Error::Shutdown)?;
+        stack.broadcast(encoded).await
     }
 
     /// Get peer statistics.
     fn peer_stats(&self) -> PeerStats {
-        self.memberlist.peer_stats()
+        self.stack
+            .as_ref()
+            .map(|s| s.peer_stats())
+            .unwrap_or(PeerStats {
+                eager_count: 0,
+                lazy_count: 0,
+            })
     }
 
     /// Get cache statistics.
     fn cache_stats(&self) -> CacheStats {
-        self.memberlist.cache_stats()
+        self.stack
+            .as_ref()
+            .map(|s| s.cache_stats())
+            .unwrap_or(CacheStats {
+                entries: 0,
+                capacity: 0,
+                ttl: Duration::ZERO,
+            })
     }
 
     /// Get pub/sub statistics.
@@ -417,18 +488,28 @@ impl PubSubNode {
     }
 
     /// Get received messages.
-    async fn received_messages(&self) -> Vec<PubSubMessage> {
-        self.delegate.get_messages().await
+    #[allow(dead_code)]
+    fn received_messages(&self) -> Vec<PubSubMessage> {
+        self.delegate.get_messages()
+    }
+
+    /// Remove a peer from this node.
+    fn remove_peer(&self, peer: &NodeId) {
+        if let Some(ref stack) = self.stack {
+            stack.remove_peer(peer);
+        }
     }
 
     /// Shutdown the node.
-    fn shutdown(&self) {
-        self.memberlist.shutdown();
+    async fn shutdown(&mut self) {
+        if let Some(stack) = self.stack.take() {
+            stack.shutdown().await;
+        }
     }
 
-    /// Check if shutdown.
-    fn is_shutdown(&self) -> bool {
-        self.memberlist.is_shutdown()
+    /// Check if the stack is running.
+    fn is_running(&self) -> bool {
+        self.stack.is_some()
     }
 }
 
@@ -438,46 +519,58 @@ impl PubSubNode {
 
 #[tokio::main]
 async fn main() {
-    println!("using PlumtreeDiscovery for efficient O(n) broadcast.\n");
+    println!("Pub/Sub using PlumtreeStack with QUIC transport for efficient O(n) broadcast.\n");
 
-    // Create configuration
-    let config = PlumtreeConfig::default()
-        .with_eager_fanout(2)
-        .with_lazy_fanout(4)
-        .with_ihave_interval(Duration::from_millis(50))
-        .with_graft_timeout(Duration::from_millis(100))
-        .with_message_cache_ttl(Duration::from_secs(30))
-        // New: Peer limit configuration
-        .with_protect_ring_neighbors(false) // Small cluster, no need for protection
-        .with_max_eager_peers(3) // Cap eager peers for this demo
-        .with_max_lazy_peers(10); // Cap lazy peers
+    // Install rustls crypto provider (required for QUIC/TLS)
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Node IDs: 1=broker-1, 2=broker-2, 3=broker-3, 4=client-a, 5=client-b
+    let all_ids: Vec<NodeId> = vec![1, 2, 3, 4, 5];
 
     // Create pub/sub nodes
-    // IDs: 1=broker-1, 2=broker-2, 3=broker-3, 4=client-a, 5=client-b
-    let nodes: Vec<PubSubNode> = vec![
-        PubSubNode::new(1, config.clone()),
-        PubSubNode::new(2, config.clone()),
-        PubSubNode::new(3, config.clone()),
-        PubSubNode::new(4, config.clone()),
-        PubSubNode::new(5, config.clone()),
-    ];
+    let mut nodes: Vec<PubSubNode> = all_ids.iter().map(|&id| PubSubNode::new(id)).collect();
 
-    println!("Created {} pub/sub nodes:", nodes.len());
-    for node in &nodes {
-        println!("  - {} (id: {})", node_name(node.id()), node.id());
+    // Start each node with QUIC transport
+    println!(
+        "Starting {} nodes on QUIC ports {}-{}...",
+        nodes.len(),
+        BASE_PORT,
+        BASE_PORT + nodes.len() as u16 - 1
+    );
+
+    for node in &mut nodes {
+        match node.start(&all_ids).await {
+            Ok(()) => println!(
+                "  - {} (id: {}, port: {})",
+                node_name(node.id()),
+                node.id(),
+                node.port
+            ),
+            Err(e) => println!(
+                "  - {} (id: {}) FAILED: {}",
+                node_name(node.id()),
+                node.id(),
+                e
+            ),
+        }
     }
     println!();
 
-    // Connect nodes in a mesh
-    for i in 0..nodes.len() {
-        for j in 0..nodes.len() {
-            if i != j {
-                nodes[i].add_peer(nodes[j].id());
-            }
-        }
-    }
+    // Wait for peer discovery and QUIC connections to establish
+    println!("Waiting for peer discovery...");
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
-    println!("Connected nodes in mesh topology\n");
+    // Print initial peer topology
+    for node in &nodes {
+        let stats = node.peer_stats();
+        println!(
+            "  {}: {} eager, {} lazy",
+            node_name(node.id()),
+            stats.eager_count,
+            stats.lazy_count
+        );
+    }
+    println!();
 
     // Define topics
     let topic_orders = Topic::new("orders");
@@ -487,17 +580,17 @@ async fn main() {
     // Subscribe nodes to topics
     // Brokers subscribe to all topics
     for node in &nodes[0..3] {
-        node.subscribe(topic_orders.clone()).await;
-        node.subscribe(topic_inventory.clone()).await;
-        node.subscribe(topic_notifications.clone()).await;
+        node.subscribe(topic_orders.clone());
+        node.subscribe(topic_inventory.clone());
+        node.subscribe(topic_notifications.clone());
     }
 
     // Client A subscribes to orders and notifications
-    nodes[3].subscribe(topic_orders.clone()).await;
-    nodes[3].subscribe(topic_notifications.clone()).await;
+    nodes[3].subscribe(topic_orders.clone());
+    nodes[3].subscribe(topic_notifications.clone());
 
     // Client B subscribes to inventory only
-    nodes[4].subscribe(topic_inventory.clone()).await;
+    nodes[4].subscribe(topic_inventory.clone());
 
     println!("Subscription setup:");
     println!("  broker-1, broker-2, broker-3: all topics");
@@ -517,7 +610,7 @@ async fn main() {
         &msg_id.to_string()[..8]
     );
 
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Broker-1 publishes inventory update
     let msg_id = nodes[0]
@@ -532,7 +625,7 @@ async fn main() {
         &msg_id.to_string()[..8]
     );
 
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Broker-2 publishes notification
     let msg_id = nodes[1]
@@ -547,7 +640,7 @@ async fn main() {
         &msg_id.to_string()[..8]
     );
 
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Client B publishes inventory request
     let msg_id = nodes[4]
@@ -562,8 +655,8 @@ async fn main() {
         &msg_id.to_string()[..8]
     );
 
-    // Wait for message propagation
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Wait for message propagation over QUIC
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     println!("\n=== Node Statistics ===\n");
 
@@ -599,7 +692,7 @@ async fn main() {
 
     // Client B subscribes to notifications
     println!("[client-b] Subscribing to 'notifications'...");
-    nodes[4].subscribe(topic_notifications.clone()).await;
+    nodes[4].subscribe(topic_notifications.clone());
 
     // Broker-3 publishes another notification
     let msg_id = nodes[2]
@@ -614,23 +707,26 @@ async fn main() {
         &msg_id.to_string()[..8]
     );
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Client A unsubscribes from orders
     println!("[client-a] Unsubscribing from 'orders'...");
-    nodes[3].unsubscribe(&topic_orders).await;
+    nodes[3].unsubscribe(&topic_orders);
 
     // Demonstrate peer removal
     println!("\n=== Peer Removal ===\n");
 
-    // Remove broker-3 from all nodes (simulating node failure)
+    // Shut down broker-3 and remove it from other nodes (simulating node failure)
     println!("Simulating broker-3 leaving the cluster...");
-    let broker3_id = nodes[2].id();
+    nodes[2].shutdown().await;
+    let broker3_id = 3u64;
     for node in &nodes {
-        if node.id() != broker3_id {
+        if node.id() != broker3_id && node.is_running() {
             node.remove_peer(&broker3_id);
         }
     }
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Publish after peer removal
     let msg_id = nodes[0]
@@ -642,7 +738,7 @@ async fn main() {
         &msg_id.to_string()[..8]
     );
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Final statistics
     println!("\n=== Final Statistics ===\n");
@@ -652,19 +748,22 @@ async fn main() {
         let pubsub_stats = node.pubsub_stats();
 
         println!(
-            "{}: {} peers, {} published, {} received",
+            "{}: {} peers, {} published, {} received{}",
             node_name(node.id()),
             peer_stats.total(),
             pubsub_stats.messages_published,
-            pubsub_stats.messages_received
+            pubsub_stats.messages_received,
+            if !node.is_running() { " (stopped)" } else { "" }
         );
     }
 
     // Cleanup
     println!("\n=== Shutting Down ===\n");
 
-    for node in &nodes {
-        node.shutdown();
+    for node in &mut nodes {
+        if node.is_running() {
+            node.shutdown().await;
+        }
         println!("[{}] Shutdown complete", node_name(node.id()));
     }
 

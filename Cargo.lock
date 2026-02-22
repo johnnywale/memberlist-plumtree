@@ -2048,7 +2048,6 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "nodecraft",
- "once_cell",
  "parking_lot 0.12.5",
  "quinn",
  "rand 0.9.2",

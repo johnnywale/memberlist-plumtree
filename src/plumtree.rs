@@ -195,19 +195,19 @@ impl<I: Clone> ShardedSeenMap<I> {
             return 0;
         }
 
-        // Find the oldest entries by seen_at timestamp
+        let to_remove = target_evict.min(shard.len());
+
+        // Use select_nth_unstable for O(n) partitioning instead of O(n log n) sort
         let mut entries: Vec<(MessageId, std::time::Instant)> = shard
             .iter()
             .map(|(id, entry)| (*id, entry.seen_at))
             .collect();
 
-        // Sort by seen_at (oldest first)
-        entries.sort_by_key(|(_, seen_at)| *seen_at);
+        // Partition so that the `to_remove` oldest entries are at the front
+        entries.select_nth_unstable_by_key(to_remove - 1, |(_, seen_at)| *seen_at);
 
-        // Remove the oldest entries
-        let to_remove = target_evict.min(entries.len());
-        for (id, _) in entries.into_iter().take(to_remove) {
-            shard.remove(&id);
+        for (id, _) in entries.iter().take(to_remove) {
+            shard.remove(id);
         }
 
         to_remove
@@ -895,15 +895,21 @@ where
     /// via the Graft mechanism if needed.
     ///
     /// If `max_peers` is configured, the peer will not be added if the limit is reached.
+    /// The max_peers check and add are performed atomically under a single lock
+    /// via `add_peer_auto` to prevent TOCTOU races.
     pub fn add_peer_lazy(&self, peer: I) {
         if peer != self.inner.local_id {
-            if let Some(max) = self.inner.config.max_peers {
-                let stats = self.inner.peers.stats();
-                if stats.eager_count + stats.lazy_count >= max {
-                    return;
-                }
+            // Use add_peer_auto with eager_fanout=0 to force lazy-only placement.
+            // This performs the max_peers check atomically inside the PeerState lock.
+            let result = self.inner.peers.add_peer_auto(
+                peer.clone(),
+                self.inner.config.max_peers,
+                0, // eager_fanout=0: always add as lazy
+            );
+
+            if !result.is_added() {
+                return;
             }
-            self.inner.peers.add_peer(peer.clone());
 
             #[cfg(feature = "metrics")]
             {

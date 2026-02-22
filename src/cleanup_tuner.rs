@@ -451,6 +451,7 @@ impl LockFreeRateCounter {
     }
 
     /// Read current count without draining.
+    #[allow(dead_code)]
     fn load(&self) -> u64 {
         self.current_count.load(Ordering::Acquire)
     }
@@ -529,8 +530,10 @@ impl RateWindowState {
             elapsed = Duration::ZERO;
         }
 
-        // Add any remaining count from counter (for accurate current window)
-        let current = self.accumulated_current + counter.load();
+        // Use only accumulated_current (already drained from counter).
+        // Do NOT add counter.load() here: any events arriving between drain()
+        // and now will be properly drained on the next call, avoiding double-counting.
+        let current = self.accumulated_current;
 
         // Blend current and previous windows
         let total_count = current + self.previous_count;

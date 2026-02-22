@@ -45,30 +45,33 @@
 //!
 //! ## Example
 //!
-//! ```ignore
-//! use memberlist_plumtree::{Plumtree, PlumtreeConfig, PlumtreeDelegate};
+//! ```no_run
+//! use memberlist_plumtree::{Plumtree, PlumtreeConfig, PlumtreeDelegate, MessageId};
 //! use bytes::Bytes;
 //!
 //! // Define a delegate to receive messages
 //! struct MyDelegate;
-//! impl PlumtreeDelegate for MyDelegate {
+//! impl PlumtreeDelegate<u64> for MyDelegate {
 //!     fn on_deliver(&self, msg_id: MessageId, payload: Bytes) {
 //!         println!("Received message: {:?}", payload);
 //!     }
 //! }
 //!
+//! # async fn example() -> memberlist_plumtree::Result<()> {
 //! // Create Plumtree instance
 //! let (plumtree, handle) = Plumtree::new(
-//!     node_id,
+//!     1u64,
 //!     PlumtreeConfig::lan(),
 //!     MyDelegate,
 //! );
 //!
 //! // Add peers (from memberlist membership)
-//! plumtree.add_peer(peer_id);
+//! plumtree.add_peer(2u64);
 //!
 //! // Broadcast a message to all nodes
-//! let msg_id = plumtree.broadcast(b"hello world").await?;
+//! let msg_id = plumtree.broadcast(&b"hello world"[..]).await?;
+//! # Ok(())
+//! # }
 //! ```
 
 #![cfg_attr(docsrs, feature(doc_cfg))]

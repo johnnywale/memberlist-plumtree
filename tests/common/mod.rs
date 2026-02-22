@@ -3,10 +3,10 @@
 //! This module provides utilities for test port allocation, avoiding
 //! Windows socket permission errors (10013) and port conflicts.
 
-use once_cell::sync::Lazy;
 use std::collections::HashSet;
 use std::net::{SocketAddr, TcpListener, UdpSocket};
 use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -147,7 +147,7 @@ impl PortAllocator {
 /// Global port allocator instance.
 ///
 /// Starts at port 17000 to avoid common service ports and Windows reserved ranges.
-pub static PORT_ALLOCATOR: Lazy<PortAllocator> = Lazy::new(|| PortAllocator::new(17000));
+pub static PORT_ALLOCATOR: LazyLock<PortAllocator> = LazyLock::new(|| PortAllocator::new(17000));
 
 /// Convenience function to allocate a single available port.
 pub fn allocate_port() -> u16 {

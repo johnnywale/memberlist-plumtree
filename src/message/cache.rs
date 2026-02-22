@@ -155,7 +155,11 @@ impl MessageCache {
         let mut inner = self.inner.write();
 
         if let Some(entry) = inner.entries.remove(id) {
-            inner.insertion_order.retain(|(i, _)| i != id);
+            // Use position-based removal instead of retain() for O(n) worst case
+            // but early exit on first match (insertion_order has unique IDs)
+            if let Some(pos) = inner.insertion_order.iter().position(|(i, _)| i == id) {
+                inner.insertion_order.remove(pos);
+            }
             Some(entry.payload)
         } else {
             None

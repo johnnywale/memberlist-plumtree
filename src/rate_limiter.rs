@@ -162,6 +162,11 @@ pub struct GlobalRateLimiter {
 impl GlobalRateLimiter {
     /// Create a new global rate limiter.
     pub fn new(max_tokens: u32, refill_rate: f64) -> Self {
+        assert!(
+            refill_rate > 0.0 && refill_rate.is_finite(),
+            "refill_rate must be positive and finite"
+        );
+        assert!(max_tokens > 0, "max_tokens must be > 0");
         Self {
             bucket: Mutex::new(TokenBucket {
                 tokens: max_tokens as f64,

@@ -158,9 +158,13 @@ impl std::fmt::Debug for PooledConnection {
 type PendingResult = Result<Connection, Arc<QuicError>>;
 
 /// Entry for tracking a pending connection attempt.
+///
+/// Supports multiple concurrent waiters: each waiter gets its own
+/// channel and all are notified when the connection attempt completes.
 struct PendingConnection {
-    /// Receiver to await the result of the connection attempt.
-    receiver: Receiver<PendingResult>,
+    /// Senders for notifying all waiting tasks of the connection result.
+    /// Each waiter registers a new sender/receiver pair.
+    waiter_senders: Vec<Sender<PendingResult>>,
 }
 
 /// LRU index for efficient O(log N) eviction.
@@ -338,9 +342,9 @@ where
         // Slow path: need to connect or wait for pending connection
         // Determine if we should initiate connection or wait for pending one
         enum Action {
-            /// We are the initiator - perform the connection
-            Initiate(Sender<PendingResult>),
-            /// Another task is connecting - wait for result
+            /// We are the initiator - perform the connection.
+            Initiate,
+            /// Another task is connecting - wait for result on our dedicated channel.
             Wait(Receiver<PendingResult>),
         }
 
@@ -352,30 +356,31 @@ where
             // but this is a best-effort check. The connection manager handles races.
 
             // Check if there's already a pending connection for this peer
-            if let Some(pending_conn) = pending.get(peer) {
-                // Another task is already connecting, wait for its result
-                Action::Wait(pending_conn.receiver.clone())
+            if let Some(pending_conn) = pending.get_mut(peer) {
+                // Another task is already connecting - register as a waiter
+                let (tx, rx) = bounded::<PendingResult>(1);
+                pending_conn.waiter_senders.push(tx);
+                Action::Wait(rx)
             } else {
-                // We're the first to connect - create a broadcast channel
-                let (sender, receiver) = bounded::<PendingResult>(1);
-
-                // Store the pending connection
+                // We're the first to connect - create the pending entry
                 pending.insert(
                     peer.clone(),
                     PendingConnection {
-                        receiver: receiver.clone(),
+                        waiter_senders: Vec::new(),
                     },
                 );
 
-                Action::Initiate(sender)
+                Action::Initiate
             }
             // pending lock is dropped here before we do any async work
         };
 
         match action {
-            Action::Initiate(sender) => {
+            Action::Initiate => {
                 // RAII guard for panic-safe cleanup
-                // This ensures the pending entry is removed even if do_connect panics
+                // This ensures the pending entry is removed even if do_connect panics,
+                // and any waiters that haven't received a result will see their
+                // channel close, which they handle as an error.
                 struct PendingGuard<'a, I: Clone + Eq + Hash> {
                     pending: &'a SyncMutex<HashMap<I, PendingConnection>>,
                     peer: I,
@@ -383,7 +388,6 @@ where
 
                 impl<I: Clone + Eq + Hash> Drop for PendingGuard<'_, I> {
                     fn drop(&mut self) {
-                        // Synchronous cleanup - safe to call from Drop
                         let mut pending = self.pending.lock();
                         pending.remove(&self.peer);
                     }
@@ -397,12 +401,12 @@ where
 
                 // We are responsible for establishing the connection
                 let connection =
-                    self.do_connect(peer.clone(), addr, &sender)
-                        .await
-                        .map_err(|e| match Arc::try_unwrap(e) {
+                    self.do_connect(peer.clone(), addr).await.map_err(
+                        |e| match Arc::try_unwrap(e) {
                             Ok(err) => err,
                             Err(arc_err) => QuicError::Internal(arc_err.to_string()),
-                        })?;
+                        },
+                    )?;
 
                 // Guard is dropped here, removing from pending map
                 // (happens whether we return Ok, Err, or panic)
@@ -454,12 +458,7 @@ where
     ///
     /// The semaphore is owned by ConnectionManager, so it cannot be dropped while
     /// do_connect is running, making the acquire safe.
-    async fn do_connect(
-        &self,
-        peer: I,
-        addr: SocketAddr,
-        result_sender: &Sender<PendingResult>,
-    ) -> Result<Connection, Arc<QuicError>> {
+    async fn do_connect(&self, peer: I, addr: SocketAddr) -> Result<Connection, Arc<QuicError>> {
         // Acquire semaphore permit before connecting (enforces strict limit)
         // Try to acquire without blocking first
         let permit = match self.connection_semaphore.try_acquire_arc() {
@@ -483,7 +482,7 @@ where
                             current,
                             max: self.config.connection.max_connections,
                         });
-                        let _ = result_sender.send(Err(err.clone())).await;
+                        self.broadcast_to_waiters(&peer, Err(err.clone()));
                         return Err(err);
                     }
                 }
@@ -521,8 +520,8 @@ where
                         .connections_established
                         .fetch_add(1, Ordering::Relaxed);
 
-                    // Broadcast success to any waiting tasks
-                    let _ = result_sender.send(Ok(connection.clone())).await;
+                    // Broadcast success to all waiting tasks
+                    self.broadcast_to_waiters(&peer, Ok(connection.clone()));
 
                     return Ok(connection);
                 }
@@ -537,11 +536,25 @@ where
             "connection failed with no error".to_string(),
         )));
 
-        // Broadcast failure
-        let _ = result_sender.send(Err(err.clone())).await;
+        // Broadcast failure to all waiting tasks
+        self.broadcast_to_waiters(&peer, Err(err.clone()));
 
         // Permit is dropped here automatically, releasing the slot
         Err(err)
+    }
+
+    /// Broadcast a connection result to all waiting tasks for a given peer.
+    ///
+    /// Drains the waiter senders from the pending entry and sends the result
+    /// to each one. Uses `try_send` since each channel has capacity 1 and
+    /// only one message is ever sent per waiter.
+    fn broadcast_to_waiters(&self, peer: &I, result: PendingResult) {
+        let mut pending = self.pending.lock();
+        if let Some(pending_conn) = pending.get_mut(peer) {
+            for sender in pending_conn.waiter_senders.drain(..) {
+                let _ = sender.try_send(result.clone());
+            }
+        }
     }
 
     /// Try to establish a connection once.

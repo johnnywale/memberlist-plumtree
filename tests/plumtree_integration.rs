@@ -1228,15 +1228,16 @@ async fn test_plumtree_memberlist_peer_disconnect() {
         node.pm.remove_peer(&MemberlistNodeId(3));
     }
 
-    // Give time for changes to propagate
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Verify node 3 is removed from node 1's topology
-    let topo = node1.pm.peers().topology();
-    assert_eq!(topo.total(), 2);
-    assert!(topo.contains(&MemberlistNodeId(2)));
-    assert!(!topo.contains(&MemberlistNodeId(3))); // <-- Removed!
-    assert!(topo.contains(&MemberlistNodeId(4)));
+    // Wait for changes to propagate
+    eventually(Duration::from_secs(5), || async {
+        let topo = node1.pm.peers().topology();
+        topo.total() == 2
+            && topo.contains(&MemberlistNodeId(2))
+            && !topo.contains(&MemberlistNodeId(3))
+            && topo.contains(&MemberlistNodeId(4))
+    })
+    .await
+    .expect("node 3 should be removed from node 1's topology");
 
     // Verify node 3 sees no peers (it was removed from everyone)
     let node3 = cluster.get_node(MemberlistNodeId(3)).unwrap();
@@ -1370,10 +1371,12 @@ async fn test_plumtree_memberlist_no_messages_after_disconnect() {
     // Also disconnect node 1 from node 3's perspective (bidirectional)
     node3.pm.remove_peer(&MemberlistNodeId(1));
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Verify node 1 no longer sees node 3
-    assert!(!node1.pm.peers().topology().contains(&MemberlistNodeId(3)));
+    // Wait for topology to reflect the disconnect
+    eventually(Duration::from_secs(5), || async {
+        !node1.pm.peers().topology().contains(&MemberlistNodeId(3))
+    })
+    .await
+    .expect("node 1 should no longer see node 3");
 
     // Broadcast second message from node 1
     let _msg_id2 = node1
@@ -1430,23 +1433,23 @@ async fn test_plumtree_memberlist_topology_consistency() {
         node.pm.remove_peer(&MemberlistNodeId(7));
     }
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Verify updated topology
+    // Wait for topology to reflect removals
     let node1 = cluster.get_node(MemberlistNodeId(1)).unwrap();
-    let topo = node1.pm.peers().topology();
-    assert_eq!(topo.total(), 6); // 9 - 3 = 6
-    assert!(!topo.contains(&MemberlistNodeId(3)));
-    assert!(!topo.contains(&MemberlistNodeId(5)));
-    assert!(!topo.contains(&MemberlistNodeId(7)));
-
-    // Remaining peers should still be present
-    assert!(topo.contains(&MemberlistNodeId(2)));
-    assert!(topo.contains(&MemberlistNodeId(4)));
-    assert!(topo.contains(&MemberlistNodeId(6)));
-    assert!(topo.contains(&MemberlistNodeId(8)));
-    assert!(topo.contains(&MemberlistNodeId(9)));
-    assert!(topo.contains(&MemberlistNodeId(10)));
+    eventually(Duration::from_secs(5), || async {
+        let topo = node1.pm.peers().topology();
+        topo.total() == 6
+            && !topo.contains(&MemberlistNodeId(3))
+            && !topo.contains(&MemberlistNodeId(5))
+            && !topo.contains(&MemberlistNodeId(7))
+            && topo.contains(&MemberlistNodeId(2))
+            && topo.contains(&MemberlistNodeId(4))
+            && topo.contains(&MemberlistNodeId(6))
+            && topo.contains(&MemberlistNodeId(8))
+            && topo.contains(&MemberlistNodeId(9))
+            && topo.contains(&MemberlistNodeId(10))
+    })
+    .await
+    .expect("node 1's topology should reflect removal of nodes 3, 5, 7");
 
     cluster.shutdown_all();
 }
@@ -1602,10 +1605,12 @@ async fn test_plumtree_memberlist_dynamic_peer_join() {
     node1.pm.add_peer(MemberlistNodeId(2));
     node2.pm.add_peer(MemberlistNodeId(1));
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Verify node 3 is isolated
-    assert_eq!(node3.pm.peers().topology().total(), 0);
+    // Verify node 3 is isolated (no peers added yet)
+    eventually(Duration::from_secs(5), || async {
+        node3.pm.peers().topology().total() == 0
+    })
+    .await
+    .expect("node 3 should have no peers initially");
 
     // Broadcast from node 1 - only node 2 should receive
     let _msg_id1 = node1
@@ -1637,13 +1642,11 @@ async fn test_plumtree_memberlist_dynamic_peer_join() {
     let _msg_id2 = node1.pm.broadcast(Bytes::from("after join")).await.unwrap();
 
     // Wait for delivery
-    let start = std::time::Instant::now();
-    while node3.delegate.delivered_count() < 1 {
-        if start.elapsed() > Duration::from_secs(5) {
-            panic!("Timeout waiting for node 3 to receive message");
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    eventually(Duration::from_secs(5), || async {
+        node3.delegate.delivered_count() >= 1 && node2.delegate.delivered_count() >= 2
+    })
+    .await
+    .expect("node 3 should receive 1 message and node 2 should receive 2 messages");
 
     assert_eq!(node2.delegate.delivered_count(), 2);
     assert_eq!(node3.delegate.delivered_count(), 1); // Received the second message
@@ -1654,15 +1657,15 @@ async fn test_plumtree_memberlist_dynamic_peer_join() {
     node3.shutdown();
 }
 
-/// Test 10-node cluster with max_peers=6 constraint.
-/// Each node can only maintain 6 peers, but messages should still reach all nodes
+/// Test 50-node cluster with max_peers=5 constraint.
+/// Each node can only maintain 5 peers, but messages should still reach all nodes
 /// through the spanning tree and lazy push recovery mechanism.
 ///
 /// This test uses the natural add_peer behavior which triggers auto-classification
-/// and eviction logic in peer_state.rs. With max_peers=6 and eager_fanout=3,
-/// each node will have 3 eager + 3 lazy peers (total 6).
+/// and eviction logic in peer_state.rs. With max_peers=5 and eager_fanout=3,
+/// each node will have 3 eager + 2 lazy peers (total 5).
 #[tokio::test]
-async fn test_plumtree_memberlist_10_nodes_max_peers_6() {
+async fn test_plumtree_memberlist_50_nodes_max_peers_5() {
     let max_peers = 5;
     let eager_fanout = 3;
     let config = PlumtreeConfig::default()
@@ -1672,7 +1675,7 @@ async fn test_plumtree_memberlist_10_nodes_max_peers_6() {
         .with_ihave_interval(Duration::from_millis(30))
         .with_graft_timeout(Duration::from_millis(200));
 
-    // Create a 10-node cluster
+    // Create a 50-node cluster
     let routes: RoutingTable = Arc::new(parking_lot::RwLock::new(HashMap::new()));
     let mut nodes: Vec<TestNode> = Vec::new();
 
@@ -1719,8 +1722,8 @@ async fn test_plumtree_memberlist_10_nodes_max_peers_6() {
         assert!(
             topo.total() <= max_peers,
             "Node {} should have at most {} peers due to max_peers, but has {}",
-            max_peers,
             node.id,
+            max_peers,
             topo.total()
         );
         // Each node should have at least 3 peers (eager_fanout)
@@ -1765,46 +1768,15 @@ async fn test_plumtree_memberlist_10_nodes_max_peers_6() {
     // 1. Eager push: immediate Gossip to eager peers
     // 2. Lazy push: IHave announcements to lazy peers
     // 3. Graft: lazy peers request missing messages
-    let start = std::time::Instant::now();
-    let timeout = Duration::from_secs(10);
-
-    loop {
-        let all_received = nodes
+    eventually(Duration::from_secs(10), || async {
+        nodes
             .iter()
-            .all(|node| node.id == MemberlistNodeId(1) || node.delegate.has_message(&msg_id));
+            .all(|node| node.id == MemberlistNodeId(1) || node.delegate.has_message(&msg_id))
+    })
+    .await
+    .expect("all nodes should receive the broadcast message");
 
-        if all_received {
-            break;
-        }
-
-        if start.elapsed() > timeout {
-            // Print status for debugging
-            println!("=== Message Delivery Status ===");
-            for node in &nodes {
-                if node.id != MemberlistNodeId(1) {
-                    println!(
-                        "Node {}: received={}, delivered_count={}",
-                        node.id,
-                        node.delegate.has_message(&msg_id),
-                        node.delegate.delivered_count()
-                    );
-                }
-            }
-            panic!(
-                "Timeout waiting for message delivery after {:?}",
-                start.elapsed()
-            );
-        }
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    println!(
-        "=== All nodes received message in {:?} ===",
-        start.elapsed()
-    );
-
-    // Verify all 9 other nodes received the message
+    // Verify all other nodes received the message
     for node in &nodes {
         if node.id == MemberlistNodeId(1) {
             continue; // Sender doesn't deliver to itself

@@ -462,10 +462,10 @@ impl<I: Clone + Eq + Hash> ClockSkewSimulator<I> {
         }
     }
 
-    /// Set the clock skew for a specific node.
+    /// Set the clock skew for a specific node (clock ahead of real time).
     ///
-    /// Positive values mean the node's clock is ahead of real time,
-    /// negative values mean the node's clock is behind.
+    /// This sets a positive skew (node's clock is ahead).
+    /// For negative skew (behind), use [`set_skew_ms`] with a negative value.
     pub fn set_skew(&self, node: &I, skew: Duration) {
         let mut skews = self.skew_per_node.write();
         skews.insert(node.clone(), skew.as_millis() as i64);
@@ -754,13 +754,17 @@ impl<I: Clone, M: Clone> MessageReorderer<I, M> {
     }
 
     /// Get the next message ready for delivery, if any.
+    ///
+    /// Scans the queue for any ready message since messages are not
+    /// necessarily ordered by `deliver_at` (due to random jitter).
     pub fn pop_ready(&self) -> Option<DelayedMessage<I, M>> {
         let now = Instant::now();
         let mut queue = self.delay_queue.write();
 
-        if let Some(msg) = queue.front() {
-            if msg.deliver_at <= now {
-                return queue.pop_front();
+        // Messages may have different random delays, so we scan for the first ready one
+        for i in 0..queue.len() {
+            if queue[i].deliver_at <= now {
+                return queue.remove(i);
             }
         }
 
@@ -950,15 +954,21 @@ impl<I: Clone + Eq + Hash, M: Clone> EnhancedChaosController<I, M> {
 
     /// Simulate cascading failures where nodes fail one after another.
     ///
+    /// Each failing node is fully isolated from all other nodes in the list
+    /// (both previously failed and not-yet-failed), simulating a real cascading
+    /// failure where each node becomes completely unreachable.
+    ///
     /// Returns the list of nodes that were isolated.
     pub fn cascading_failure(&self, nodes: Vec<I>, delay_between: Duration) -> Vec<I> {
         let mut failed: Vec<I> = Vec::new();
-        for node in nodes {
-            // Isolate this node from all previously healthy nodes
-            for other in &failed {
-                self.partition.partition(node.clone(), other.clone());
+        for (i, node) in nodes.iter().enumerate() {
+            // Isolate this node from ALL other nodes in the list
+            for (j, other) in nodes.iter().enumerate() {
+                if i != j {
+                    self.partition.partition(node.clone(), other.clone());
+                }
             }
-            failed.push(node);
+            failed.push(node.clone());
             // Uses std::thread::sleep intentionally: this is a sync function used in
             // test/simulation contexts where blocking the thread is acceptable.
             std::thread::sleep(delay_between);

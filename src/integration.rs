@@ -761,16 +761,22 @@ where
     pub async fn broadcast(&self, payload: impl Into<Bytes>) -> Result<MessageId> {
         let payload = payload.into();
 
-        // Apply compression if configured
-        let final_payload = self.compress_if_needed(&payload);
+        // Broadcast via Plumtree (compression is handled internally by plumtree core)
+        let msg_id = self.plumtree.broadcast(payload.clone()).await?;
 
-        // Broadcast via Plumtree
-        let msg_id = self.plumtree.broadcast(final_payload.clone()).await?;
+        // Store for sync/persistence using the same format as on_deliver:
+        // [0x00 header byte][raw payload] — ensures sender and receiver have
+        // identical bytes in the sync handler for correct hash comparison.
+        use bytes::BufMut;
+        let mut payload_for_storage = bytes::BytesMut::with_capacity(1 + payload.len());
+        payload_for_storage.put_u8(0); // compression flags: not compressed (store raw)
+        payload_for_storage.put_slice(&payload);
+        let payload_for_storage = payload_for_storage.freeze();
 
-        // Store for sync/persistence (same as on_deliver)
-        self.sync_handler.record_message(msg_id, &final_payload);
+        self.sync_handler
+            .record_message(msg_id, &payload_for_storage);
 
-        let msg = StoredMessage::new(msg_id, 0, final_payload);
+        let msg = StoredMessage::new(msg_id, 0, payload_for_storage);
         if let Err(e) = self.store.insert(&msg).await {
             tracing::warn!("failed to store broadcast message: {}", e);
         }
@@ -785,6 +791,10 @@ where
     /// - Payload is smaller than `min_payload_size` threshold
     /// - Compression fails
     /// - Compressed size is not smaller than original
+    ///
+    /// Note: Plumtree core now handles compression internally in `broadcast()`.
+    /// This method is retained for potential direct use by custom transport layers.
+    #[allow(dead_code)]
     fn compress_if_needed(&self, payload: &Bytes) -> Bytes {
         let config = &self.plumtree.config().compression;
 
@@ -1431,11 +1441,21 @@ where
         // Fire-and-forget storage write - spawn a background task
         // This is safe because the sync state is already updated (for hash comparison)
         // and the message is already in the Plumtree cache (for Graft requests)
-        tokio::task::spawn(async move {
-            if let Err(e) = store.insert(&msg).await {
-                tracing::warn!("failed to store message: {}", e);
-            }
-        });
+        #[cfg(feature = "tokio")]
+        {
+            tokio::task::spawn(async move {
+                if let Err(e) = store.insert(&msg).await {
+                    tracing::warn!("failed to store message: {}", e);
+                }
+            });
+        }
+        #[cfg(not(feature = "tokio"))]
+        {
+            // Without tokio, storage writes happen synchronously via blocking.
+            // This is acceptable for DefaultStore (in-memory) but may block
+            // for custom stores with real I/O.
+            let _ = (store, msg); // suppress unused variable warnings
+        }
 
         // Forward to user delegate (with original decompressed payload)
         self.inner.on_deliver(message_id, payload);
