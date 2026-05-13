@@ -2504,7 +2504,7 @@ async fn test_peer_stats_accuracy() {
 
         // Total peers should not exceed cluster size - 1
         assert!(
-            stats.eager_count + stats.lazy_count <= NUM_NODES - 1,
+            stats.eager_count + stats.lazy_count < NUM_NODES,
             "Node {} has too many total peers",
             node.node_id
         );

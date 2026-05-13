@@ -1268,8 +1268,22 @@ mod tests {
             decisions2.push(policy2.decide(&i, &(i + 1)).is_delivered());
         }
 
-        // Should produce different sequences (very unlikely to be identical)
-        assert_ne!(decisions1, decisions2);
+        // Different seeds should produce a meaningfully different sequence.
+        // `assert_ne!` alone is fragile: identical-sequence probability is ~2^-100
+        // but non-zero, and CI flakes on probabilistic asserts are expensive to
+        // debug. Two 50%-loss streams with independent seeds should disagree on
+        // ~50% of decisions; require at least 20 disagreements out of 100 — that
+        // is ~5σ below the expected mean, so flakes are vanishingly rare while
+        // a regression that makes the seeds correlated will still be caught.
+        let differing = decisions1
+            .iter()
+            .zip(decisions2.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(
+            differing >= 20,
+            "expected seeds to produce diverging streams, but only {differing}/100 decisions differed"
+        );
     }
 
     #[test]

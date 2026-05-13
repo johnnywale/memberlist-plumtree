@@ -204,7 +204,15 @@ impl BridgeConfig {
     }
 
     /// Check if Lazarus probing is enabled and has seeds configured.
-    pub fn should_run_lazarus(&self) -> bool {
+    ///
+    /// Crate-internal: callers outside the crate should not need to decide
+    /// whether to spawn Lazarus themselves — `PlumtreeBridge` owns that
+    /// responsibility.
+    ///
+    /// Only used by the memberlist-gated discovery layer; suppress dead_code
+    /// when that feature is off so `--no-default-features` builds stay clean.
+    #[cfg_attr(not(feature = "memberlist"), allow(dead_code))]
+    pub(crate) fn should_run_lazarus(&self) -> bool {
         self.lazarus_enabled && !self.static_seeds.is_empty()
     }
 }
@@ -224,13 +232,15 @@ where
     I: Id + IdCodec + Clone + Ord + Send + Sync + 'static,
     PD: PlumtreeDelegate<I>,
 {
-    /// The Plumtree instance.
-    pub pm: Arc<PlumtreeDiscovery<I, PD>>,
-    /// Configuration for the bridge.
-    pub config: BridgeConfig,
+    /// The Plumtree instance. Crate-internal; external callers use `pm()`.
+    pub(crate) pm: Arc<PlumtreeDiscovery<I, PD>>,
+    /// Configuration for the bridge. Crate-internal; external callers use `config()`.
+    /// Made non-pub to avoid post-construction mutation diverging from `pm` state
+    /// (e.g. toggling `lazarus_enabled` after Lazarus has already been spawned).
+    pub(crate) config: BridgeConfig,
     /// Address resolver for QUIC transport (optional).
     #[cfg(feature = "quic")]
-    pub resolver: Option<Arc<MapPeerResolver<I>>>,
+    pub(crate) resolver: Option<Arc<MapPeerResolver<I>>>,
     #[cfg(not(feature = "quic"))]
     _marker: PhantomData<I>,
 }
@@ -240,6 +250,20 @@ where
     I: Id + IdCodec + Clone + Ord + Send + Sync + 'static,
     PD: PlumtreeDelegate<I>,
 {
+    /// Returns the underlying `PlumtreeDiscovery` instance.
+    pub fn pm(&self) -> &Arc<PlumtreeDiscovery<I, PD>> {
+        &self.pm
+    }
+
+    /// Returns the bridge configuration (read-only).
+    ///
+    /// Configuration is intentionally immutable after construction so that
+    /// fields like `lazarus_enabled` cannot diverge from background tasks
+    /// that have already been spawned based on the original config.
+    pub fn config(&self) -> &BridgeConfig {
+        &self.config
+    }
+
     /// Create a new bridge without an address resolver.
     ///
     /// Use this when not using QUIC transport or when handling address

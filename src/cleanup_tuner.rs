@@ -109,6 +109,23 @@ pub struct CleanupConfig {
 
 impl Default for CleanupConfig {
     fn default() -> Self {
+        // Same defaults as `new()` — go through `new()` so the validation pass
+        // can't be skipped just because a caller used `Default::default()`.
+        Self::new()
+    }
+}
+
+impl CleanupConfig {
+    /// Create a new cleanup config with default values.
+    pub fn new() -> Self {
+        let mut config = Self::raw_defaults();
+        config.validate();
+        config
+    }
+
+    /// Raw (unvalidated) defaults. Internal — all public constructors must
+    /// run `validate()` on the result.
+    fn raw_defaults() -> Self {
         Self {
             base_interval: Duration::from_secs(30),
             min_interval: Duration::from_secs(5),
@@ -129,15 +146,6 @@ impl Default for CleanupConfig {
             min_cycles_for_efficiency: 3,
             max_ttl_interval_factor: 2.0,
         }
-    }
-}
-
-impl CleanupConfig {
-    /// Create a new cleanup config with default values.
-    pub fn new() -> Self {
-        let mut config = Self::default();
-        config.validate();
-        config
     }
 
     /// Configuration for high-throughput scenarios.

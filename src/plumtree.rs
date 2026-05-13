@@ -1883,64 +1883,32 @@ where
         }
     }
 
-    /// Run anti-entropy sync background task.
+    /// Run anti-entropy sync background task at the core Plumtree layer.
     ///
-    /// This task periodically compares message state with random peers
-    /// and requests any missing messages. This enables recovery from:
-    /// - Network partitions
-    /// - Node crashes
-    /// - Long disconnects (> cache TTL)
+    /// The full sync protocol (storage integration, message exchange over
+    /// transport) lives in [`PlumtreeDiscovery::run_anti_entropy_sync`]. This
+    /// method exists only so the bare Plumtree runner has a uniform task
+    /// surface — it is a no-op and exits immediately. If sync is configured,
+    /// callers should spawn the `PlumtreeDiscovery` variant instead; this one
+    /// will not perform any synchronization.
     ///
-    /// This should be spawned as a background task when sync is enabled.
-    ///
-    /// # Note
-    ///
-    /// This is a no-op if sync is not configured. Check `config.sync` before
-    /// spawning this task to avoid unnecessary work.
+    /// This is `pub(crate)` because the bare-layer path is internal to the
+    /// runner. Application code should reach sync via `PlumtreeDiscovery`.
     #[instrument(skip(self), name = "anti_entropy_sync")]
-    pub async fn run_anti_entropy_sync(&self) {
+    pub(crate) async fn run_anti_entropy_sync(&self) {
         let Some(ref sync_config) = self.inner.config.sync else {
-            info!("Anti-entropy sync not configured, skipping");
             return;
         };
 
         if !sync_config.enabled {
-            info!("Anti-entropy sync disabled");
             return;
         }
 
-        info!(
-            interval_s = sync_config.sync_interval.as_secs(),
-            window_s = sync_config.sync_window.as_secs(),
-            "Anti-entropy sync started"
+        warn!(
+            "Anti-entropy sync configured but the core Plumtree layer does not \
+             implement the sync protocol. Spawn PlumtreeDiscovery::run_anti_entropy_sync \
+             with a transport instead. This task is exiting without doing work."
         );
-
-        loop {
-            if self.inner.shutdown.load(Ordering::Acquire) {
-                info!("Anti-entropy sync shutting down");
-                break;
-            }
-
-            // Wait for sync interval
-            Delay::new(sync_config.sync_interval).await;
-
-            // Check for shutdown after waking
-            if self.inner.shutdown.load(Ordering::Acquire) {
-                break;
-            }
-
-            // Pick a random peer
-            if let Some(peer) = self.inner.peers.random_peer() {
-                debug!(?peer, "Initiating sync with peer");
-
-                // For now, we just log that sync would happen
-                // Full implementation requires storage integration
-                // which is done in the PlumtreeDiscovery layer
-                trace!("Sync protocol not fully integrated at Plumtree layer");
-            } else {
-                trace!("No peers available for sync");
-            }
-        }
     }
 
     /// Shutdown the Plumtree instance.

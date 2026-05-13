@@ -159,49 +159,49 @@ impl BatcherConfig {
     }
 
     /// Set minimum batch size (builder pattern).
-    pub const fn with_min_batch_size(mut self, size: usize) -> Self {
+    pub fn with_min_batch_size(mut self, size: usize) -> Self {
         self.min_batch_size = size;
         self
     }
 
     /// Set maximum batch size (builder pattern).
-    pub const fn with_max_batch_size(mut self, size: usize) -> Self {
+    pub fn with_max_batch_size(mut self, size: usize) -> Self {
         self.max_batch_size = size;
         self
     }
 
     /// Set target batch size (builder pattern).
-    pub const fn with_target_batch_size(mut self, size: usize) -> Self {
+    pub fn with_target_batch_size(mut self, size: usize) -> Self {
         self.target_batch_size = size;
         self
     }
 
     /// Set momentum factor (builder pattern).
-    pub const fn with_momentum(mut self, momentum: f64) -> Self {
+    pub fn with_momentum(mut self, momentum: f64) -> Self {
         self.momentum = momentum;
         self
     }
 
     /// Set hysteresis threshold (builder pattern).
-    pub const fn with_hysteresis(mut self, hysteresis: f64) -> Self {
+    pub fn with_hysteresis(mut self, hysteresis: f64) -> Self {
         self.hysteresis = hysteresis;
         self
     }
 
     /// Set observation window duration (builder pattern).
-    pub const fn with_observation_window(mut self, window: Duration) -> Self {
+    pub fn with_observation_window(mut self, window: Duration) -> Self {
         self.observation_window = window;
         self
     }
 
     /// Set recalculation interval (builder pattern).
-    pub const fn with_recalc_interval(mut self, interval: Duration) -> Self {
+    pub fn with_recalc_interval(mut self, interval: Duration) -> Self {
         self.recalc_interval = interval;
         self
     }
 
     /// Set EMA alpha smoothing factor (builder pattern).
-    pub const fn with_ema_alpha(mut self, alpha: f64) -> Self {
+    pub fn with_ema_alpha(mut self, alpha: f64) -> Self {
         self.ema_alpha = alpha;
         self
     }
@@ -339,7 +339,7 @@ impl BatcherState {
         }
     }
 
-    fn reset_window(&mut self) {
+    fn reset_window(&mut self, now: Instant) {
         // Preserve totals
         self.total_ihaves = self.total_ihaves.saturating_add(self.ihaves_sent);
         self.total_grafts_success = self
@@ -347,8 +347,9 @@ impl BatcherState {
             .saturating_add(self.grafts_success);
         self.total_grafts_failed = self.total_grafts_failed.saturating_add(self.grafts_failed);
 
-        // Reset window counters
-        self.window_start = Instant::now();
+        // Reset window counters using the caller's `now` so reset/recalc share
+        // a single wall-clock anchor.
+        self.window_start = now;
         self.ihaves_sent = 0;
         self.grafts_success = 0;
         self.grafts_failed = 0;
@@ -410,13 +411,19 @@ impl AdaptiveBatcher {
     }
 
     /// Alias for backward compatibility.
-    #[deprecated(since = "0.2.0", note = "Use record_graft_received instead")]
+    #[deprecated(
+        since = "0.2.0",
+        note = "Use record_graft_received instead; will be removed in 0.4.0"
+    )]
     pub fn record_graft_success(&self) {
         self.record_graft_received();
     }
 
     /// Alias for backward compatibility.
-    #[deprecated(since = "0.2.0", note = "Use record_graft_timeout instead")]
+    #[deprecated(
+        since = "0.2.0",
+        note = "Use record_graft_timeout instead; will be removed in 0.4.0"
+    )]
     pub fn record_graft_failed(&self) {
         self.record_graft_timeout();
     }
@@ -503,13 +510,18 @@ impl AdaptiveBatcher {
     fn recalculate_batch_size(&self) {
         let mut state = self.state.write();
 
+        // Anchor everything in this critical section to a single `now`
+        // so that `window_start`, `last_recalc`, and the elapsed values used
+        // for rate calculations all agree.
+        let now = Instant::now();
+
         // Check and reset window first (at the beginning of recalc)
-        if state.window_start.elapsed() >= self.config.observation_window {
-            state.reset_window();
+        if now.saturating_duration_since(state.window_start) >= self.config.observation_window {
+            state.reset_window(now);
         }
 
         // Cache window elapsed calculation
-        let window_elapsed = state.window_start.elapsed();
+        let window_elapsed = now.saturating_duration_since(state.window_start);
         let window_elapsed_secs = window_elapsed.as_secs_f64();
 
         // Calculate Graft success rate (require minimum sample size)
@@ -592,13 +604,18 @@ impl AdaptiveBatcher {
             state.current_batch_size = new_batch_size;
         }
 
-        state.last_recalc = Instant::now();
+        state.last_recalc = now;
     }
 
     /// Get current statistics.
     pub fn stats(&self) -> BatcherStats {
         let state = self.state.read();
+        Self::stats_from(&state)
+    }
 
+    /// Compute a `BatcherStats` snapshot from an already-held state guard.
+    /// Lets callers like `debug_info` avoid double-locking.
+    fn stats_from(state: &BatcherState) -> BatcherStats {
         let total_grafts = state.grafts_success + state.grafts_failed;
         let graft_success_rate = if total_grafts > 0 {
             state.grafts_success as f64 / total_grafts as f64
@@ -658,7 +675,7 @@ impl AdaptiveBatcher {
     /// Get debug information about the batcher's current state.
     pub fn debug_info(&self) -> String {
         let state = self.state.read();
-        let stats = self.stats();
+        let stats = Self::stats_from(&state);
 
         format!(
             "AdaptiveBatcher Debug Info:

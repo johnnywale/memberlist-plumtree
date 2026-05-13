@@ -465,7 +465,7 @@ impl<I: Clone + Eq + Hash> ClockSkewSimulator<I> {
     /// Set the clock skew for a specific node (clock ahead of real time).
     ///
     /// This sets a positive skew (node's clock is ahead).
-    /// For negative skew (behind), use [`set_skew_ms`] with a negative value.
+    /// For negative skew (behind), use [`Self::set_skew_ms`] with a negative value.
     pub fn set_skew(&self, node: &I, skew: Duration) {
         let mut skews = self.skew_per_node.write();
         skews.insert(node.clone(), skew.as_millis() as i64);

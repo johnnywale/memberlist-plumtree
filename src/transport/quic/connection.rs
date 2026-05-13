@@ -6,6 +6,15 @@
 //! - Connection health monitoring
 //! - Thundering herd prevention via pending connection tracking
 //! - Strict connection limits via semaphore
+//!
+//! ## Semaphore permit lifetime
+//!
+//! Each cached connection (`PooledConnection`) holds an `Arc`-flavored
+//! semaphore permit. The permit is released automatically when the
+//! `PooledConnection` is dropped — i.e., whenever a connection is removed
+//! from the pool (eviction, idle cleanup, explicit `remove`, `close_all`).
+//! Removal sites therefore do not need to call `release`/`add_permits` by
+//! hand; dropping the value is sufficient.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Debug;
@@ -595,10 +604,10 @@ where
     ///
     /// # 0-RTT Support
     ///
-    /// If 0-RTT is enabled and a session ticket exists for this peer,
-    /// the transport attempts to send via early data (`open_uni_early`).
-    /// If early data is not available, it falls back to regular streams.
-    /// The `SendResult` includes whether 0-RTT was actually used.
+    /// Currently, `get_or_connect` awaits the full handshake before returning,
+    /// so streams opened here are 1-RTT. Real 0-RTT requires `Connecting::into_0rtt`
+    /// during connection setup; until that path is wired up, `used_0rtt` is always
+    /// `false` regardless of the `zero_rtt` config.
     pub async fn send(
         &self,
         peer: &I,
@@ -607,17 +616,13 @@ where
     ) -> Result<SendResult, QuicError> {
         let conn_result = self.get_or_connect(peer, addr).await?;
 
-        // Try to use 0-RTT early data if enabled
-        let mut used_0rtt = false;
+        // 0-RTT is not currently used: get_or_connect waits for handshake completion,
+        // so any stream opened on the returned connection is 1-RTT. Report this
+        // honestly in the metric rather than guessing from handshake_data().
+        let used_0rtt = false;
         let send_result = if self.config.zero_rtt.enabled {
-            // Attempt early data first
             match conn_result.connection.open_uni().await {
                 Ok(mut stream) => {
-                    // Check if we're still in 0-RTT phase (handshake not complete)
-                    // Note: quinn doesn't expose open_uni_early directly, but if the
-                    // connection was resumed with a session ticket and handshake isn't
-                    // complete yet, data sent is 0-RTT early data.
-                    used_0rtt = conn_result.connection.handshake_data().is_none();
                     stream.write_all(&data).await.map_err(QuicError::Write)?;
                     stream
                         .finish()
@@ -668,9 +673,6 @@ where
     }
 
     /// Remove a connection to a peer.
-    ///
-    /// The semaphore permit is automatically released when the `PooledConnection`
-    /// is dropped (RAII pattern).
     pub async fn remove(&self, peer: &I) -> bool {
         let removed = {
             let mut connections = self.connections.write().await;
@@ -679,7 +681,6 @@ where
                 self.stats
                     .connections_closed
                     .fetch_add(1, Ordering::Relaxed);
-                // Permit is released automatically when pooled is dropped
                 true
             } else {
                 false
@@ -695,8 +696,6 @@ where
     /// Evict the most idle (least recently used) connection.
     ///
     /// Uses the LRU index for O(log N) lookup instead of scanning all connections.
-    /// The semaphore permit is automatically released when the `PooledConnection`
-    /// is dropped (RAII pattern).
     async fn evict_idle(&self) {
         // Find the oldest connection using LRU index (O(log N))
         let oldest_peer = {
@@ -713,7 +712,6 @@ where
                     self.stats
                         .connections_closed
                         .fetch_add(1, Ordering::Relaxed);
-                    // Permit is released automatically when pooled is dropped
                     true
                 } else {
                     false
@@ -728,9 +726,6 @@ where
     }
 
     /// Close all connections.
-    ///
-    /// All semaphore permits are automatically released when the `PooledConnection`s
-    /// are dropped (RAII pattern).
     pub async fn close_all(&self) {
         {
             let mut connections = self.connections.write().await;
@@ -739,7 +734,6 @@ where
                 self.stats
                     .connections_closed
                     .fetch_add(1, Ordering::Relaxed);
-                // Permit is released automatically when pooled is dropped
             }
         }
         // Clear LRU index
@@ -779,7 +773,6 @@ where
     /// Clean up stale connections.
     ///
     /// Removes connections that have been idle longer than the idle timeout.
-    /// Semaphore permits are automatically released when connections are dropped (RAII).
     pub async fn cleanup_stale(&self) -> usize {
         let idle_timeout = self.config.connection.idle_timeout;
 
@@ -806,7 +799,6 @@ where
                         .connections_closed
                         .fetch_add(1, Ordering::Relaxed);
                     lru.remove(peer_id);
-                    // Permit is released automatically when pooled is dropped
                 }
             }
         }

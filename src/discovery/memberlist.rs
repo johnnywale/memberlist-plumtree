@@ -18,12 +18,15 @@
 //! ```
 
 use super::traits::{ClusterDiscovery, DiscoveryEvent, DiscoveryHandle};
+use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 // Re-export memberlist-core types for convenience
 pub use memberlist_core::{
@@ -282,6 +285,10 @@ pub struct PlumtreeNodeDelegate<I, A, D> {
     /// Outgoing Plumtree messages to broadcast via memberlist (unencooded).
     /// Serialization is deferred until messages are sent over the network.
     outgoing_rx: async_channel::Receiver<BroadcastEnvelope<I>>,
+    /// Already-encoded Plumtree messages that didn't fit in the previous
+    /// proportional bandwidth slot. Drained first on the next broadcast so
+    /// IHave/Graft control traffic isn't silently lost under sustained load.
+    pending_overflow: Mutex<VecDeque<(usize, Bytes)>>,
     /// Shared peer state for synchronizing membership changes.
     /// When memberlist detects a node join/leave, this is updated to keep
     /// Plumtree's peer state in sync.
@@ -344,6 +351,7 @@ impl<I, A, D> PlumtreeNodeDelegate<I, A, D> {
             inner,
             plumtree_tx,
             outgoing_rx,
+            pending_overflow: Mutex::new(VecDeque::new()),
             peers,
             eager_fanout,
             max_peers,
@@ -381,15 +389,6 @@ impl<I, A, D> PlumtreeNodeDelegate<I, A, D> {
     /// This can be used to forward Plumtree messages from external sources.
     pub fn plumtree_sender(&self) -> async_channel::Sender<(I, PlumtreeMessage)> {
         self.plumtree_tx.clone()
-    }
-
-    /// Get a clone of the outgoing envelope receiver.
-    ///
-    /// This can be used to receive outgoing Plumtree messages from external sources.
-    /// Messages are unencooded - call `.encode()` on the envelope to get bytes.
-    #[allow(dead_code)]
-    pub(crate) fn outgoing_receiver(&self) -> async_channel::Receiver<BroadcastEnvelope<I>> {
-        self.outgoing_rx.clone()
     }
 }
 
@@ -445,6 +444,22 @@ where
         // Serialization is deferred to here - encode just before network transmission
         let mut plumtree_msgs = Vec::new();
         let mut plumtree_used = 0;
+        let mut overflow_putback: VecDeque<(usize, Bytes)> = VecDeque::new();
+
+        // Drain any previously-overflowed messages first so we never silently
+        // drop IHave/Graft control traffic. Messages already carry their
+        // measured encoded length.
+        {
+            let mut pending = self.pending_overflow.lock();
+            while let Some((len, msg)) = pending.pop_front() {
+                if plumtree_used + len <= plumtree_limit {
+                    plumtree_used += len;
+                    plumtree_msgs.push(msg);
+                } else {
+                    overflow_putback.push_back((len, msg));
+                }
+            }
+        }
 
         while let Ok(envelope) = self.outgoing_rx.try_recv() {
             // Encode at the last moment before network transmission
@@ -454,8 +469,31 @@ where
                 plumtree_used += len;
                 plumtree_msgs.push(msg);
             } else {
-                // Plumtree hit its proportional limit, stop collecting
+                // Defer over-budget messages to the next broadcast cycle.
+                overflow_putback.push_back((len, msg));
                 break;
+            }
+        }
+
+        if !overflow_putback.is_empty() {
+            // Cap the deferral queue. If the bandwidth quota is chronically too
+            // small to absorb output, this queue would otherwise grow without
+            // bound; trimming the oldest entries keeps memory bounded while
+            // still letting fresh IHave/Graft traffic catch up.
+            const MAX_PENDING_OVERFLOW: usize = 1024;
+            let mut pending = self.pending_overflow.lock();
+            // Preserve ordering: deferred messages go to the front so they're
+            // tried first on the next call.
+            while let Some(item) = overflow_putback.pop_back() {
+                pending.push_front(item);
+            }
+            if pending.len() > MAX_PENDING_OVERFLOW {
+                let drop_count = pending.len() - MAX_PENDING_OVERFLOW;
+                pending.drain(MAX_PENDING_OVERFLOW..);
+                tracing::warn!(
+                    dropped = drop_count,
+                    "pending_overflow exceeded cap; bandwidth budget is too small for sustained Plumtree traffic"
+                );
             }
         }
 
@@ -799,13 +837,21 @@ where
         return Some(*socket_addr);
     }
 
-    // Try to extract from nodecraft::Node<I, SocketAddr> if that's what A is
-    // This covers the common case where memberlist uses Node<I, SocketAddr>
+    // Common case: memberlist uses nodecraft::Node<I, SocketAddr>.
+    if let Some(node) = addr_any.downcast_ref::<nodecraft::Node<I, SocketAddr>>() {
+        return Some(*node.address());
+    }
 
     // For other custom address types, users should:
     // 1. Implement a custom BridgeEventDelegate that extracts addresses
     // 2. Or manually update the resolver after notify_join
-
+    // Logged at debug! because misconfiguration produces one event per join,
+    // and many deployments use legitimate custom address types.
+    tracing::debug!(
+        type_name = std::any::type_name::<A>(),
+        "extract_socket_addr: could not extract SocketAddr from address type; \
+         QUIC resolver will not be updated for this peer"
+    );
     None
 }
 

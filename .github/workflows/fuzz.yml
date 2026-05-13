@@ -26,6 +26,13 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   fuzz:
     name: Fuzz (${{ matrix.target }})
@@ -41,13 +48,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust nightly
+      # cargo-fuzz only needs nightly to *build* fuzz targets (libFuzzer uses
+      # -Zsanitizer=address). The cargo-fuzz binary itself builds on stable and
+      # invokes `cargo +nightly` internally. So we install both, but cargo-fuzz
+      # is fetched as a prebuilt binary to avoid source compilation churn.
+      - name: Install Rust nightly (for fuzz targets)
         uses: dtolnay/rust-toolchain@nightly
         with:
           components: llvm-tools-preview
 
+      - name: Install Rust stable (for cargo-fuzz host build)
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
 
       - name: Cache fuzz corpus
         uses: actions/cache@v4
@@ -59,18 +75,14 @@ jobs:
           restore-keys: |
             fuzz-corpus-${{ matrix.target }}-
 
-      - name: Check if target should run
-        id: check
-        run: |
-          if [[ "${{ github.event.inputs.target }}" == "all" || "${{ github.event.inputs.target }}" == "${{ matrix.target }}" || "${{ github.event_name }}" != "workflow_dispatch" ]]; then
-            echo "should_run=true" >> $GITHUB_OUTPUT
-          else
-            echo "should_run=false" >> $GITHUB_OUTPUT
-          fi
-
+      # Per-step filter (not job-level) because `matrix` isn't available in
+      # job-level `if:` expressions — that context only resolves once the
+      # matrix has been expanded for an individual step's environment.
       - name: Run fuzzer
-        if: steps.check.outputs.should_run == 'true'
-        working-directory: fuzz
+        if: >-
+          github.event_name != 'workflow_dispatch' ||
+          github.event.inputs.target == 'all' ||
+          github.event.inputs.target == matrix.target
         run: |
           DURATION="${{ github.event.inputs.fuzz_duration || '60' }}"
           echo "Fuzzing ${{ matrix.target }} for ${DURATION} seconds..."
@@ -103,13 +115,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust nightly
+      - name: Install Rust nightly (for fuzz targets)
         uses: dtolnay/rust-toolchain@nightly
         with:
           components: llvm-tools-preview
 
+      - name: Install Rust stable (for cargo-fuzz host build)
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
 
       - name: Cache fuzz corpus
         uses: actions/cache@v4
@@ -122,7 +139,6 @@ jobs:
             fuzz-corpus-${{ matrix.target }}-
 
       - name: Run extended fuzzer (5 minutes)
-        working-directory: fuzz
         run: |
           echo "Extended fuzzing ${{ matrix.target }} for 300 seconds..."
           cargo +nightly fuzz run ${{ matrix.target }} -- \

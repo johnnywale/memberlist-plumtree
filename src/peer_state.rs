@@ -264,6 +264,22 @@ struct PeerStateInner<I> {
     cached_ring: Option<Vec<I>>,
 }
 
+/// Remove the first occurrence of `target` from `vec` in O(n) scan + O(1) remove.
+///
+/// `Vec::retain` does the same scan but also shifts every element after the match;
+/// since `eager_vec`/`lazy_vec` mirror a `HashSet` (so at most one match exists),
+/// `swap_remove` avoids the shift. Order in these vecs is not load-bearing — they
+/// exist only for random selection.
+#[inline]
+fn vec_remove_first<I: PartialEq>(vec: &mut Vec<I>, target: &I) -> bool {
+    if let Some(pos) = vec.iter().position(|p| p == target) {
+        vec.swap_remove(pos);
+        true
+    } else {
+        false
+    }
+}
+
 /// Compute a deterministic hash value for a peer ID using fixed-seed SipHash.
 /// This ensures consistent ordering across Rust versions and architectures.
 pub fn stable_hash<I: Hash>(id: &I) -> u64 {
@@ -559,19 +575,30 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
         let local_pos = find_position_in_ring(&sorted_ring, &local_id).unwrap_or(0);
         let ring_size = sorted_ring.len();
 
-        // Compute ring neighbors (these will be protected)
+        // Compute ring neighbors (these will be protected).
+        // Use a HashSet for O(1) dedup, plus a parallel Vec to preserve
+        // insertion order (which matters for the `take(eager_fanout)` below —
+        // adjacent links should win over long-range jumps when fanout is tight).
         let mut ring_neighbors: HashSet<I> = HashSet::new();
         let mut eager_candidates: Vec<I> = Vec::new();
+        let mut eager_seen: HashSet<I> = HashSet::new();
+
+        let try_add_eager = |peer: &I, candidates: &mut Vec<I>, seen: &mut HashSet<I>| {
+            if *peer != local_id && seen.insert(peer.clone()) {
+                candidates.push(peer.clone());
+                true
+            } else {
+                false
+            }
+        };
 
         // 1. Adjacent links (i±1) - basic ring connectivity (always eager + protected)
         let pred = (local_pos + ring_size - 1) % ring_size;
         let succ = (local_pos + 1) % ring_size;
-        if sorted_ring[pred] != local_id {
-            eager_candidates.push(sorted_ring[pred].clone());
+        if try_add_eager(&sorted_ring[pred], &mut eager_candidates, &mut eager_seen) {
             ring_neighbors.insert(sorted_ring[pred].clone());
         }
-        if sorted_ring[succ] != local_id && !eager_candidates.contains(&sorted_ring[succ]) {
-            eager_candidates.push(sorted_ring[succ].clone());
+        if try_add_eager(&sorted_ring[succ], &mut eager_candidates, &mut eager_seen) {
             ring_neighbors.insert(sorted_ring[succ].clone());
         }
 
@@ -579,12 +606,10 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
         if ring_size > 3 {
             let pred2 = (local_pos + ring_size - 2) % ring_size;
             let succ2 = (local_pos + 2) % ring_size;
-            if sorted_ring[pred2] != local_id && !eager_candidates.contains(&sorted_ring[pred2]) {
-                eager_candidates.push(sorted_ring[pred2].clone());
+            if try_add_eager(&sorted_ring[pred2], &mut eager_candidates, &mut eager_seen) {
                 ring_neighbors.insert(sorted_ring[pred2].clone());
             }
-            if sorted_ring[succ2] != local_id && !eager_candidates.contains(&sorted_ring[succ2]) {
-                eager_candidates.push(sorted_ring[succ2].clone());
+            if try_add_eager(&sorted_ring[succ2], &mut eager_candidates, &mut eager_seen) {
                 ring_neighbors.insert(sorted_ring[succ2].clone());
             }
         }
@@ -594,16 +619,16 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
             let jump = ring_size / 4;
             let jump_pred = (local_pos + ring_size - jump) % ring_size;
             let jump_succ = (local_pos + jump) % ring_size;
-            if sorted_ring[jump_pred] != local_id
-                && !eager_candidates.contains(&sorted_ring[jump_pred])
-            {
-                eager_candidates.push(sorted_ring[jump_pred].clone());
-            }
-            if sorted_ring[jump_succ] != local_id
-                && !eager_candidates.contains(&sorted_ring[jump_succ])
-            {
-                eager_candidates.push(sorted_ring[jump_succ].clone());
-            }
+            try_add_eager(
+                &sorted_ring[jump_pred],
+                &mut eager_candidates,
+                &mut eager_seen,
+            );
+            try_add_eager(
+                &sorted_ring[jump_succ],
+                &mut eager_candidates,
+                &mut eager_seen,
+            );
         }
 
         // Take up to eager_fanout from candidates
@@ -873,7 +898,7 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
 
                     // Remove evicted peer from lazy
                     inner.lazy.remove(&evicted);
-                    inner.lazy_vec.retain(|p| *p != evicted);
+                    vec_remove_first(&mut inner.lazy_vec, &evicted);
                     inner.known_peers.remove(&evicted);
                     Self::invalidate_ring_cache(&mut inner);
 
@@ -964,10 +989,10 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
 
         // Determine which set the peer was in and remove
         let result = if inner.eager.remove(peer) {
-            inner.eager_vec.retain(|p| p != peer);
+            vec_remove_first(&mut inner.eager_vec, peer);
             RemovePeerResult::RemovedEager
         } else if inner.lazy.remove(peer) {
-            inner.lazy_vec.retain(|p| p != peer);
+            vec_remove_first(&mut inner.lazy_vec, peer);
             RemovePeerResult::RemovedLazy
         } else {
             // Was in known_peers but not eager or lazy (shouldn't happen)
@@ -1022,13 +1047,13 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
 
             // Demote from eager to lazy
             inner.eager.remove(demote);
-            inner.eager_vec.retain(|p| p != demote);
+            vec_remove_first(&mut inner.eager_vec, demote);
             inner.lazy.insert(demote.clone());
             inner.lazy_vec.push(demote.clone());
 
             // Promote from lazy to eager
             inner.lazy.remove(promote);
-            inner.lazy_vec.retain(|p| p != promote);
+            vec_remove_first(&mut inner.lazy_vec, promote);
             inner.eager.insert(promote.clone());
             inner.eager_vec.push(promote.clone());
         }
@@ -1040,7 +1065,7 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
             }
             // Move from lazy to eager
             inner.lazy.remove(neighbor);
-            inner.lazy_vec.retain(|p| p != neighbor);
+            vec_remove_first(&mut inner.lazy_vec, neighbor);
             inner.eager.insert(neighbor.clone());
             inner.eager_vec.push(neighbor.clone());
         }
@@ -1065,7 +1090,7 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
 
         // Check eager first (more important for topology)
         if inner.eager.remove(peer) {
-            inner.eager_vec.retain(|p| p != peer);
+            vec_remove_first(&mut inner.eager_vec, peer);
             // Update ring neighbors after removal
             self.update_ring_neighbors(&mut inner);
             return RemovePeerResult::RemovedEager;
@@ -1073,7 +1098,7 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
 
         // Check lazy
         if inner.lazy.remove(peer) {
-            inner.lazy_vec.retain(|p| p != peer);
+            vec_remove_first(&mut inner.lazy_vec, peer);
             // Update ring neighbors after removal
             self.update_ring_neighbors(&mut inner);
             return RemovePeerResult::RemovedLazy;
@@ -1114,7 +1139,7 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
 
         // Remove from lazy if present (update both set and cache)
         if inner.lazy.remove(peer) {
-            inner.lazy_vec.retain(|p| p != peer);
+            vec_remove_first(&mut inner.lazy_vec, peer);
         }
 
         // Add to eager (update both set and cache)
@@ -1154,7 +1179,7 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
 
         // Move from eager to lazy (update both sets and caches)
         inner.eager.remove(peer);
-        inner.eager_vec.retain(|p| p != peer);
+        vec_remove_first(&mut inner.eager_vec, peer);
         inner.lazy.insert(peer.clone());
         inner.lazy_vec.push(peer.clone());
 
@@ -1372,7 +1397,7 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
                 for peer in to_promote {
                     inner.lazy.remove(&peer);
                     inner.eager.insert(peer.clone());
-                    inner.lazy_vec.retain(|p| *p != peer);
+                    vec_remove_first(&mut inner.lazy_vec, &peer);
                     inner.eager_vec.push(peer);
                 }
             }
@@ -1539,7 +1564,7 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
                 inner.lazy.remove(&peer);
                 inner.eager.insert(peer.clone());
                 // Update caches
-                inner.lazy_vec.retain(|p| *p != peer);
+                vec_remove_first(&mut inner.lazy_vec, &peer);
                 inner.eager_vec.push(peer.clone());
                 result.promoted.push(peer);
             }
@@ -1554,7 +1579,7 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
                 inner.eager.remove(&peer);
                 inner.lazy.insert(peer.clone());
                 // Update caches
-                inner.eager_vec.retain(|p| *p != peer);
+                vec_remove_first(&mut inner.eager_vec, &peer);
                 inner.lazy_vec.push(peer.clone());
                 result.demoted.push(peer);
             }
@@ -1757,7 +1782,7 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
 
         if let Some(ref peer) = peer_to_promote {
             inner.lazy.remove(peer);
-            inner.lazy_vec.retain(|p| p != peer);
+            vec_remove_first(&mut inner.lazy_vec, peer);
             inner.eager.insert(peer.clone());
             inner.eager_vec.push(peer.clone());
         }

@@ -1234,32 +1234,10 @@ where
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_is_gossip_message() {
-        // Create a mock Gossip message
-        // Format: [0x50][8 bytes sender_id][0x01 tag]...
-        let mut gossip_data = vec![0x50]; // Magic
-        gossip_data.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 1]); // Sender ID (u64)
-        gossip_data.push(0x01); // Tag = Gossip
-        gossip_data.extend_from_slice(b"payload");
-
-        // Create a mock IHave message
-        let mut ihave_data = vec![0x50];
-        ihave_data.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 1]);
-        ihave_data.push(0x02); // Tag = IHave
-
-        // Create a mock Graft message
-        let mut graft_data = vec![0x50];
-        graft_data.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 1]);
-        graft_data.push(0x03); // Tag = Graft
-
-        // We can't test the actual method without a transport instance,
-        // but we can verify the expected byte patterns
-        assert_eq!(gossip_data[0], 0x50);
-        assert_eq!(gossip_data[9], 0x01);
-        assert_eq!(ihave_data[9], 0x02);
-        assert_eq!(graft_data[9], 0x03);
-    }
+    // `test_is_gossip_message` was removed: it re-implemented the wire-format
+    // it claimed to test instead of exercising the actual classification method,
+    // so it gave zero regression value. A real test should drive an instantiated
+    // transport via the `testing` module — that lives in integration tests.
 
     #[test]
     fn test_quic_stats_default() {
