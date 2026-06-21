@@ -3,12 +3,8 @@
 //! These tests verify the new Phase 1 features work correctly in realistic scenarios:
 //! - Message Compression
 //! - Message Priority Queues
-//! - Enhanced Peer Health Monitoring
 
 mod common;
-
-use std::sync::Arc;
-use std::time::Duration;
 
 #[allow(unused_imports)]
 use common::allocate_ports;
@@ -16,8 +12,7 @@ use common::allocate_ports;
 #[cfg(feature = "compression")]
 use memberlist_plumtree::CompressionStats;
 use memberlist_plumtree::{
-    CompressionAlgorithm, CompressionConfig, MessagePriority, PeerHealthConfig, PeerHealthTracker,
-    PeerStatus, PriorityConfig, PriorityQueue, ZombieAction,
+    CompressionAlgorithm, CompressionConfig, MessagePriority, PriorityConfig, PriorityQueue,
 };
 
 // =============================================================================
@@ -258,167 +253,6 @@ fn test_priority_queue_starvation_prevention() {
 }
 
 // =============================================================================
-// PEER HEALTH MONITORING TESTS
-// =============================================================================
-
-#[test]
-fn test_peer_health_rtt_tracking() {
-    let config = PeerHealthConfig {
-        adaptive_timeout: true,
-        rtt_multiplier: 3.0,
-        ema_alpha: 0.5,
-        ..Default::default()
-    };
-    let tracker: PeerHealthTracker<u64> = PeerHealthTracker::new(config);
-
-    // Record RTT samples
-    tracker.record_success(&1, Duration::from_millis(100));
-    tracker.record_success(&1, Duration::from_millis(120));
-    tracker.record_success(&1, Duration::from_millis(80));
-
-    // Timeout should be roughly 3x the EMA of RTT
-    let timeout = tracker.timeout(&1);
-    assert!(
-        timeout.as_millis() >= 200 && timeout.as_millis() <= 400,
-        "Timeout should be ~300ms (3x ~100ms RTT), got {:?}",
-        timeout
-    );
-}
-
-#[test]
-fn test_peer_health_zombie_detection() {
-    let config = PeerHealthConfig {
-        zombie_threshold: 3,
-        zombie_action: ZombieAction::Demote,
-        ..Default::default()
-    };
-    let tracker: PeerHealthTracker<u64> = PeerHealthTracker::new(config);
-
-    // Record failures
-    assert_eq!(tracker.status(&1), PeerStatus::Healthy); // No data = healthy
-
-    tracker.record_failure(&1);
-    assert_eq!(tracker.status(&1), PeerStatus::Degraded);
-
-    tracker.record_failure(&1);
-    assert_eq!(tracker.status(&1), PeerStatus::Degraded);
-
-    // Third failure crosses threshold
-    let action = tracker.record_failure(&1);
-    assert_eq!(action, Some(ZombieAction::Demote));
-    assert_eq!(tracker.status(&1), PeerStatus::Zombie);
-    assert!(tracker.is_zombie(&1));
-
-    // Zombies list should contain this peer
-    let zombies = tracker.zombies();
-    assert!(zombies.contains(&1));
-}
-
-#[test]
-fn test_peer_health_recovery() {
-    let config = PeerHealthConfig {
-        zombie_threshold: 3,
-        ..Default::default()
-    };
-    let tracker: PeerHealthTracker<u64> = PeerHealthTracker::new(config);
-
-    // Make peer a zombie
-    for _ in 0..3 {
-        tracker.record_failure(&1);
-    }
-    assert!(tracker.is_zombie(&1));
-
-    // Single success should recover the peer
-    tracker.record_success(&1, Duration::from_millis(50));
-    assert_eq!(tracker.status(&1), PeerStatus::Healthy);
-    assert!(!tracker.is_zombie(&1));
-}
-
-#[test]
-fn test_peer_health_summary() {
-    let config = PeerHealthConfig {
-        zombie_threshold: 3,
-        ..Default::default()
-    };
-    let tracker: PeerHealthTracker<u64> = PeerHealthTracker::new(config);
-
-    // Create peers in different states
-    tracker.record_success(&1, Duration::from_millis(10)); // Healthy
-    tracker.record_success(&2, Duration::from_millis(20)); // Healthy
-    tracker.record_failure(&3); // Degraded
-    for _ in 0..3 {
-        tracker.record_failure(&4); // Zombie
-    }
-
-    let summary = tracker.summary();
-    assert_eq!(summary.total_peers, 4);
-    assert_eq!(summary.healthy, 2);
-    assert_eq!(summary.degraded, 1);
-    assert_eq!(summary.zombie, 1);
-    assert_eq!(summary.total_successes, 2);
-    assert_eq!(summary.total_failures, 4);
-}
-
-#[test]
-fn test_peer_health_adaptive_timeout_bounds() {
-    let config = PeerHealthConfig {
-        adaptive_timeout: true,
-        rtt_multiplier: 3.0,
-        min_timeout: Duration::from_millis(100),
-        max_timeout: Duration::from_secs(5),
-        ema_alpha: 1.0, // Use exact values
-        ..Default::default()
-    };
-    let tracker: PeerHealthTracker<u64> = PeerHealthTracker::new(config);
-
-    // Very fast peer - should clamp to min
-    tracker.record_success(&1, Duration::from_micros(100));
-    let timeout1 = tracker.timeout(&1);
-    assert!(
-        timeout1 >= Duration::from_millis(100),
-        "Should be at least min_timeout"
-    );
-
-    // Very slow peer - should clamp to max
-    tracker.record_success(&2, Duration::from_secs(10));
-    let timeout2 = tracker.timeout(&2);
-    assert!(
-        timeout2 <= Duration::from_secs(5),
-        "Should be at most max_timeout"
-    );
-}
-
-#[test]
-fn test_peer_health_concurrent_tracking() {
-    use std::thread;
-
-    let config = PeerHealthConfig::default();
-    let tracker = Arc::new(PeerHealthTracker::<u64>::new(config));
-
-    // Spawn multiple threads recording health data
-    let mut handles = vec![];
-
-    for peer_id in 0..10 {
-        let tracker = Arc::clone(&tracker);
-        handles.push(thread::spawn(move || {
-            for _ in 0..100 {
-                tracker.record_success(&peer_id, Duration::from_millis(10));
-            }
-        }));
-    }
-
-    for handle in handles {
-        handle.join().unwrap();
-    }
-
-    // All peers should be tracked
-    let summary = tracker.summary();
-    assert_eq!(summary.total_peers, 10);
-    assert_eq!(summary.total_successes, 1000); // 10 peers * 100 successes
-    assert_eq!(summary.healthy, 10);
-}
-
-// =============================================================================
 // INTEGRATION TESTS
 // =============================================================================
 
@@ -486,42 +320,4 @@ fn test_priority_with_message_types() {
     // Finally Prune (optimization)
     let (msg, _) = queue.pop().unwrap();
     assert!(matches!(msg, PlumtreeMessageType::Prune));
-}
-
-#[test]
-fn test_health_based_timeout_selection() {
-    // Simulate selecting timeout based on peer health for Graft retries
-    let config = PeerHealthConfig {
-        adaptive_timeout: true,
-        rtt_multiplier: 2.0,
-        min_timeout: Duration::from_millis(50),
-        max_timeout: Duration::from_secs(10),
-        ..Default::default()
-    };
-    let tracker: PeerHealthTracker<u64> = PeerHealthTracker::new(config);
-
-    // Fast peer (good network)
-    tracker.record_success(&1, Duration::from_millis(10));
-    tracker.record_success(&1, Duration::from_millis(12));
-    tracker.record_success(&1, Duration::from_millis(8));
-
-    // Slow peer (bad network or far away)
-    tracker.record_success(&2, Duration::from_millis(200));
-    tracker.record_success(&2, Duration::from_millis(250));
-    tracker.record_success(&2, Duration::from_millis(180));
-
-    let timeout1 = tracker.timeout(&1);
-    let timeout2 = tracker.timeout(&2);
-
-    // Slow peer should have longer timeout
-    assert!(
-        timeout2 > timeout1,
-        "Slow peer timeout {:?} should be > fast peer timeout {:?}",
-        timeout2,
-        timeout1
-    );
-
-    // Both should be within bounds
-    assert!(timeout1 >= Duration::from_millis(50));
-    assert!(timeout2 <= Duration::from_secs(10));
 }

@@ -7,8 +7,54 @@ use std::collections::HashSet;
 use std::net::{SocketAddr, TcpListener, UdpSocket};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::LazyLock;
-use std::sync::Mutex;
+use std::sync::{Mutex, Once};
 use std::time::Duration;
+
+/// Install a process-wide panic hook that swallows a known, harmless upstream
+/// race in `memberlist-net@0.7.x` during transport shutdown:
+///
+///   `index out of bounds: the len is 0 but the index is 0`
+///   at `memberlist-net-0.7.*/src/lib.rs`
+///
+/// The cached `num_v{4,6}_sockets` integer and the actual sockets `Vec` are
+/// separate fields; during `Drop` the vec is emptied while the count is not,
+/// so a still-in-flight round-robin send computes `idx = counter % cached_count`
+/// and panics indexing the now-empty vec. The race is timing-sensitive and
+/// surfaces on macOS CI under load; our test assertions are not affected.
+///
+/// We can't patch upstream. Filter the specific panic message + location and
+/// chain to the default hook for everything else. Real bugs still surface.
+///
+/// Safe to call from any number of tests — the install is `Once`-guarded.
+#[allow(dead_code)]
+pub fn install_panic_hook_filter() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let msg = info
+                .payload()
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("");
+
+            // Match the exact upstream panic: "index out of bounds: the len is 0
+            // but the index is 0" originating inside the memberlist-net crate.
+            let is_upstream_socket_race = msg.contains("index out of bounds")
+                && info
+                    .location()
+                    .map(|l| l.file().contains("memberlist-net"))
+                    .unwrap_or(false);
+
+            if is_upstream_socket_race {
+                // Swallow silently — real failures use the default hook below.
+                return;
+            }
+            default(info);
+        }));
+    });
+}
 
 #[allow(dead_code)]
 pub async fn eventually<F, Fut>(timeout: Duration, mut f: F) -> Result<(), &'static str>

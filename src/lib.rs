@@ -87,7 +87,6 @@ mod error;
 mod health;
 mod integration;
 mod message;
-mod peer_health;
 mod peer_scoring;
 mod peer_state;
 mod priority;
@@ -151,11 +150,6 @@ pub use health::{
 pub use message::{
     CacheStats, MessageCache, MessageId, MessageTag, PlumtreeMessage, PlumtreeMessageRef,
     SyncMessage,
-};
-
-// Re-export peer health monitoring types
-pub use peer_health::{
-    HealthSummary, PeerHealthConfig, PeerHealthState, PeerHealthTracker, PeerStatus, ZombieAction,
 };
 
 // Re-export peer state types

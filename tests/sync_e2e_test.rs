@@ -222,6 +222,7 @@ impl RealStack {
         port: u16,
         config: PlumtreeConfig,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        common::install_panic_hook_filter();
         let node_id = TestNodeId(name.to_string());
         // Use port allocator when port is 0 to avoid Windows socket permission errors
         let actual_port = if port == 0 { allocate_port() } else { port };

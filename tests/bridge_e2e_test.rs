@@ -276,6 +276,7 @@ impl RealStack {
         port: u16,
         config: PlumtreeConfig,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        common::install_panic_hook_filter();
         let node_id = TestNodeId(name.to_string());
         // Use port allocator when port is 0 to avoid Windows socket permission errors
         let actual_port = if port == 0 { allocate_port() } else { port };
@@ -636,7 +637,7 @@ async fn test_e2e_peer_topology_after_node_departure() {
 
     // Wait for cluster to stabilize - poll until all nodes see 6 members and have at least 3 peers
     println!("Waiting for cluster to stabilize...");
-    let max_wait = Duration::from_secs(15);
+    let max_wait = Duration::from_secs(30);
     let start = std::time::Instant::now();
     loop {
         let mut all_stable = true;
@@ -668,8 +669,7 @@ async fn test_e2e_peer_topology_after_node_departure() {
         }
 
         if start.elapsed() > max_wait {
-            println!("Warning: Timeout waiting for cluster to stabilize");
-            break;
+            panic!("stabilization wait exceeded budget; SWIM membership or Plumtree topology never converged. This usually means parallel-suite CPU contention exceeded the wait budget — bump it if real, or fix the convergence path if not.");
         }
 
         sleep(Duration::from_millis(500)).await;
@@ -720,7 +720,7 @@ async fn test_e2e_peer_topology_after_node_departure() {
     println!("Waiting for SWIM failure detection...");
 
     // Poll until all remaining nodes see <= 4 members (allowing for some detection delay)
-    let max_wait = Duration::from_secs(15);
+    let max_wait = Duration::from_secs(30);
     let start = std::time::Instant::now();
     loop {
         let mut all_detected = true;
@@ -738,8 +738,7 @@ async fn test_e2e_peer_topology_after_node_departure() {
         }
 
         if start.elapsed() > max_wait {
-            println!("Warning: Timeout waiting for all nodes to detect departures");
-            break;
+            panic!("wait for SWIM failure detection exceeded budget; not all surviving nodes saw the departure.");
         }
 
         sleep(Duration::from_millis(500)).await;
@@ -754,7 +753,7 @@ async fn test_e2e_peer_topology_after_node_departure() {
 
     // 5b. Wait for Plumtree topology to be updated (stopped nodes removed from peer sets)
     println!("Waiting for Plumtree topology to be updated...");
-    let max_wait = Duration::from_secs(15);
+    let max_wait = Duration::from_secs(30);
     let start = std::time::Instant::now();
     loop {
         let mut topology_clean = true;
@@ -777,8 +776,7 @@ async fn test_e2e_peer_topology_after_node_departure() {
         }
 
         if start.elapsed() > max_wait {
-            println!("Warning: Timeout waiting for Plumtree topology to be updated");
-            break;
+            panic!("wait for Plumtree topology cleanup exceeded budget; stopped nodes still appear in some peer set.");
         }
 
         sleep(Duration::from_millis(500)).await;
@@ -957,7 +955,7 @@ async fn test_e2e_peer_topology_after_node_restart() {
     // 3. Wait for SWIM failure detection
     println!("Waiting for SWIM failure detection...");
 
-    let max_wait = Duration::from_secs(15);
+    let max_wait = Duration::from_secs(30);
     let start = std::time::Instant::now();
     loop {
         let mut all_detected = true;
@@ -977,8 +975,7 @@ async fn test_e2e_peer_topology_after_node_restart() {
         }
 
         if start.elapsed() > max_wait {
-            println!("Warning: Timeout waiting for all nodes to detect departures");
-            break;
+            panic!("wait for SWIM failure detection exceeded budget; not all surviving nodes saw the departure.");
         }
 
         sleep(Duration::from_millis(500)).await;
@@ -1019,7 +1016,7 @@ async fn test_e2e_peer_topology_after_node_restart() {
     // 5. Wait for SWIM to detect rejoined nodes (all nodes should see 6 members)
     println!("Waiting for SWIM to detect rejoined nodes...");
 
-    let max_wait = Duration::from_secs(15);
+    let max_wait = Duration::from_secs(30);
     let start = std::time::Instant::now();
     loop {
         let mut all_detected = true;
@@ -1052,8 +1049,7 @@ async fn test_e2e_peer_topology_after_node_restart() {
         }
 
         if start.elapsed() > max_wait {
-            println!("Warning: Timeout waiting for cluster to reform");
-            break;
+            panic!("wait for cluster reformation after restart exceeded budget; not all nodes see the rejoined members.");
         }
 
         sleep(Duration::from_millis(500)).await;
@@ -1241,9 +1237,9 @@ async fn test_e2e_network_aware_rebalancing() {
         sleep(Duration::from_millis(100)).await;
     }
 
-    // Wait for cluster to stabilize - both memberlist AND plumtree topology
-    // Use longer timeout since peer discovery can take time with 6 nodes
-    let max_wait = Duration::from_secs(20);
+    // Wait for cluster to stabilize - both memberlist AND plumtree topology.
+    // 30s budget absorbs parallel-suite CPU contention on macOS CI.
+    let max_wait = Duration::from_secs(30);
     let start = std::time::Instant::now();
     loop {
         let mut all_stable = true;
@@ -1271,8 +1267,8 @@ async fn test_e2e_network_aware_rebalancing() {
         }
 
         if start.elapsed() > max_wait {
-            println!("Warning: Timeout waiting for cluster to stabilize");
-            // Print diagnostic info
+            // Print diagnostic info before failing so the panic message points
+            // at the convergence step rather than a downstream peer-count assert.
             for (i, node) in nodes.iter().enumerate() {
                 let stats = node.peer_stats();
                 println!(
@@ -1283,7 +1279,7 @@ async fn test_e2e_network_aware_rebalancing() {
                     stats.eager_count + stats.lazy_count
                 );
             }
-            break;
+            panic!("stabilization wait exceeded budget — see diagnostic output above for per-node peer counts");
         }
 
         sleep(Duration::from_millis(200)).await;
@@ -1431,8 +1427,7 @@ async fn test_e2e_network_aware_rebalancing() {
         }
 
         if start.elapsed() > max_wait {
-            println!("Warning: Timeout waiting for topology to stabilize after rebalance");
-            break;
+            panic!("wait for topology to stabilize after rebalance exceeded budget.");
         }
 
         sleep(Duration::from_millis(200)).await;

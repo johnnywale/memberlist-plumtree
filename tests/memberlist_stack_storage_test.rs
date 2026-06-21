@@ -209,6 +209,7 @@ struct TestNode {
 
 impl TestNode {
     async fn new(name: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        common::install_panic_hook_filter();
         let node_id = TestNodeId(name.to_string());
         let port = allocate_port();
         let bind_addr: SocketAddr = format!("127.0.0.1:{}", port).parse()?;

@@ -43,8 +43,8 @@ use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use memberlist_plumtree::{
     discovery::{StaticDiscovery, StaticDiscoveryConfig},
-    ConnectionEvent, MapPeerResolver, MessageId, PeerStats, PeerStatus, PeerTopology,
-    PlumtreeConfig, PlumtreeDelegate, PlumtreeStack, PlumtreeStackConfig, QuicConfig,
+    ConnectionEvent, MapPeerResolver, MessageId, PeerStats, PeerTopology, PlumtreeConfig,
+    PlumtreeDelegate, PlumtreeStack, PlumtreeStackConfig, QuicConfig,
 };
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use serde_json::{json, Value};
@@ -107,64 +107,6 @@ impl QuicMetrics {
         self.peers_healthy.fetch_sub(1, Ordering::SeqCst);
         #[cfg(feature = "metrics")]
         memberlist_plumtree::metrics::dec_peers_healthy();
-    }
-
-    /// Increment degraded peer count
-    fn inc_degraded(&self) {
-        self.peers_degraded.fetch_add(1, Ordering::SeqCst);
-        #[cfg(feature = "metrics")]
-        memberlist_plumtree::metrics::inc_peers_degraded();
-    }
-
-    /// Decrement degraded peer count
-    fn dec_degraded(&self) {
-        self.peers_degraded.fetch_sub(1, Ordering::SeqCst);
-        #[cfg(feature = "metrics")]
-        memberlist_plumtree::metrics::dec_peers_degraded();
-    }
-
-    /// Increment zombie peer count
-    fn inc_zombie(&self) {
-        self.peers_zombie.fetch_add(1, Ordering::SeqCst);
-        #[cfg(feature = "metrics")]
-        memberlist_plumtree::metrics::inc_peers_zombie();
-    }
-
-    /// Decrement zombie peer count
-    fn dec_zombie(&self) {
-        self.peers_zombie.fetch_sub(1, Ordering::SeqCst);
-        #[cfg(feature = "metrics")]
-        memberlist_plumtree::metrics::dec_peers_zombie();
-    }
-
-    /// Transition a peer from one health state to another.
-    /// Decrements the old state counter and increments the new state counter.
-    #[allow(dead_code)]
-    fn transition_peer_health(&self, from: Option<PeerStatus>, to: PeerStatus) {
-        // Decrement old state if present
-        if let Some(old) = from {
-            match old {
-                PeerStatus::Healthy => self.dec_healthy(),
-                PeerStatus::Degraded => self.dec_degraded(),
-                PeerStatus::Zombie => self.dec_zombie(),
-            }
-        }
-        // Increment new state
-        match to {
-            PeerStatus::Healthy => self.inc_healthy(),
-            PeerStatus::Degraded => self.inc_degraded(),
-            PeerStatus::Zombie => self.inc_zombie(),
-        }
-    }
-
-    /// Remove a peer (decrement its current health state)
-    #[allow(dead_code)]
-    fn remove_peer(&self, current: PeerStatus) {
-        match current {
-            PeerStatus::Healthy => self.dec_healthy(),
-            PeerStatus::Degraded => self.dec_degraded(),
-            PeerStatus::Zombie => self.dec_zombie(),
-        }
     }
 
     /// Convert to JSON, reading all metrics from Prometheus text output.

@@ -409,7 +409,8 @@ struct PlumtreeInner<I, D> {
     /// Rate limiter for Graft requests (per-peer).
     graft_rate_limiter: RateLimiter<I>,
 
-    /// Peer scoring for RTT-based optimization and zombie peer detection.
+    /// Peer scoring for RTT- and failure-based peer ranking (eager-peer
+    /// promotion and topology rebalancing).
     peer_scoring: Arc<PeerScoring<I>>,
 
     /// Dynamic cleanup tuning based on system load.

@@ -33,9 +33,9 @@ use memberlist::net::NetTransportOptions;
 use memberlist::tokio::{TokioRuntime, TokioSocketAddrResolver, TokioTcp};
 use memberlist::{Memberlist, Options as MemberlistOptions};
 use memberlist_plumtree::{
-    storage::MemoryStore, CompressionConfig, Error, IdCodec, MessageId, PeerHealthConfig,
-    PeerHealthTracker, PeerStats, PeerTopology, PlumtreeBridge, PlumtreeConfig, PlumtreeDelegate,
-    PlumtreeDiscovery, PlumtreeNodeDelegate, SyncConfig,
+    storage::MemoryStore, CompressionConfig, Error, IdCodec, MessageId, PeerStats, PeerTopology,
+    PlumtreeBridge, PlumtreeConfig, PlumtreeDelegate, PlumtreeDiscovery, PlumtreeNodeDelegate,
+    SyncConfig,
 };
 use metrics_exporter_prometheus::PrometheusBuilder;
 use nodecraft::resolver::socket_addr::SocketAddrResolver;
@@ -187,9 +187,6 @@ struct MemberlistChatDelegate {
     node_idx: usize,
     /// Reference to the PlumtreeDiscovery (set after construction)
     pm: Arc<RwLock<Option<Arc<PlumtreeDiscovery<NodeId, Arc<MemberlistChatDelegate>>>>>>,
-    /// Peer health tracker for Phase 1 features
-    #[allow(dead_code)]
-    peer_health: Arc<PeerHealthTracker<NodeId>>,
 }
 
 impl MemberlistChatDelegate {
@@ -204,7 +201,6 @@ impl MemberlistChatDelegate {
             start_time: Instant::now(),
             node_idx,
             pm: Arc::new(RwLock::new(None)),
-            peer_health: Arc::new(PeerHealthTracker::new(PeerHealthConfig::default())),
         }
     }
 
