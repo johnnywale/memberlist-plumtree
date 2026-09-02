@@ -188,8 +188,8 @@ where
         &self,
         from: I,
         message: SyncMessage,
-    ) -> SyncResult<Option<SyncMessage>> {
-        handle_sync_message_common(&self.sync_handler, from, message).await
+    ) -> SyncResult<Vec<SyncMessage>> {
+        handle_sync_message_common(&self.sync_handler, from, message, self.config.sync_window).await
     }
 
     fn is_enabled(&self) -> bool {
@@ -206,6 +206,13 @@ where
 
     fn remove_message(&self, id: &MessageId) {
         self.sync_handler.remove_message(id);
+    }
+
+    fn shutdown(&self) {
+        // Breaks the periodic sync loop in `run_background_sync`, which
+        // otherwise runs for the lifetime of the process and pins the node's
+        // store and peer state.
+        self.shutdown.store(true, Ordering::Release);
     }
 }
 
@@ -225,8 +232,11 @@ where
         let now = current_time_ms();
         let start = now.saturating_sub(self.config.sync_window.as_millis() as u64);
 
-        // Get root hash
-        let root_hash = self.sync_handler.root_hash();
+        // Scope the root hash to the same window the request asks about.
+        // An all-history hash compared against window-scoped responses can
+        // never converge: divergence older than the window mismatches every
+        // round with no exchange able to repair it.
+        let root_hash = self.sync_handler.root_hash_in_window(start, now);
 
         // Build and send SyncRequest
         let request = PlumtreeMessage::Sync(SyncMessage::Request {
@@ -380,10 +390,11 @@ mod tests {
         let result = strategy.handle_sync_message(1u64, request).await;
         assert!(result.is_ok());
 
-        if let Some(SyncMessage::Response { matches, .. }) = result.unwrap() {
+        let replies = result.unwrap();
+        if let [SyncMessage::Response { matches, .. }] = replies.as_slice() {
             assert!(!matches); // Should not match
         } else {
-            panic!("expected SyncResponse");
+            panic!("expected a single SyncResponse, got {:?}", replies);
         }
     }
 
@@ -400,7 +411,7 @@ mod tests {
 
         let result = strategy.handle_sync_message(1u64, response).await;
         assert!(result.is_ok());
-        assert!(result.unwrap().is_none()); // No follow-up needed
+        assert!(result.unwrap().is_empty()); // No follow-up needed
     }
 
     #[test]

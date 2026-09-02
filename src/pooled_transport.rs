@@ -52,6 +52,17 @@ pub struct PoolConfig {
     pub max_queue_per_peer: usize,
 
     /// Whether to enable fair scheduling across peers.
+    ///
+    /// # Deprecated behavior
+    ///
+    /// This no longer changes permit acquisition order. It previously selected
+    /// between acquiring the global permit first (`true`) or the per-peer
+    /// permit first (`false`); taking the global permit first meant a task
+    /// waited on its per-peer permit *while holding* a global one, so a handful
+    /// of stalled peers could exhaust the global budget and freeze sends to
+    /// healthy peers. The per-peer permit is now always acquired first, which
+    /// is both fair and starvation-free, so this flag has no effect. It is
+    /// retained for API compatibility.
     pub fair_scheduling: bool,
 }
 
@@ -167,6 +178,35 @@ impl PeerState {
             messages_sent: AtomicU64::new(0),
             messages_dropped: AtomicU64::new(0),
         }
+    }
+}
+
+/// RAII guard for a peer's queue-depth counter.
+///
+/// Increments on acquire and decrements on drop, so the counter is released on
+/// every exit path — including a cancelled future, which a bare
+/// increment/decrement pair around an `.await` would leak. Leaked slots are
+/// permanent: once `max_queue_per_peer` of them accumulate, every subsequent
+/// send to that peer is rejected as `QueueFull` for the process lifetime.
+struct QueueDepthGuard {
+    peer_state: Arc<PeerState>,
+}
+
+impl QueueDepthGuard {
+    /// Reserve a queue slot, or return `None` if the peer's queue is full.
+    fn acquire(peer_state: Arc<PeerState>, max_queue: u64) -> Option<Self> {
+        let current = peer_state.queue_depth.fetch_add(1, Ordering::Relaxed);
+        if current >= max_queue {
+            peer_state.queue_depth.fetch_sub(1, Ordering::Relaxed);
+            return None;
+        }
+        Some(Self { peer_state })
+    }
+}
+
+impl Drop for QueueDepthGuard {
+    fn drop(&mut self) {
+        self.peer_state.queue_depth.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -312,26 +352,28 @@ where
     ) -> Result<(), PooledTransportError<T::Error>> {
         let peer_state = self.get_peer_state(target);
 
-        // Check queue depth
-        let current_queue = peer_state.queue_depth.fetch_add(1, Ordering::Relaxed);
-        if current_queue >= self.config.max_queue_per_peer as u64 {
-            peer_state.queue_depth.fetch_sub(1, Ordering::Relaxed);
-            peer_state.messages_dropped.fetch_add(1, Ordering::Relaxed);
-            self.stats.messages_dropped.fetch_add(1, Ordering::Relaxed);
-            return Err(PooledTransportError::QueueFull);
-        }
-
-        // Acquire permits (peer + global)
-        // In fair scheduling mode, we acquire global first to prevent per-peer starvation
-        let (global_permit, peer_permit) = if self.config.fair_scheduling {
-            let global = self.global_semaphore.acquire_arc().await;
-            let peer = peer_state.semaphore.acquire_arc().await;
-            (global, peer)
-        } else {
-            let peer = peer_state.semaphore.acquire_arc().await;
-            let global = self.global_semaphore.acquire_arc().await;
-            (global, peer)
+        // Check queue depth. The counter is held by an RAII guard: there is an
+        // `.await` between here and the send, so a cancelled caller (e.g. one
+        // wrapped in `tokio::time::timeout`) would otherwise leak the increment
+        // permanently, and enough leaks mark the peer's queue as forever full.
+        let queue_guard = match QueueDepthGuard::acquire(
+            peer_state.clone(),
+            self.config.max_queue_per_peer as u64,
+        ) {
+            Some(guard) => guard,
+            None => {
+                peer_state.messages_dropped.fetch_add(1, Ordering::Relaxed);
+                self.stats.messages_dropped.fetch_add(1, Ordering::Relaxed);
+                return Err(PooledTransportError::QueueFull);
+            }
         };
+
+        // Acquire permits. Always take the per-peer permit first, then the
+        // global one: holding a global permit while waiting on a per-peer
+        // permit lets a handful of stalled peers pin the entire global budget
+        // and freeze sends to healthy peers.
+        let peer_permit = peer_state.semaphore.acquire_arc().await;
+        let global_permit = self.global_semaphore.acquire_arc().await;
 
         // Update active count and track peak
         let active = self.stats.active_sends.fetch_add(1, Ordering::Relaxed) + 1;
@@ -339,8 +381,8 @@ where
             .peak_concurrent
             .fetch_max(active, Ordering::Relaxed);
 
-        // Decrement queue depth now that we're active
-        peer_state.queue_depth.fetch_sub(1, Ordering::Relaxed);
+        // No longer queued: we hold both permits and are about to send.
+        drop(queue_guard);
 
         // Send the message
         let result = self.inner.send_to(target, data).await;

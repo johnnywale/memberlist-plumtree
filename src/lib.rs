@@ -96,7 +96,13 @@ mod priority;
 /// Provides trait-based chaos injection:
 /// - [`chaos::NoopChaosPolicy`] - Production (zero overhead, compiles to nothing)
 /// - [`chaos::ConfigurableChaosPolicy`] - Dev/Test (full chaos support)
+#[cfg(feature = "testing")]
+#[cfg_attr(docsrs, doc(cfg(feature = "testing")))]
 pub mod chaos;
+
+// See the note on `testing` below: kept available for the crate's own tests.
+#[cfg(all(test, not(feature = "testing")))]
+mod chaos;
 
 pub mod discovery;
 mod plumtree;
@@ -106,8 +112,16 @@ mod runner;
 mod scheduler;
 mod stack;
 pub mod storage;
+#[cfg_attr(docsrs, doc(cfg(feature = "sync")))]
 pub mod sync;
+#[cfg(feature = "testing")]
+#[cfg_attr(docsrs, doc(cfg(feature = "testing")))]
 pub mod testing;
+
+// The crate's own unit tests use these helpers, so keep the module available
+// internally even when the public `testing` feature is off.
+#[cfg(all(test, not(feature = "testing")))]
+mod testing;
 mod transport;
 
 #[cfg(feature = "metrics")]
@@ -151,6 +165,10 @@ pub use message::{
     CacheStats, MessageCache, MessageId, MessageTag, PlumtreeMessage, PlumtreeMessageRef,
     SyncMessage,
 };
+// Wire-format limits. Encoders must respect these: a message exceeding one is
+// rejected as malformed by every receiver's decoder, silently, so exceeding
+// them disables the affected mechanism cluster-wide rather than erroring.
+pub use message::{MAX_IHAVE_BATCH, MAX_SYNC_BATCH, MAX_SYNC_PUSH_MESSAGES};
 
 // Re-export peer state types
 pub use peer_state::{
@@ -164,6 +182,8 @@ pub use priority::{
 };
 
 // Re-export chaos types
+#[cfg(feature = "testing")]
+#[cfg_attr(docsrs, doc(cfg(feature = "testing")))]
 pub use chaos::{
     ChaosConfig, ChaosDecision, ChaosPolicy, ChaosStatsSnapshot, ConfigurableChaosPolicy,
     MessageType as ChaosMessageType, NoopChaosPolicy, SharedChaosPolicy,
@@ -175,7 +195,7 @@ pub use peer_scoring::{PeerScore, PeerScoring, ScoringConfig, ScoringStats};
 // Re-export core plumtree types
 pub use plumtree::{
     IncomingMessage, NoopDelegate, OutgoingMessage, Plumtree, PlumtreeDelegate, PlumtreeHandle,
-    SeenMapStats,
+    SeenMapStats, GRAFT_TOPOLOGY_ONLY,
 };
 
 // Re-export runner types
@@ -187,10 +207,11 @@ pub use runner::{PlumtreeRunner, PlumtreeRunnerBuilder};
 
 // Re-export integration types
 pub use integration::{
-    decode_plumtree_envelope, decode_plumtree_message, encode_plumtree_envelope,
-    encode_plumtree_envelope_into, encode_plumtree_envelope_with_compression,
-    encode_plumtree_message, envelope_encoded_len, is_plumtree_message, BroadcastEnvelope, IdCodec,
-    MessagePage, PlumtreeDiscovery, PlumtreeEventHandler,
+    decode_plumtree_envelope, decode_plumtree_envelope_capped, decode_plumtree_message,
+    encode_plumtree_envelope, encode_plumtree_envelope_into,
+    encode_plumtree_envelope_with_compression, encode_plumtree_message, envelope_encoded_len,
+    is_plumtree_message, BroadcastEnvelope, IdCodec, MessagePage, PlumtreeDiscovery,
+    PlumtreeEventHandler, DEFAULT_MAX_DECOMPRESSED_ENVELOPE,
 };
 
 // Re-export memberlist-specific integration types (requires memberlist feature)
@@ -239,6 +260,7 @@ pub use transport::quic::{
     QuicError,
     QuicStats,
     QuicTransport,
+    SenderAuth,
     SessionTicketStore,
     StreamConfig,
     TlsConfig,

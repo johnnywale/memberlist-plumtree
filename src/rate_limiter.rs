@@ -133,11 +133,36 @@ impl<K: Clone + Eq + Hash> RateLimiter<K> {
         *last_cleanup = now;
         drop(last_cleanup);
 
-        // Remove buckets that are at max capacity (haven't been used recently)
-        let stale_threshold = now - self.cleanup_interval;
+        // Drop buckets that have been idle long enough to have fully refilled.
+        //
+        // A bucket is equivalent to "absent" once its tokens would be back at
+        // max, since a fresh bucket starts full. Note that tokens are only
+        // refilled inside `check_n`, so a bucket's stored `tokens` stays at
+        // whatever it was when last used: testing the stored value would keep
+        // every bucket that was ever used forever. Compute the refilled value
+        // from elapsed time instead.
         buckets.retain(|_, bucket| {
-            bucket.last_update > stale_threshold || bucket.tokens < self.max_tokens as f64 - 0.1
+            let idle = now.duration_since(bucket.last_update).as_secs_f64();
+            let refilled = bucket.tokens + idle * self.refill_rate;
+            // Keep only buckets still holding consumed tokens.
+            refilled < self.max_tokens as f64 - 0.1
         });
+    }
+
+    /// Remove a key's bucket.
+    ///
+    /// Call this when a peer departs so its bucket does not linger until the
+    /// next cleanup sweep.
+    pub fn remove(&self, key: &K) {
+        self.buckets.lock().remove(key);
+    }
+
+    /// Number of buckets currently tracked.
+    ///
+    /// Exposed for tests and diagnostics: unbounded growth here means cleanup
+    /// is not evicting.
+    pub fn bucket_count(&self) -> usize {
+        self.buckets.lock().len()
     }
 }
 

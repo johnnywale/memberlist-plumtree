@@ -143,7 +143,7 @@ pub use resolver::{MapPeerResolver, PeerResolver};
 #[allow(unused_imports)]
 pub use transport::{
     CleanupTaskHandle, ConnectionEvent, DisconnectReason, IncomingConfig, IncomingHandle,
-    IncomingStats, QuicStats, QuicTransport,
+    IncomingStats, QuicStats, QuicTransport, SenderAuth,
 };
 
 // Re-export TLS utilities (used by consumers who want lower-level control)

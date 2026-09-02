@@ -483,8 +483,14 @@ async fn test_sync_handler_matching_state() {
     let hash_b = handler_b.root_hash();
     assert_eq!(hash_a, hash_b, "Hashes should match when content is same");
 
-    // Sync request should show match
-    let response = handler_b.handle_sync_request(hash_a, (0, 1000)).await;
+    // Sync request should show match. The window must cover the messages'
+    // own timestamps: the comparison hash is scoped to the requested range, so
+    // asking about a range the messages don't fall into is a real mismatch,
+    // not a match.
+    let window = (0, u64::MAX);
+    let response = handler_b
+        .handle_sync_request(handler_a.root_hash_in_window(window.0, window.1), window)
+        .await;
     assert!(response.matches, "Response should indicate match");
     assert!(
         response.message_ids.is_empty(),

@@ -313,11 +313,29 @@ async fn test_ihave_graft_flow_with_limits() {
 
     node2.handle_message(NodeId(1), ihave).await.unwrap();
 
-    // Node 2 should have promoted node 1 to eager (missing message triggers GRAFT)
+    // IHave only arms the missed-message timer; the Graft (and the promotion
+    // that goes with it) happens when that timer expires. Drive the timer.
+    let node2_timer = node2.clone();
+    let timer_task = tokio::spawn(async move {
+        node2_timer.run_graft_timer().await;
+    });
+
+    // Node 2 should promote node 1 to eager once the Graft actually fires.
+    let promoted = async {
+        loop {
+            if node2.peers().is_eager(&NodeId(1)) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
     assert!(
-        node2.peers().is_eager(&NodeId(1)),
-        "Node 1 should be promoted to eager on node 2 after IHave for missing message"
+        tokio::time::timeout(Duration::from_secs(5), promoted)
+            .await
+            .unwrap_or(false),
+        "Node 1 should be promoted to eager on node 2 once the Graft timer fires"
     );
+    timer_task.abort();
 
     // Check that node 2 queued a GRAFT request
     // (In real scenario, this would be sent back to node 1)
@@ -601,12 +619,29 @@ async fn test_ihave_graft_full_flow_with_scheduler() {
 
     assert!(ihave_sent, "Node 1 should have sent IHave to lazy peer");
 
-    // Node 2 should have promoted Node 1 to eager and sent GRAFT
-    // The promotion happens in handle_ihave when message is missing
+    // IHave only arms the missed-message timer; the Graft and the promotion
+    // that accompanies it happen when that timer expires. Drive the timer.
+    let node2_timer = node2.clone();
+    let timer_task = tokio::spawn(async move {
+        node2_timer.run_graft_timer().await;
+    });
+
+    // Node 2 should promote Node 1 to eager once the Graft actually fires.
+    let promoted = async {
+        loop {
+            if node2.peers().is_eager(&NodeId(1)) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
     assert!(
-        node2.peers().is_eager(&NodeId(1)),
-        "Node 2 should have promoted Node 1 to eager after receiving IHave for missing message"
+        tokio::time::timeout(Duration::from_secs(5), promoted)
+            .await
+            .unwrap_or(false),
+        "Node 2 should promote Node 1 to eager once the Graft timer fires"
     );
+    timer_task.abort();
 
     // Process outgoing messages from Node 2 (should include GRAFT)
     let mut graft_sent = false;

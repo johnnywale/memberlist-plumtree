@@ -113,6 +113,20 @@ pub fn init_metrics() {
         "plumtree_graft_retries_total",
         "Total number of Graft retry attempts"
     );
+    describe_counter!(
+        "plumtree_decompress_failures_total",
+        "Total number of received payloads dropped because they failed to \
+         decompress or exceeded the decompressed-size limit"
+    );
+    describe_counter!(
+        "plumtree_prune_ignored_total",
+        "Total number of Prune requests ignored because the sender is a \
+         protected hash-ring neighbor"
+    );
+    describe_counter!(
+        "plumtree_ihave_queue_overflow_total",
+        "Total number of IHave announcements dropped because the queue was full"
+    );
 
     // Histograms
     describe_histogram!(
@@ -262,6 +276,22 @@ pub fn record_broadcast() {
 /// Record a message delivery.
 pub fn record_delivery() {
     counter!("plumtree_messages_delivered_total").increment(1);
+}
+
+/// Record a received payload dropped for failing decompression or exceeding
+/// the decompressed-size limit.
+pub fn record_decompress_failure() {
+    counter!("plumtree_decompress_failures_total").increment(1);
+}
+
+/// Record a Prune ignored because the sender is a protected ring neighbor.
+pub fn record_prune_ignored() {
+    counter!("plumtree_prune_ignored_total").increment(1);
+}
+
+/// Record an IHave announcement dropped because the queue was full.
+pub fn record_ihave_queue_overflow(dropped: u64) {
+    counter!("plumtree_ihave_queue_overflow_total").increment(dropped);
 }
 
 /// Record a duplicate message.

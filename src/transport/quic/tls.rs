@@ -471,14 +471,11 @@ fn build_rustls_server_config(
 ) -> Result<rustls::ServerConfig, QuicError> {
     let mut config = if tls.mtls_enabled {
         // Build with mTLS client certificate verification
-        let mut verifier = if let Some(ca_path) = &tls.ca_path {
-            PeerIdVerifier::from_ca_file(ca_path)?
-        } else {
-            // Use system roots + any custom CA
-            let mut roots = RootCertStore::empty();
-            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            PeerIdVerifier::new(roots)
-        };
+        // When a cluster CA is pinned, trust only that CA for client
+        // certificates. Public WebPKI roots are used only as a fallback when no
+        // CA is configured, so a publicly-trusted certificate can never satisfy
+        // client auth for a privately-CA'd cluster.
+        let mut verifier = PeerIdVerifier::new(build_client_root_store(tls)?);
 
         // Configure peer ID verification if requested
         if let Some(ref expected_peer_id) = tls.expected_peer_id {
@@ -671,22 +668,50 @@ pub(crate) fn client_config_full(
     Ok(config)
 }
 
-/// Build a secure client crypto configuration.
-fn secure_client_crypto(tls: &TlsConfig) -> Result<ClientConfig, QuicError> {
+/// Build the client-side root certificate store.
+///
+/// # Security
+///
+/// When `ca_path` is set the cluster is using a private CA, and *only* that CA
+/// is trusted. Public WebPKI roots are deliberately excluded: including them
+/// would let anyone holding a publicly-trusted certificate for the configured
+/// `server_name` (trivially obtainable for a real domain) impersonate a cluster
+/// peer, silently defeating the pinning the operator asked for.
+///
+/// Public WebPKI roots are used only when no CA is pinned.
+fn build_client_root_store(tls: &TlsConfig) -> Result<RootCertStore, QuicError> {
     let mut root_store = RootCertStore::empty();
 
-    // Add system roots
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-    // Add custom CA if provided
     if let Some(ca_path) = &tls.ca_path {
+        // Private CA pinned: trust that CA exclusively.
         let ca_certs = load_certificates(ca_path)?;
         for cert in ca_certs {
             root_store
                 .add(cert)
                 .map_err(|e| QuicError::Certificate(e.to_string()))?;
         }
+        if root_store.is_empty() {
+            return Err(QuicError::Certificate(format!(
+                "no usable certificates found in CA file {}",
+                ca_path.display()
+            )));
+        }
+        tracing::debug!(
+            ca_path = %ca_path.display(),
+            roots = root_store.len(),
+            "pinned private CA; public WebPKI roots are not trusted"
+        );
+    } else {
+        // No CA pinned: fall back to public WebPKI roots.
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     }
+
+    Ok(root_store)
+}
+
+/// Build a secure client crypto configuration.
+fn secure_client_crypto(tls: &TlsConfig) -> Result<ClientConfig, QuicError> {
+    let root_store = build_client_root_store(tls)?;
 
     let mut config = ClientConfig::builder()
         .with_root_certificates(root_store)
@@ -704,20 +729,7 @@ fn secure_client_crypto(tls: &TlsConfig) -> Result<ClientConfig, QuicError> {
 /// enabling mutual TLS authentication where both client and server verify
 /// each other's certificates.
 fn mtls_client_crypto(tls: &TlsConfig) -> Result<ClientConfig, QuicError> {
-    let mut root_store = RootCertStore::empty();
-
-    // Add system roots
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-    // Add custom CA if provided
-    if let Some(ca_path) = &tls.ca_path {
-        let ca_certs = load_certificates(ca_path)?;
-        for cert in ca_certs {
-            root_store
-                .add(cert)
-                .map_err(|e| QuicError::Certificate(e.to_string()))?;
-        }
-    }
+    let root_store = build_client_root_store(tls)?;
 
     // Load client certificate and key
     let (cert_chain, private_key) = load_certs_and_key(tls)?;

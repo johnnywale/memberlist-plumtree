@@ -56,6 +56,17 @@ pub enum QuicError {
         timeout_ms: u64,
     },
 
+    /// Sending on an established connection timed out.
+    ///
+    /// The handshake had already completed, so [`QuicError::HandshakeTimeout`]
+    /// does not cover this: the peer accepted the connection and may still be
+    /// answering keep-alives, but stopped reading its streams.
+    #[error("send timed out after {timeout_ms}ms")]
+    SendTimeout {
+        /// Timeout duration.
+        timeout_ms: u64,
+    },
+
     /// Connection was closed by peer or locally.
     #[error("connection closed (code={code}): {reason}")]
     ConnectionClosed {
@@ -135,6 +146,7 @@ impl QuicError {
             QuicError::Write(_) => true,
             QuicError::Read(_) => true,
             QuicError::HandshakeTimeout { .. } => true,
+            QuicError::SendTimeout { .. } => true,
             QuicError::ConnectionClosed { .. } => true,
             QuicError::MaxConnectionsReached { .. } => true,
             QuicError::EarlyDataRejected => true,

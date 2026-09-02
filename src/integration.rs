@@ -449,7 +449,20 @@ where
             .unwrap_or(100_000);
         let store = Arc::new(MemoryStore::new(max_messages));
 
-        PlumtreeDiscovery::with_storage(local_id, config, delegate, store)
+        let discovery = PlumtreeDiscovery::with_storage(local_id, config, delegate, store.clone());
+
+        // Keep sync state consistent with the store: capacity eviction drops
+        // messages, and an evicted ID left in the sync root hash makes this
+        // node advertise a message it can no longer serve, so peers would see a
+        // mismatch that no sync round can repair.
+        let sync_handler = discovery.sync_handler.clone();
+        store.set_evict_callback(move |ids| {
+            for id in ids {
+                sync_handler.remove_message(id);
+            }
+        });
+
+        discovery
     }
 
     /// Create a PlumtreeDiscovery from a PlumtreeStackConfig with MemberlistDiscovery.
@@ -1005,7 +1018,10 @@ where
                 break;
             }
 
-            futures_timer::Delay::new(prune_interval).await;
+            // Sleep, but wake immediately on shutdown: the prune interval can
+            // be minutes, and a task that only re-checks after a full tick
+            // delays shutdown by that much.
+            self.plumtree.sleep_until_shutdown(prune_interval).await;
 
             if self.plumtree.is_shutdown() {
                 break;
@@ -1155,17 +1171,22 @@ where
             .handle_sync_message(from.clone(), sync_msg)
             .await
         {
-            Ok(Some(response_msg)) => {
-                // Send response back to requester
-                let envelope = UnicastEnvelope {
-                    sender: local_id,
-                    target: from,
-                    message: PlumtreeMessage::Sync(response_msg),
-                };
-                let _ = self.unicast_tx.send(envelope).await;
-            }
-            Ok(None) => {
-                // No response needed
+            Ok(responses) => {
+                // A single logical reply can span several messages (a large
+                // Pull is answered with several wire-sized Pushes, and a paged
+                // Response is followed by the next Request), so send them all
+                // in order.
+                for response_msg in responses {
+                    let envelope = UnicastEnvelope {
+                        sender: local_id.clone(),
+                        target: from.clone(),
+                        message: PlumtreeMessage::Sync(response_msg),
+                    };
+                    if self.unicast_tx.send(envelope).await.is_err() {
+                        // Channel closed (shutting down); stop sending.
+                        break;
+                    }
+                }
             }
             Err(e) => {
                 tracing::warn!("sync strategy error: {}", e);
@@ -1200,9 +1221,12 @@ where
             self.sync_strategy.run_background_sync(transport).await;
         } else {
             tracing::info!("Anti-entropy sync handled externally (e.g., via memberlist push-pull)");
-            // No background task needed - sync happens via external mechanism
-            // Just wait forever (or until shutdown)
-            std::future::pending::<()>().await;
+            // No background task needed - sync happens via external mechanism.
+            // Park until shutdown by delegating to the strategy, which returns
+            // when `shutdown()` is called. Awaiting `std::future::pending()`
+            // here would strand this task for the process lifetime, holding the
+            // node's store and peer state alive with no way to reclaim it.
+            self.sync_strategy.run_background_sync(transport).await;
         }
     }
 
@@ -1366,10 +1390,21 @@ where
     }
 
     /// Shutdown the Plumtree layer.
+    ///
+    /// Closes every channel the background processors block on and signals the
+    /// sync strategy, so all of `run_incoming_processor`,
+    /// `run_outgoing_processor`, `run_unicast_processor` and
+    /// `run_anti_entropy_sync` return instead of parking forever.
     pub fn shutdown(&self) {
         self.plumtree.shutdown();
         self.outgoing_tx.close();
         self.unicast_tx.close();
+        // Without this, `run_incoming_processor` blocks on `recv()` for the
+        // process lifetime: the struct holds a sender itself, so the channel
+        // never closes on its own even after every external clone is dropped.
+        self.incoming_tx.close();
+        // Breaks the strategy's periodic sync loop / releases its park.
+        self.sync_strategy.shutdown();
     }
 
     /// Check if shutdown has been requested.
@@ -1394,6 +1429,11 @@ pub struct PlumtreeEventHandler<I, PD, S: MessageStore = DefaultStore> {
     /// Message storage for sync/persistence.
     store: Arc<S>,
     /// Sync handler for anti-entropy.
+    ///
+    /// Read only when `tokio` is enabled: without an executor there is no way
+    /// to persist a delivered message, so nothing is recorded in sync state
+    /// either (see `on_deliver`).
+    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
     sync_handler: Arc<SyncHandler<S>>,
     /// Marker for I type parameter.
     _marker: std::marker::PhantomData<I>,
@@ -1429,20 +1469,18 @@ where
         payload_with_header.put_slice(&payload);
         let payload_for_storage = payload_with_header.freeze();
 
-        // Record in sync state for hash comparison (O(1), synchronous)
-        self.sync_handler
-            .record_message(message_id, &payload_for_storage);
-
-        // Store message for sync/persistence
-        // Since on_deliver is synchronous but storage may be async, we spawn a task
-        let msg = StoredMessage::new(message_id, 0, payload_for_storage);
+        let msg = StoredMessage::new(message_id, 0, payload_for_storage.clone());
         let store = self.store.clone();
 
-        // Fire-and-forget storage write - spawn a background task
-        // This is safe because the sync state is already updated (for hash comparison)
-        // and the message is already in the Plumtree cache (for Graft requests)
+        // Fire-and-forget storage write - spawn a background task.
+        // This is safe because the message is already in the Plumtree cache
+        // (for Graft requests), and the sync state is updated to match.
         #[cfg(feature = "tokio")]
         {
+            // Record in sync state for hash comparison (O(1), synchronous).
+            self.sync_handler
+                .record_message(message_id, &payload_for_storage);
+
             tokio::task::spawn(async move {
                 if let Err(e) = store.insert(&msg).await {
                     tracing::warn!("failed to store message: {}", e);
@@ -1451,10 +1489,29 @@ where
         }
         #[cfg(not(feature = "tokio"))]
         {
-            // Without tokio, storage writes happen synchronously via blocking.
-            // This is acceptable for DefaultStore (in-memory) but may block
-            // for custom stores with real I/O.
-            let _ = (store, msg); // suppress unused variable warnings
+            // `on_deliver` is synchronous and there is no executor to hand an
+            // async store write to, so the message cannot be persisted here.
+            //
+            // Critically, we also skip `record_message`: advertising a message
+            // in the sync root hash that the store does not hold would make
+            // this node claim messages it can never serve, so every peer would
+            // see a permanent hash mismatch and sync would never converge.
+            // Better to under-advertise and let sync stay consistent.
+            let _ = (store, msg);
+            let _ = &payload_for_storage;
+
+            #[cfg(feature = "sync")]
+            {
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(
+                        "sync is configured but the `tokio` feature is disabled: delivered \
+                         messages cannot be persisted, so anti-entropy sync will not serve \
+                         them. Enable the `tokio` feature for working sync."
+                    );
+                }
+            }
         }
 
         // Forward to user delegate (with original decompressed payload)
@@ -1641,6 +1698,13 @@ pub fn envelope_encoded_len<I: IdCodec>(sender: &I, msg: &PlumtreeMessage) -> us
     1 + sender.encoded_id_len() + msg.encoded_len()
 }
 
+/// Default cap on the decompressed size of a received envelope, in bytes.
+///
+/// Used by [`decode_plumtree_envelope`]. Callers that know their transport's
+/// configured limit should call [`decode_plumtree_envelope_capped`] with it
+/// instead.
+pub const DEFAULT_MAX_DECOMPRESSED_ENVELOPE: usize = 1024 * 1024;
+
 /// Decode a Plumtree envelope extracting sender ID and message.
 ///
 /// This function automatically handles both compressed and uncompressed messages:
@@ -1648,7 +1712,28 @@ pub fn envelope_encoded_len<I: IdCodec>(sender: &I, msg: &PlumtreeMessage) -> us
 /// - Format (compressed): `[MAGIC_COMPRESSED][algo][compressed([sender_id][message])]`
 ///
 /// Returns `Some((sender, message))` on success, `None` on decode failure.
+///
+/// # Security
+///
+/// Compressed envelopes are decompressed with a hard output cap of
+/// [`DEFAULT_MAX_DECOMPRESSED_ENVELOPE`], so a hostile peer cannot inflate a
+/// small frame into a huge allocation. Use
+/// [`decode_plumtree_envelope_capped`] to match the cap to your transport's
+/// configured maximum message size.
 pub fn decode_plumtree_envelope<I: IdCodec>(data: &[u8]) -> Option<(I, PlumtreeMessage)> {
+    decode_plumtree_envelope_capped(data, DEFAULT_MAX_DECOMPRESSED_ENVELOPE)
+}
+
+/// Decode a Plumtree envelope, capping decompressed size at `max_decompressed`.
+///
+/// Identical to [`decode_plumtree_envelope`] except that the caller chooses the
+/// decompression bound. A compressed envelope that would expand beyond
+/// `max_decompressed` is rejected (`None`) rather than allocated, which is what
+/// prevents a decompression bomb on the receive path.
+pub fn decode_plumtree_envelope_capped<I: IdCodec>(
+    data: &[u8],
+    #[cfg_attr(not(feature = "compression"), allow(unused_variables))] max_decompressed: usize,
+) -> Option<(I, PlumtreeMessage)> {
     if data.is_empty() {
         return None;
     }
@@ -1671,8 +1756,19 @@ pub fn decode_plumtree_envelope<I: IdCodec>(data: &[u8]) -> Option<(I, PlumtreeM
             let algo = crate::compression::CompressionAlgorithm::from_wire_id(algo_id)?;
             let compressed_data = &data[2..];
 
-            // Decompress
-            let decompressed = crate::compression::decompress(compressed_data, algo).ok()?;
+            // Decompress with a hard output bound: this is untrusted input.
+            let decompressed =
+                match crate::compression::decompress(compressed_data, algo, max_decompressed) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            compressed_size = compressed_data.len(),
+                            "rejecting envelope: decompression failed or exceeded limit"
+                        );
+                        return None;
+                    }
+                };
 
             // Now decode the decompressed data as [sender_id][message]
             let mut buf = decompressed.as_ref();

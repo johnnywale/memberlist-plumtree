@@ -65,6 +65,10 @@ pub struct MemberlistSyncStrategy<I, S: MessageStore> {
     sync_window: Duration,
     /// Channel to send sync requests when hash mismatch detected.
     sync_request_tx: async_channel::Sender<I>,
+    /// Set by [`SyncStrategy::shutdown`] to release `run_background_sync`.
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    /// Wakes `run_background_sync` when `shutdown` is set.
+    shutdown_notify: Arc<event_listener::Event>,
 }
 
 impl<I, S> MemberlistSyncStrategy<I, S>
@@ -88,6 +92,8 @@ where
             sync_handler,
             sync_window,
             sync_request_tx,
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            shutdown_notify: Arc::new(event_listener::Event::new()),
         }
     }
 
@@ -164,17 +170,27 @@ where
     where
         T: Transport<I>,
     {
-        // No background task needed - sync happens via push-pull hooks
-        // This will never be called since needs_background_task() returns false
-        std::future::pending::<()>().await
+        // No background task needed - sync happens via push-pull hooks. Park
+        // until shutdown rather than forever: a caller that spawns this
+        // regardless of `needs_background_task()` must still get its task back
+        // at shutdown instead of leaking it for the process lifetime.
+        while !self.shutdown.load(std::sync::atomic::Ordering::Acquire) {
+            let listener = self.shutdown_notify.listen();
+            // Re-check after registering, so a signal racing the check above
+            // cannot be missed.
+            if self.shutdown.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+            listener.await;
+        }
     }
 
     async fn handle_sync_message(
         &self,
         from: I,
         message: SyncMessage,
-    ) -> SyncResult<Option<SyncMessage>> {
-        handle_sync_message_common(&self.sync_handler, from, message).await
+    ) -> SyncResult<Vec<SyncMessage>> {
+        handle_sync_message_common(&self.sync_handler, from, message, self.sync_window).await
     }
 
     fn is_enabled(&self) -> bool {
@@ -192,14 +208,28 @@ where
     fn remove_message(&self, id: &MessageId) {
         self.sync_handler.remove_message(id);
     }
+
+    fn shutdown(&self) {
+        // Wake `run_background_sync` so it stops parking. This strategy has no
+        // loop of its own (sync rides memberlist's push-pull), but the task
+        // wrapper still awaits it and must be released.
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.shutdown_notify.notify(usize::MAX);
+    }
 }
 
 /// Common sync message handling logic shared by all strategies.
+///
+/// `sync_window` bounds the time range a sync round covers; it is used to scope
+/// the root-hash comparison to the same set of messages the exchange can
+/// actually transfer.
 pub(crate) async fn handle_sync_message_common<I, S>(
     sync_handler: &SyncHandler<S>,
     from: I,
     message: SyncMessage,
-) -> SyncResult<Option<SyncMessage>>
+    sync_window: Duration,
+) -> SyncResult<Vec<SyncMessage>>
 where
     I: Clone + std::fmt::Debug + Send + Sync,
     S: MessageStore,
@@ -216,59 +246,107 @@ where
                 .handle_sync_request(root_hash, (time_start, time_end))
                 .await;
 
-            Ok(Some(SyncMessage::Response {
+            Ok(vec![SyncMessage::Response {
                 matches: response.matches,
                 message_ids: SmallVec::from_vec(response.message_ids),
                 has_more: response.has_more,
-            }))
+            }])
         }
 
         SyncMessage::Response {
             matches,
             message_ids,
-            has_more: _,
+            has_more,
         } => {
             if matches {
                 tracing::debug!(?from, "sync complete - hashes match");
-                return Ok(None);
+                return Ok(Vec::new());
             }
 
             tracing::debug!(
                 ?from,
                 ids = message_ids.len(),
+                has_more,
                 "sync response - checking for missing"
             );
+
+            // Remember where this page ended before the IDs are consumed.
+            // `get_range` walks time buckets in ascending order, so the last ID
+            // is the newest one this page covered.
+            let page_end = message_ids.iter().map(|id| id.timestamp()).max();
+            let mut replies = Vec::new();
 
             if let Some(pull) = sync_handler
                 .handle_sync_response(message_ids.to_vec())
                 .await
             {
-                Ok(Some(SyncMessage::Pull {
+                // A Pull may name more IDs than one Push can carry; the
+                // responder chunks its reply, so we can ask for the whole page.
+                replies.push(SyncMessage::Pull {
                     message_ids: SmallVec::from_vec(pull.message_ids),
-                }))
-            } else {
-                Ok(None)
+                });
             }
+
+            // Continue paginating. Without this, only the first page of the
+            // window is ever compared and anything past it never converges.
+            // We advance by *narrowing the time window* to start just after the
+            // newest ID we just saw, rather than by an offset: the range is
+            // already part of the wire format, and it stays monotone even if
+            // the responder's store changes between rounds.
+            if has_more {
+                if let Some(page_end) = page_end {
+                    let now = current_time_ms();
+                    let window_ms = sync_window.as_millis() as u64;
+                    let window_start = now.saturating_sub(window_ms);
+                    // Resume after this page, but never walk backwards out of
+                    // the window or past the present.
+                    let next_start = page_end.saturating_add(1).max(window_start);
+
+                    if next_start <= now {
+                        replies.push(SyncMessage::Request {
+                            root_hash: sync_handler.root_hash_in_window(next_start, now),
+                            time_start: next_start,
+                            time_end: now,
+                        });
+                    }
+                } else {
+                    tracing::debug!(
+                        ?from,
+                        "peer reported more IDs but sent none; stopping pagination"
+                    );
+                }
+            }
+
+            Ok(replies)
         }
 
         SyncMessage::Pull { message_ids } => {
             tracing::debug!(?from, ids = message_ids.len(), "handling sync pull");
 
-            let push = sync_handler.handle_sync_pull(message_ids.to_vec()).await;
+            // Split into wire-sized Push batches: a receiver rejects any Push
+            // carrying more than MAX_SYNC_PUSH_MESSAGES entries as malformed,
+            // so one oversized Push would transfer nothing and the exchange
+            // would repeat forever.
+            let pushes = sync_handler
+                .handle_sync_pull_chunked(message_ids.to_vec())
+                .await;
 
-            let messages: Vec<_> = push
-                .messages
+            Ok(pushes
                 .into_iter()
-                .map(|m| (m.id, m.round, m.payload))
-                .collect();
-
-            Ok(Some(SyncMessage::Push { messages }))
+                .map(|push| SyncMessage::Push {
+                    messages: push
+                        .messages
+                        .into_iter()
+                        .map(|m| (m.id, m.round, m.payload))
+                        .collect(),
+                })
+                .collect())
         }
 
         SyncMessage::Push { .. } => {
             // Push messages are handled at the Plumtree level
             // (delivered via handle_message as Gossip)
-            Ok(None)
+            Ok(Vec::new())
         }
     }
 }
@@ -374,10 +452,11 @@ mod tests {
         let result = strategy.handle_sync_message(1u64, request).await;
         assert!(result.is_ok());
 
-        if let Some(SyncMessage::Response { matches, .. }) = result.unwrap() {
+        let replies = result.unwrap();
+        if let [SyncMessage::Response { matches, .. }] = replies.as_slice() {
             assert!(!matches); // Should not match
         } else {
-            panic!("expected SyncResponse");
+            panic!("expected a single SyncResponse, got {:?}", replies);
         }
     }
 }

@@ -82,7 +82,7 @@ where
         &self,
         _from: I,
         _message: SyncMessage,
-    ) -> SyncResult<Option<SyncMessage>> {
+    ) -> SyncResult<Vec<SyncMessage>> {
         Err(SyncError::Disabled)
     }
 

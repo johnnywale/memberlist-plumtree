@@ -50,9 +50,6 @@ use crate::{PlumtreeDelegate, PlumtreeDiscovery};
 #[cfg(feature = "quic")]
 use crate::MapPeerResolver;
 
-/// Magic byte prefix for Plumtree messages.
-const PLUMTREE_MAGIC: u8 = 0x50;
-
 /// Configuration for memberlist-based discovery.
 #[derive(Debug, Clone)]
 pub struct MemberlistDiscoveryConfig {
@@ -403,8 +400,11 @@ where
     }
 
     async fn notify_message(&self, msg: std::borrow::Cow<'_, [u8]>) {
-        // Check if this is a Plumtree message
-        if msg.len() > 1 && msg[0] == PLUMTREE_MAGIC {
+        // Check if this is a Plumtree message. Use the shared predicate so
+        // compressed envelopes (magic 0x51) are recognized too: matching only
+        // the uncompressed magic sent every compressed Plumtree message through
+        // to the user delegate as if it were application data.
+        if crate::integration::is_plumtree_message(&msg) {
             // Decode Plumtree envelope (sender_id + message)
             if let Some((sender, plumtree_msg)) = decode_plumtree_envelope::<I>(&msg) {
                 tracing::trace!(
@@ -1193,6 +1193,12 @@ where
     memberlist: memberlist_core::Memberlist<T, D>,
     /// The advertise address.
     advertise_addr: SocketAddr,
+    /// Handles for the tasks spawned by `start*`, so `shutdown()` can reclaim
+    /// them. Without these, a task that fails to observe shutdown is
+    /// unreclaimable and keeps this stack's `Arc`s alive for the process
+    /// lifetime.
+    #[cfg(feature = "tokio")]
+    tasks: parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl<I, PD, T, D> MemberlistStack<I, PD, T, D>
@@ -1222,6 +1228,8 @@ where
             bridge,
             memberlist,
             advertise_addr,
+            #[cfg(feature = "tokio")]
+            tasks: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
@@ -1289,6 +1297,8 @@ where
             bridge,
             memberlist,
             advertise_addr,
+            #[cfg(feature = "tokio")]
+            tasks: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
@@ -1353,22 +1363,24 @@ where
         D: 'static,
         <T as memberlist_core::transport::Transport>::ResolvedAddress: From<SocketAddr> + Send,
     {
+        let mut tasks = self.tasks.lock();
+
         // Spawn the main Plumtree runner (IHave scheduler, Graft timer, etc.)
         let pm_runner = self.bridge.pm.clone();
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             pm_runner.run().await;
-        });
+        }));
 
         // Spawn the incoming message processor
         let pm_incoming = self.bridge.pm.clone();
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             pm_incoming.run_incoming_processor().await;
-        });
+        }));
 
         // Spawn the unicast sender that uses memberlist's reliable send
         let unicast_rx = self.bridge.pm.unicast_receiver_raw();
         let memberlist_unicast = self.memberlist.clone();
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             while let Ok(envelope) = unicast_rx.recv().await {
                 let target_id = envelope.target().clone();
 
@@ -1400,20 +1412,22 @@ where
                     );
                 }
             }
-        });
+        }));
 
         // Spawn the anti-entropy sync task using memberlist as transport
         let pm_sync = self.bridge.pm.clone();
         let sync_transport = MemberlistTransportAdapter::new(self.memberlist.clone());
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             pm_sync.run_anti_entropy_sync(sync_transport).await;
-        });
+        }));
 
         // Spawn the storage prune task
         let pm_prune = self.bridge.pm.clone();
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             pm_prune.run_storage_prune().await;
-        });
+        }));
+
+        drop(tasks);
 
         tracing::info!("MemberlistStack background tasks started (including sync)");
     }
@@ -1445,17 +1459,21 @@ where
         PT: crate::Transport<I> + Clone + 'static,
         PD: 'static,
     {
+        let mut tasks = self.tasks.lock();
+
         // Spawn the main Plumtree runner (IHave scheduler, Graft timer, etc.)
         let pm_runner = self.bridge.pm.clone();
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             pm_runner.run_with_transport(transport).await;
-        });
+        }));
 
         // Spawn the incoming message processor
         let pm_incoming = self.bridge.pm.clone();
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             pm_incoming.run_incoming_processor().await;
-        });
+        }));
+
+        drop(tasks);
 
         tracing::info!("MemberlistStack background tasks started with custom transport");
     }
@@ -1482,17 +1500,21 @@ where
     where
         PD: 'static,
     {
+        let mut tasks = self.tasks.lock();
+
         // Spawn the main Plumtree runner without unicast handling
         let pm_runner = self.bridge.pm.clone();
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             pm_runner.run().await;
-        });
+        }));
 
         // Spawn the incoming message processor
         let pm_incoming = self.bridge.pm.clone();
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             pm_incoming.run_incoming_processor().await;
-        });
+        }));
+
+        drop(tasks);
 
         tracing::info!("MemberlistStack background tasks started (without unicast transport)");
     }
@@ -1538,6 +1560,13 @@ where
     ///
     /// * `seed_addrs` - Socket addresses of seed nodes to join through
     ///
+    /// # Errors
+    ///
+    /// Every seed is tried and the join succeeds if **any** of
+    /// them is reachable — an unreachable seed listed first does not prevent
+    /// joining through the healthy ones behind it. [`MemberlistStackError::JoinFailed`]
+    /// is returned only when every seed fails, or when no seeds were given.
+    ///
     /// # Example
     ///
     /// ```ignore
@@ -1553,19 +1582,60 @@ where
     {
         use memberlist_core::proto::MaybeResolvedAddress;
 
+        if seed_addrs.is_empty() {
+            return Err(MemberlistStackError::JoinFailed(
+                "no seed addresses provided".to_string(),
+            ));
+        }
+
+        // Try every seed and keep going past failures: a single unreachable
+        // seed must not prevent joining through the healthy ones.
+        //
+        // `Memberlist::join_many` would batch this, but its future is not
+        // `Send` in memberlist-core 0.7 (it holds a `RefCell` across awaits),
+        // which callers here need. Sequential joins give the same
+        // any-seed-suffices semantics.
+        let mut joined = 0usize;
+        let mut errors = Vec::new();
+
         for &addr in seed_addrs {
-            // Create a placeholder ID - memberlist will resolve the actual ID
-            // We use a minimal ID representation that will be replaced during handshake
+            // Create a placeholder ID - memberlist resolves the actual ID
+            // during the handshake.
             let seed_node = nodecraft::Node::new(
                 self.bridge.local_id().clone(),
                 MaybeResolvedAddress::Resolved(addr.into()),
             );
 
-            self.memberlist
-                .join(seed_node)
-                .await
-                .map_err(|e| MemberlistStackError::JoinFailed(format!("{}", e)))?;
+            match self.memberlist.join(seed_node).await {
+                Ok(_) => joined += 1,
+                Err(e) => {
+                    tracing::debug!(%addr, error = %e, "failed to join via seed");
+                    errors.push(format!("{}: {}", addr, e));
+                }
+            }
         }
+
+        if joined == 0 {
+            return Err(MemberlistStackError::JoinFailed(format!(
+                "all {} seed(s) failed: {}",
+                seed_addrs.len(),
+                errors.join("; ")
+            )));
+        }
+
+        if !errors.is_empty() {
+            // At least one seed worked; the cluster is reachable and SWIM will
+            // discover the rest.
+            tracing::warn!(
+                joined,
+                seeds = seed_addrs.len(),
+                "joined cluster with some seeds unreachable: {}",
+                errors.join("; ")
+            );
+        } else {
+            tracing::info!(joined, seeds = seed_addrs.len(), "joined cluster");
+        }
+
         Ok(())
     }
 
@@ -1582,13 +1652,54 @@ where
 
     /// Shutdown the entire stack.
     ///
-    /// This shuts down both Plumtree and Memberlist.
+    /// This shuts down both Plumtree and Memberlist, then reclaims the
+    /// background tasks spawned by `start*`.
+    ///
+    /// Tasks are given a short grace period to observe the shutdown signal and
+    /// exit on their own; any that are still running after it are aborted, so
+    /// this never hangs on a task that misses the signal.
     pub async fn shutdown(&self) -> Result<(), MemberlistStackError> {
         self.bridge.shutdown();
-        self.memberlist
+
+        let result = self
+            .memberlist
             .shutdown()
             .await
-            .map_err(|e| MemberlistStackError::ShutdownFailed(format!("{}", e)))
+            .map_err(|e| MemberlistStackError::ShutdownFailed(format!("{}", e)));
+
+        #[cfg(feature = "tokio")]
+        {
+            let handles: Vec<_> = std::mem::take(&mut *self.tasks.lock());
+
+            // Wait on all tasks together under one grace period, then abort
+            // whatever is left. Waiting per-task in sequence would multiply the
+            // grace period by the task count.
+            let grace = std::time::Duration::from_millis(500);
+            let mut handles = handles;
+            let joined = tokio::time::timeout(grace, async {
+                for handle in &mut handles {
+                    match handle.await {
+                        Ok(()) => {}
+                        Err(e) if e.is_cancelled() => {}
+                        Err(e) => {
+                            tracing::warn!(error = %e, "background task failed during shutdown");
+                        }
+                    }
+                }
+            })
+            .await;
+
+            if joined.is_err() {
+                // Dropping a JoinHandle detaches rather than cancels, so abort
+                // explicitly to actually reclaim the stragglers.
+                for handle in &handles {
+                    handle.abort();
+                }
+                tracing::debug!("aborted background tasks that outlived the shutdown grace period");
+            }
+        }
+
+        result
     }
 
     /// Check if the stack has been shut down.
@@ -1715,7 +1826,23 @@ where
                 }
 
                 // Get alive member addresses
+                let member_count = memberlist.num_online_members().await;
                 let alive_addrs = Self::get_alive_addresses(&memberlist).await;
+
+                // If the cluster has members but none of their addresses could
+                // be read, every seed looks dead and we would re-join them all
+                // on every tick, forever. That is an address-extraction
+                // failure, not a connectivity problem, so back off instead of
+                // hammering the seeds.
+                if alive_addrs.is_empty() && member_count > 0 {
+                    tracing::warn!(
+                        member_count,
+                        "Lazarus: could not extract any member addresses for this transport; \
+                         skipping rejoin to avoid a re-join loop"
+                    );
+                    handle_clone.set_missing_seeds(0);
+                    continue;
+                }
 
                 // Find missing seeds
                 let missing_seeds: Vec<_> = seeds
@@ -1814,7 +1941,11 @@ where
             return Some(*socket_addr);
         }
 
-        None
+        // Fall back to parsing the address's Display form. Transports whose
+        // `ResolvedAddress` is a wrapper around a socket address (rather than a
+        // bare `SocketAddr`) render as "host:port", so this recovers them
+        // without needing to know each concrete type.
+        addr.to_string().parse::<SocketAddr>().ok()
     }
 
     /// Save current cluster members to persistence file.

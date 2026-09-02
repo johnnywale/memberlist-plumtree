@@ -24,6 +24,13 @@ use std::error::Error;
 pub struct MemoryStore {
     inner: RwLock<MemoryStoreInner>,
     max_size: usize,
+    /// Invoked with each message ID dropped by capacity eviction.
+    ///
+    /// Sync state is tracked outside the store, so without this hook an
+    /// evicted ID stays in the sync root hash forever and the node advertises
+    /// a message it can no longer serve — a permanent hash divergence.
+    #[allow(clippy::type_complexity)]
+    on_evict: parking_lot::Mutex<Option<Box<dyn Fn(&[MessageId]) + Send + Sync>>>,
 }
 
 struct MemoryStoreInner {
@@ -45,7 +52,24 @@ impl MemoryStore {
                 time_index: BTreeMap::new(),
             }),
             max_size,
+            on_evict: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// Register a callback invoked with the IDs dropped by capacity eviction.
+    ///
+    /// Use this to keep externally-held state (notably the anti-entropy sync
+    /// root hash) consistent with what the store actually holds. Without it,
+    /// evicted IDs remain advertised and peers see a mismatch that no sync
+    /// round can repair.
+    ///
+    /// The callback runs while the store lock is *not* held; it must not call
+    /// back into this store.
+    pub fn set_evict_callback<F>(&self, callback: F)
+    where
+        F: Fn(&[MessageId]) + Send + Sync + 'static,
+    {
+        *self.on_evict.lock() = Some(Box::new(callback));
     }
 
     /// Get the current number of messages in the store.
@@ -91,11 +115,13 @@ impl MemoryStore {
         }
 
         // Evict oldest messages if at capacity
+        let mut evicted: Vec<MessageId> = Vec::new();
         while inner.messages.len() >= self.max_size {
             if let Some((&oldest_ts, _)) = inner.time_index.first_key_value() {
                 if let Some(ids) = inner.time_index.remove(&oldest_ts) {
                     for id in ids {
                         inner.messages.remove(&id);
+                        evicted.push(id);
                     }
                 }
             } else {
@@ -112,6 +138,16 @@ impl MemoryStore {
 
         // Insert into primary index
         inner.messages.insert(msg.id, msg.clone());
+
+        // Release the store lock before notifying, so the callback cannot
+        // deadlock against it.
+        drop(inner);
+
+        if !evicted.is_empty() {
+            if let Some(ref callback) = *self.on_evict.lock() {
+                callback(&evicted);
+            }
+        }
 
         Ok(true)
     }
@@ -139,11 +175,13 @@ impl MessageStore for MemoryStore {
         // Evict oldest messages if at capacity
         // NOTE: If multiple messages share the same timestamp, all will be removed.
         // This is intentional - we evict by time bucket, not individual messages.
+        let mut evicted: Vec<MessageId> = Vec::new();
         while inner.messages.len() >= self.max_size {
             if let Some((&oldest_ts, _)) = inner.time_index.first_key_value() {
                 if let Some(ids) = inner.time_index.remove(&oldest_ts) {
                     for id in ids {
                         inner.messages.remove(&id);
+                        evicted.push(id);
                     }
                 }
             } else {
@@ -160,6 +198,16 @@ impl MessageStore for MemoryStore {
 
         // Insert into primary index
         inner.messages.insert(msg.id, msg.clone());
+
+        // Release the store lock before notifying, so the callback cannot
+        // deadlock against it.
+        drop(inner);
+
+        if !evicted.is_empty() {
+            if let Some(ref callback) = *self.on_evict.lock() {
+                callback(&evicted);
+            }
+        }
 
         Ok(true)
     }

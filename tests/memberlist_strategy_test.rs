@@ -301,13 +301,13 @@ async fn test_memberlist_strategy_handles_sync_request() {
 
     assert!(result.is_ok());
     let response = result.unwrap();
-    assert!(response.is_some());
+    assert!(!response.is_empty());
 
-    if let Some(SyncMessage::Response {
+    if let [SyncMessage::Response {
         matches,
         message_ids,
         ..
-    }) = response
+    }] = response.as_slice()
     {
         assert!(!matches, "should not match since hashes differ");
         assert!(!message_ids.is_empty(), "should include message IDs");
@@ -338,9 +338,9 @@ async fn test_memberlist_strategy_handles_sync_request_with_matching_hash() {
 
     assert!(result.is_ok());
     let response = result.unwrap();
-    assert!(response.is_some());
+    assert!(!response.is_empty());
 
-    if let Some(SyncMessage::Response { matches, .. }) = response {
+    if let [SyncMessage::Response { matches, .. }] = response.as_slice() {
         assert!(matches, "should match since hashes are the same");
     } else {
         panic!("expected SyncResponse");
@@ -371,9 +371,9 @@ async fn test_memberlist_strategy_handles_sync_pull() {
 
     assert!(result.is_ok());
     let response = result.unwrap();
-    assert!(response.is_some());
+    assert!(!response.is_empty());
 
-    if let Some(SyncMessage::Push { messages }) = response {
+    if let [SyncMessage::Push { messages }] = response.as_slice() {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].0, id);
         assert_eq!(messages[0].2, payload);
@@ -519,7 +519,9 @@ async fn test_memberlist_strategy_two_node_sync_simulation() {
         .handle_sync_message(TestId(2), request)
         .await
         .unwrap()
-        .unwrap();
+        .into_iter()
+        .next()
+        .expect("expected a reply");
 
     // Verify response indicates mismatch with message IDs
     if let SyncMessage::Response {
@@ -556,7 +558,9 @@ async fn test_memberlist_strategy_two_node_sync_simulation() {
             .handle_sync_message(TestId(2), pull)
             .await
             .unwrap()
-            .unwrap();
+            .into_iter()
+            .next()
+            .expect("expected a Push reply");
 
         // Verify Push contains the message
         if let SyncMessage::Push { messages } = push {
@@ -633,7 +637,9 @@ async fn test_memberlist_strategy_bidirectional_sync() {
         .handle_sync_message(TestId(1), request1)
         .await
         .unwrap()
-        .unwrap();
+        .into_iter()
+        .next()
+        .expect("expected a reply");
 
     if let SyncMessage::Response {
         matches,
@@ -653,7 +659,9 @@ async fn test_memberlist_strategy_bidirectional_sync() {
             .handle_sync_message(TestId(1), pull)
             .await
             .unwrap()
-            .unwrap();
+            .into_iter()
+            .next()
+            .expect("expected a reply");
 
         if let SyncMessage::Push { messages } = push {
             // Node 1 receives and records msg_b
@@ -674,7 +682,9 @@ async fn test_memberlist_strategy_bidirectional_sync() {
         .handle_sync_message(TestId(2), request2)
         .await
         .unwrap()
-        .unwrap();
+        .into_iter()
+        .next()
+        .expect("expected a reply");
 
     if let SyncMessage::Response {
         matches,
@@ -694,7 +704,9 @@ async fn test_memberlist_strategy_bidirectional_sync() {
             .handle_sync_message(TestId(2), pull)
             .await
             .unwrap()
-            .unwrap();
+            .into_iter()
+            .next()
+            .expect("expected a Push reply");
 
         if let SyncMessage::Push { messages } = push {
             // Node 2 receives and records msg_a

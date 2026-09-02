@@ -435,6 +435,21 @@ pub struct ConnectionConfig {
     /// Default: 1 second.
     pub retry_delay: Duration,
 
+    /// Multiply `retry_delay` by 2^(attempt-1), capped at 16x.
+    ///
+    /// Enable this when many nodes may be dialing the same peer: a flat delay
+    /// makes them all retry in lockstep, so a popular dead peer is hit by a
+    /// synchronized burst on every round (a thundering herd) and recovers
+    /// straight into an overload. Jitter (always applied when a retry delay is
+    /// used) spreads the burst; exponential growth also keeps the retries from
+    /// being sustained load while the peer is down.
+    ///
+    /// The trade-off is reconnect latency: with the default 1s delay and 3
+    /// retries, total wait grows from ~3s to ~5s.
+    ///
+    /// Default: `false`.
+    pub retry_backoff: bool,
+
     /// Timeout for acquiring a connection slot when at max capacity.
     ///
     /// When all connection slots are in use, new connection attempts will wait
@@ -443,6 +458,16 @@ pub struct ConnectionConfig {
     ///
     /// Default: 5 seconds.
     pub acquire_timeout: Duration,
+
+    /// Timeout for the stream-write phase of a send.
+    ///
+    /// Bounds `open_uni()` + `write_all()` + `finish()` on an already
+    /// established connection. Without it, a peer that answers keep-alives but
+    /// stops reading its streams blocks senders indefinitely — the handshake
+    /// timeout does not apply, since the handshake already completed.
+    ///
+    /// Default: 10 seconds.
+    pub send_timeout: Duration,
 }
 
 impl Default for ConnectionConfig {
@@ -454,7 +479,9 @@ impl Default for ConnectionConfig {
             handshake_timeout: Duration::from_secs(10),
             retries: 3,
             retry_delay: Duration::from_secs(1),
+            retry_backoff: false,
             acquire_timeout: Duration::from_secs(5),
+            send_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -483,7 +510,19 @@ impl ConnectionConfig {
         self
     }
 
-    /// Builder method to set handshake timeout.
+    /// Builder method to enable exponential retry backoff.
+    pub fn with_retry_backoff(mut self, enabled: bool) -> Self {
+        self.retry_backoff = enabled;
+        self
+    }
+
+    /// Builder method to set the stream-write send timeout.
+    pub fn with_send_timeout(mut self, timeout: Duration) -> Self {
+        self.send_timeout = timeout;
+        self
+    }
+
+    /// Set the handshake timeout (builder pattern).
     pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
         self.handshake_timeout = timeout;
         self

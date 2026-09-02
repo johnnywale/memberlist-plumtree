@@ -64,6 +64,12 @@ pub enum Error {
     /// Internal channel error.
     Channel(String),
 
+    /// An internal channel was at capacity.
+    ///
+    /// Distinct from [`Error::Channel`] so that backpressure can be classified
+    /// structurally rather than by matching on message text.
+    ChannelFull,
+
     /// Outgoing message queue is full (backpressure).
     ///
     /// This error indicates the system is under load and the caller
@@ -122,6 +128,9 @@ impl fmt::Display for Error {
             Error::Channel(msg) => {
                 write!(f, "channel error: {}", msg)
             }
+            Error::ChannelFull => {
+                write!(f, "internal channel is full")
+            }
             Error::QueueFull { dropped, capacity } => {
                 write!(
                     f,
@@ -149,6 +158,13 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {
+    /// Returns the underlying cause, where one is retained.
+    ///
+    /// Only [`Error::Io`] carries a typed source. The other variants hold
+    /// pre-formatted strings rather than the original error, so there is
+    /// nothing to hand back — the context is already flattened into the
+    /// `Display` output. Converting those to typed sources would be a
+    /// breaking change to the variant shapes.
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::Io(err) => Some(err),
@@ -176,6 +192,7 @@ impl Error {
             Error::Send { .. } => ErrorKind::Transient,
             Error::NoPeers => ErrorKind::Transient,
             Error::Channel(_) => ErrorKind::Transient,
+            Error::ChannelFull => ErrorKind::Transient,
             Error::QueueFull { .. } => ErrorKind::Transient,
             Error::Memberlist(_) => ErrorKind::Transient,
             Error::Io(_) => ErrorKind::Transient,
@@ -218,15 +235,17 @@ impl Error {
     }
 
     /// Check if this is a rate limiting or resource exhaustion error.
-    pub fn is_resource_exhausted(&self) -> bool {
-        match self {
-            // String matching is a fallback for async_channel errors which don't have
-            // structured error variants for capacity issues
-            Error::Channel(msg) => msg.contains("full") || msg.contains("capacity"),
-            Error::QueueFull { .. } => true,
-            Error::NoPeers => true,
-            _ => false,
-        }
+    ///
+    /// Classified structurally: capacity conditions map to
+    /// [`Error::ChannelFull`] or [`Error::QueueFull`] rather than being
+    /// detected by matching substrings in an error message, which both missed
+    /// capacity errors phrased differently and false-positived on unrelated
+    /// messages that happened to contain "full".
+    pub const fn is_resource_exhausted(&self) -> bool {
+        matches!(
+            self,
+            Error::ChannelFull | Error::QueueFull { .. } | Error::NoPeers
+        )
     }
 
     /// Check if this is a queue full error (backpressure).
@@ -244,6 +263,20 @@ impl From<std::io::Error> for Error {
 impl<T> From<async_channel::SendError<T>> for Error {
     fn from(err: async_channel::SendError<T>) -> Self {
         Error::Channel(err.to_string())
+    }
+}
+
+impl<T> From<async_channel::TrySendError<T>> for Error {
+    fn from(err: async_channel::TrySendError<T>) -> Self {
+        // Preserve the distinction between "at capacity" (retryable
+        // backpressure) and "closed" (permanent), instead of flattening both
+        // into a string.
+        match err {
+            async_channel::TrySendError::Full(_) => Error::ChannelFull,
+            async_channel::TrySendError::Closed(_) => {
+                Error::Channel("sending into a closed channel".to_string())
+            }
+        }
     }
 }
 
@@ -333,8 +366,15 @@ mod tests {
 
     #[test]
     fn test_resource_exhausted() {
-        let err = Error::Channel("channel full".to_string());
+        // Capacity is now a distinct variant rather than a substring of the
+        // message text.
+        let err = Error::ChannelFull;
         assert!(err.is_resource_exhausted());
+
+        // A generic channel error whose text happens to contain "full" is NOT
+        // a capacity condition.
+        let err = Error::Channel("handshake failed: buffer was not full".to_string());
+        assert!(!err.is_resource_exhausted());
 
         let err = Error::NoPeers;
         assert!(err.is_resource_exhausted());

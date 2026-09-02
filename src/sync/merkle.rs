@@ -95,9 +95,24 @@ impl SyncState {
     }
 
     /// O(1) insert - Stub when sync feature is not enabled.
+    ///
+    /// Without the `sync` feature there is no hash function available, so
+    /// nothing can be tracked. See [`SyncState::is_functional`].
     #[cfg(not(feature = "sync"))]
     pub fn insert(&mut self, _id: MessageId, _payload: &[u8]) {
         // No-op without sync feature
+    }
+
+    /// Whether this sync state can actually track messages.
+    ///
+    /// `false` when the crate was built without the `sync` feature: the leaf
+    /// hash function is unavailable, so `insert` is a no-op and every root hash
+    /// stays zero. Callers must not interpret two zero hashes as agreement —
+    /// see [`SyncHandler::handle_sync_request`].
+    ///
+    /// [`SyncHandler::handle_sync_request`]: super::SyncHandler::handle_sync_request
+    pub const fn is_functional(&self) -> bool {
+        cfg!(feature = "sync")
     }
 
     /// O(1) remove - XOR out the hash (XOR is its own inverse).
@@ -112,12 +127,59 @@ impl SyncState {
         }
     }
 
-    /// Get the current root hash.
+    /// Get the current root hash over *all* tracked messages.
     ///
     /// This hash represents the XOR of all leaf hashes. Two sync states
     /// with the same set of messages will have the same root hash.
+    ///
+    /// # Comparing with a peer
+    ///
+    /// Do not compare this against a peer whose sync responses only cover a
+    /// bounded time window: divergence in history older than that window makes
+    /// the hashes differ on every round while no exchange can ever repair it,
+    /// so the peers mismatch forever. Use [`SyncState::root_hash_in_window`]
+    /// with the same window the responses use.
     pub fn root_hash(&self) -> [u8; 32] {
         self.root_hash
+    }
+
+    /// Get the root hash over only the messages within a time window.
+    ///
+    /// XORs the leaf hashes of messages whose [`MessageId::timestamp`] falls in
+    /// `[start, end]`. This scopes the comparison to the same set of messages
+    /// the sync exchange is able to transfer, so a mismatch is always
+    /// actionable and convergence is reachable — unlike an all-history hash
+    /// compared against window-scoped responses, which can never agree once
+    /// older history diverges.
+    ///
+    /// This is O(n) in the number of tracked messages, unlike the O(1)
+    /// [`SyncState::root_hash`]; it runs once per sync round, not per message.
+    pub fn root_hash_in_window(&self, start: u64, end: u64) -> [u8; 32] {
+        let mut root = [0u8; 32];
+        for (id, hash) in &self.leaves {
+            let ts = id.timestamp();
+            if ts >= start && ts <= end {
+                for (dest, src) in root.iter_mut().zip(hash.iter()) {
+                    *dest ^= src;
+                }
+            }
+        }
+        root
+    }
+
+    /// Get the message IDs tracked within a time window.
+    ///
+    /// Companion to [`SyncState::root_hash_in_window`], for callers that need
+    /// the window's contents rather than just its digest.
+    pub fn message_ids_in_window(&self, start: u64, end: u64) -> Vec<MessageId> {
+        self.leaves
+            .keys()
+            .filter(|id| {
+                let ts = id.timestamp();
+                ts >= start && ts <= end
+            })
+            .copied()
+            .collect()
     }
 
     /// Get the number of messages in the sync state.

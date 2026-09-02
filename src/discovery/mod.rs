@@ -48,7 +48,7 @@ mod traits;
 #[cfg(feature = "memberlist")]
 pub use memberlist::{MemberlistDiscovery, MemberlistDiscoveryConfig, MemberlistDiscoveryHandle};
 pub use noop::NoOpDiscovery;
-pub use r#static::{StaticDiscovery, StaticDiscoveryConfig};
+pub use r#static::{ReachabilityProbe, StaticDiscovery, StaticDiscoveryConfig};
 pub use traits::{ClusterDiscovery, DiscoveryEvent, DiscoveryHandle, SimpleDiscoveryHandle};
 
 // Re-export memberlist delegate types for convenience (requires memberlist feature)

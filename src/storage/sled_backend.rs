@@ -6,13 +6,25 @@
 //!
 //! # Key Format
 //!
-//! Messages are stored with timestamp-prefixed keys for efficient range scans:
+//! Two trees are maintained so that both point lookups and range scans are
+//! index-driven rather than full scans:
 //!
 //! ```text
-//! Key: [timestamp_be (8 bytes)][message_id (24 bytes)]
-//!            ↑                          ↑
-//!      For range scans         For uniqueness
+//! messages tree:  [message_id (24 bytes)]  ->  [timestamp][round][payload]
+//! by_time tree:   [timestamp_be (8)][message_id (24)]  ->  []
 //! ```
+//!
+//! The primary tree is keyed by message ID alone, so `get`/`contains` are
+//! single lookups and a given ID can only ever have one row (re-inserting the
+//! same ID with a different timestamp updates it rather than adding a
+//! duplicate). The `by_time` tree provides the ordered scan that `get_range`
+//! and `prune` need.
+//!
+//! # Blocking I/O
+//!
+//! Sled's API is synchronous and hits the disk. Every operation here is
+//! therefore wrapped in `tokio::task::spawn_blocking`, so a compaction stall
+//! blocks a blocking-pool thread instead of a runtime worker.
 //!
 //! # Example
 //!
@@ -46,9 +58,13 @@ use std::path::Path;
 
 /// Sled-based persistent message store.
 ///
-/// Uses timestamp-prefixed keys for efficient range queries.
+/// Keyed by message ID, with a secondary timestamp index for range queries.
 pub struct SledStore {
     db: Db,
+    /// Primary tree: message ID -> record.
+    messages: sled::Tree,
+    /// Secondary index: (timestamp, message ID) -> empty, for ordered scans.
+    by_time: sled::Tree,
 }
 
 impl SledStore {
@@ -63,24 +79,36 @@ impl SledStore {
     /// Returns an error if the database cannot be opened or created.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, sled::Error> {
         let db = sled::open(path)?;
-        Ok(Self { db })
+        let messages = db.open_tree("messages")?;
+        let by_time = db.open_tree("by_time")?;
+        Ok(Self {
+            db,
+            messages,
+            by_time,
+        })
     }
 
     /// Flush all pending writes to disk.
     ///
-    /// This ensures durability of all inserted messages.
+    /// Call this when you need a durability barrier — `insert` does not flush.
+    /// Flushing on every insert costs a disk sync per message and collapses
+    /// write throughput; sled's own periodic flush plus an explicit call at
+    /// checkpoints (or before shutdown) gives far better throughput for the
+    /// same guarantee at the points that matter.
     pub async fn flush(&self) -> Result<(), sled::Error> {
         self.db.flush_async().await?;
         Ok(())
     }
 
-    /// Create a key with timestamp prefix for range scans.
+    /// Build the `by_time` index key for a message.
     ///
-    /// Format: `[timestamp_be (8 bytes)][message_id (24 bytes)]`
-    fn make_key(msg: &StoredMessage) -> Vec<u8> {
+    /// Format: `[timestamp_be (8 bytes)][message_id (24 bytes)]`. Big-endian
+    /// timestamps make lexicographic order the same as chronological order,
+    /// which is what makes the range scan work.
+    fn index_key(timestamp: u64, id: &MessageId) -> Vec<u8> {
         let mut key = Vec::with_capacity(32);
-        key.extend_from_slice(&msg.timestamp.to_be_bytes()); // 8 bytes, big-endian
-        key.extend_from_slice(&msg.id.encode_to_bytes()); // 24 bytes
+        key.extend_from_slice(&timestamp.to_be_bytes());
+        key.extend_from_slice(&id.encode_to_bytes());
         key
     }
 
@@ -89,7 +117,7 @@ impl SledStore {
         ts.to_be_bytes()
     }
 
-    /// Extract MessageId from a key.
+    /// Extract the MessageId from a `by_time` index key.
     fn extract_id(key: &[u8]) -> Option<MessageId> {
         if key.len() >= 32 {
             MessageId::decode_from_slice(&key[8..32])
@@ -98,40 +126,40 @@ impl SledStore {
         }
     }
 
-    /// Serialize a StoredMessage to bytes.
+    /// Serialize the value stored in the primary tree.
+    ///
+    /// The timestamp lives in the value here (the key is the ID alone), so a
+    /// record is self-describing without consulting the index.
     fn serialize(msg: &StoredMessage) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
-        // Simple format: round (4 bytes) + payload_len (4 bytes) + payload
-        let mut data = Vec::with_capacity(8 + msg.payload.len());
+        // Format: timestamp (8) + round (4) + payload_len (4) + payload
+        let mut data = Vec::with_capacity(16 + msg.payload.len());
+        data.extend_from_slice(&msg.timestamp.to_le_bytes());
         data.extend_from_slice(&msg.round.to_le_bytes());
         data.extend_from_slice(&(msg.payload.len() as u32).to_le_bytes());
         data.extend_from_slice(&msg.payload);
         Ok(data)
     }
 
-    /// Deserialize a StoredMessage from bytes.
+    /// Deserialize a record from the primary tree.
     fn deserialize(
         key: &[u8],
         value: &[u8],
     ) -> Result<StoredMessage, Box<dyn Error + Send + Sync>> {
-        if key.len() < 32 || value.len() < 8 {
+        if key.len() < 24 || value.len() < 16 {
             return Err("invalid data".into());
         }
 
-        // Extract timestamp from key
-        let timestamp = u64::from_be_bytes(key[0..8].try_into().unwrap());
+        let id = MessageId::decode_from_slice(&key[0..24]).ok_or("invalid message id")?;
 
-        // Extract message ID from key
-        let id = MessageId::decode_from_slice(&key[8..32]).ok_or("invalid message id")?;
+        let timestamp = u64::from_le_bytes(value[0..8].try_into().unwrap());
+        let round = u32::from_le_bytes(value[8..12].try_into().unwrap());
+        let payload_len = u32::from_le_bytes(value[12..16].try_into().unwrap()) as usize;
 
-        // Extract round and payload from value
-        let round = u32::from_le_bytes(value[0..4].try_into().unwrap());
-        let payload_len = u32::from_le_bytes(value[4..8].try_into().unwrap()) as usize;
-
-        if value.len() < 8 + payload_len {
+        if value.len() < 16 + payload_len {
             return Err("truncated payload".into());
         }
 
-        let payload = Bytes::copy_from_slice(&value[8..8 + payload_len]);
+        let payload = Bytes::copy_from_slice(&value[16..16 + payload_len]);
 
         Ok(StoredMessage {
             id,
@@ -140,42 +168,98 @@ impl SledStore {
             timestamp,
         })
     }
+
+    /// Read the timestamp out of a primary-tree value without full decoding.
+    fn value_timestamp(value: &[u8]) -> Option<u64> {
+        if value.len() < 8 {
+            return None;
+        }
+        Some(u64::from_le_bytes(value[0..8].try_into().unwrap()))
+    }
+}
+
+impl SledStore {
+    /// Run a synchronous sled operation on the blocking pool.
+    ///
+    /// Sled performs real disk I/O; calling it directly from an async fn lets a
+    /// compaction stall block a runtime worker.
+    async fn blocking<F, T>(&self, f: F) -> Result<T, Box<dyn Error + Send + Sync>>
+    where
+        F: FnOnce() -> Result<T, Box<dyn Error + Send + Sync>> + Send + 'static,
+        T: Send + 'static,
+    {
+        tokio::task::spawn_blocking(f)
+            .await
+            .map_err(|e| -> Box<dyn Error + Send + Sync> {
+                format!("storage task panicked: {}", e).into()
+            })?
+    }
 }
 
 impl MessageStore for SledStore {
     async fn insert(&self, msg: &StoredMessage) -> Result<bool, Box<dyn Error + Send + Sync>> {
-        let key = Self::make_key(msg);
+        let messages = self.messages.clone();
+        let by_time = self.by_time.clone();
+        let id_bytes = msg.id.encode_to_bytes();
         let value = Self::serialize(msg)?;
+        let index_key = Self::index_key(msg.timestamp, &msg.id);
 
-        // Use compare_and_swap to ensure we don't overwrite existing entries
-        let old = self.db.insert(&key, value)?;
+        self.blocking(move || {
+            // Keyed by ID alone, so re-inserting the same ID replaces the row
+            // rather than creating a second one under a different timestamp.
+            let previous = messages.insert(id_bytes.as_ref(), value)?;
 
-        // Flush immediately for durability
-        self.db.flush_async().await?;
-
-        Ok(old.is_none()) // True if new
+            match previous {
+                None => {
+                    by_time.insert(index_key, &[])?;
+                    Ok(true)
+                }
+                Some(old) => {
+                    // Same ID already stored. If its timestamp differed, drop
+                    // the stale index entry so the ID appears exactly once in
+                    // range scans.
+                    if let Some(old_ts) = Self::value_timestamp(&old) {
+                        let old_index = {
+                            let mut k = Vec::with_capacity(32);
+                            k.extend_from_slice(&old_ts.to_be_bytes());
+                            k.extend_from_slice(id_bytes.as_ref());
+                            k
+                        };
+                        if old_index != index_key {
+                            by_time.remove(old_index)?;
+                            by_time.insert(index_key, &[])?;
+                        }
+                    }
+                    Ok(false)
+                }
+            }
+        })
+        .await
     }
 
     async fn get(
         &self,
         id: &MessageId,
     ) -> Result<Option<StoredMessage>, Box<dyn Error + Send + Sync>> {
+        let messages = self.messages.clone();
         let id_bytes = id.encode_to_bytes();
 
-        // Need to scan since we don't know the timestamp
-        // This is O(n) - for better performance, maintain a secondary index
-        for item in self.db.iter() {
-            let (key, value) = item?;
-            if key.len() >= 32 && key[8..32] == id_bytes[..] {
-                let msg = Self::deserialize(&key, &value)?;
-                return Ok(Some(msg));
+        self.blocking(move || {
+            // Single indexed lookup: the primary key is the message ID.
+            match messages.get(id_bytes.as_ref())? {
+                Some(value) => Ok(Some(Self::deserialize(id_bytes.as_ref(), &value)?)),
+                None => Ok(None),
             }
-        }
-        Ok(None)
+        })
+        .await
     }
 
     async fn contains(&self, id: &MessageId) -> Result<bool, Box<dyn Error + Send + Sync>> {
-        Ok(self.get(id).await?.is_some())
+        let messages = self.messages.clone();
+        let id_bytes = id.encode_to_bytes();
+
+        self.blocking(move || Ok(messages.contains_key(id_bytes.as_ref())?))
+            .await
     }
 
     async fn get_range(
@@ -185,60 +269,70 @@ impl MessageStore for SledStore {
         limit: usize,
         offset: usize,
     ) -> Result<(Vec<MessageId>, bool), Box<dyn Error + Send + Sync>> {
-        let mut result = Vec::new();
-        let mut count = 0;
-        let mut skipped = 0;
+        let by_time = self.by_time.clone();
 
-        let start_key = Self::timestamp_prefix(start);
-        let end_key = Self::timestamp_prefix(end.saturating_add(1)); // Exclusive end
+        self.blocking(move || {
+            let mut result = Vec::new();
+            let mut count = 0;
+            let mut skipped = 0;
 
-        for item in self.db.range(start_key.as_slice()..end_key.as_slice()) {
-            let (key, _) = item?;
+            let start_key = Self::timestamp_prefix(start);
+            let end_key = Self::timestamp_prefix(end.saturating_add(1)); // Exclusive end
 
-            if skipped < offset {
-                skipped += 1;
-                continue;
+            for item in by_time.range(start_key.as_slice()..end_key.as_slice()) {
+                let (key, _) = item?;
+
+                if skipped < offset {
+                    skipped += 1;
+                    continue;
+                }
+
+                if count >= limit {
+                    return Ok((result, true)); // has_more
+                }
+
+                if let Some(id) = Self::extract_id(&key) {
+                    result.push(id);
+                    count += 1;
+                }
             }
 
-            if count >= limit {
-                return Ok((result, true)); // has_more
-            }
-
-            if let Some(id) = Self::extract_id(&key) {
-                result.push(id);
-                count += 1;
-            }
-        }
-
-        Ok((result, false))
+            Ok((result, false))
+        })
+        .await
     }
 
     async fn prune(&self, older_than: u64) -> Result<usize, Box<dyn Error + Send + Sync>> {
-        let mut removed = 0;
-        let cutoff = Self::timestamp_prefix(older_than);
+        let messages = self.messages.clone();
+        let by_time = self.by_time.clone();
 
-        // Collect keys to remove
-        let keys_to_remove: Vec<_> = self
-            .db
-            .range(..cutoff.as_slice())
-            .filter_map(|r| r.ok())
-            .map(|(k, _)| k)
-            .collect();
+        self.blocking(move || {
+            let cutoff = Self::timestamp_prefix(older_than);
+            let mut removed = 0;
 
-        // Remove collected keys
-        for key in keys_to_remove {
-            self.db.remove(&key)?;
-            removed += 1;
-        }
+            // Walk the time index rather than the whole primary tree.
+            let stale: Vec<_> = by_time
+                .range(..cutoff.as_slice())
+                .filter_map(|r| r.ok())
+                .map(|(k, _)| k)
+                .collect();
 
-        // Flush changes
-        self.db.flush_async().await?;
+            for index_key in stale {
+                if let Some(id) = Self::extract_id(&index_key) {
+                    messages.remove(id.encode_to_bytes().as_ref())?;
+                }
+                by_time.remove(&index_key)?;
+                removed += 1;
+            }
 
-        Ok(removed)
+            Ok(removed)
+        })
+        .await
     }
 
     async fn count(&self) -> Result<usize, Box<dyn Error + Send + Sync>> {
-        Ok(self.db.len())
+        let messages = self.messages.clone();
+        self.blocking(move || Ok(messages.len())).await
     }
 }
 

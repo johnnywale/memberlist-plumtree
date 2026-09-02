@@ -519,12 +519,17 @@ async fn test_full_receive_multiple_messages() {
 
     sleep(Duration::from_millis(10)).await;
 
-    // Send multiple messages
+    // Send multiple messages.
+    // Network payloads carry a compression header byte (0 = not compressed);
+    // a payload without it is misread as a compressed frame and dropped.
     let messages: Vec<_> = (0..5)
         .map(|i| {
             let msg_id = MessageId::new();
-            let payload = Bytes::from(format!("Message {}", i));
-            (msg_id, payload)
+            let content = format!("Message {}", i);
+            let mut payload = bytes::BytesMut::with_capacity(1 + content.len());
+            payload.put_u8(0); // compression flags: not compressed
+            payload.put_slice(content.as_bytes());
+            (msg_id, payload.freeze())
         })
         .collect();
 
@@ -587,9 +592,14 @@ async fn test_full_receive_duplicate_rejection() {
 
     sleep(Duration::from_millis(10)).await;
 
-    // Create a single message
+    // Create a single message. Network payloads carry a compression header
+    // byte (0 = not compressed).
     let msg_id = MessageId::new();
-    let payload = Bytes::from("Duplicate test message");
+    let content = b"Duplicate test message";
+    let mut payload_buf = bytes::BytesMut::with_capacity(1 + content.len());
+    payload_buf.put_u8(0); // compression flags: not compressed
+    payload_buf.put_slice(content);
+    let payload = payload_buf.freeze();
 
     let gossip = PlumtreeMessage::Gossip {
         id: msg_id,
@@ -643,6 +653,14 @@ async fn test_full_receive_ihave_graft_cycle() {
         pm_proc.run_incoming_processor().await;
     });
 
+    // Start the main runner: it drives the graft timer, which is what turns an
+    // armed missed-message timer into an actual Graft. IHave alone no longer
+    // grafts or promotes.
+    let pm_runner = pm.clone();
+    tokio::spawn(async move {
+        pm_runner.run().await;
+    });
+
     sleep(Duration::from_millis(10)).await;
 
     // Send IHave message (announcing a message we don't have)
@@ -654,15 +672,15 @@ async fn test_full_receive_ihave_graft_cycle() {
 
     pm.incoming_sender().send((99u64, ihave)).await.unwrap();
 
-    // Wait for Graft timer to fire and request the message
-    // The message won't be delivered because we only sent IHave (no actual Gossip with payload)
-    // But we can verify the Graft mechanism was triggered by checking that
-    // the peer was promoted to eager (since it had a message we wanted)
+    // Wait for the missed-message timer to expire and drive the Graft. The
+    // message itself is never delivered (we only sent IHave, no Gossip with a
+    // payload), but the peer is promoted to eager at the point the Graft is
+    // actually sent — that is when it becomes a real repair path.
     eventually(Duration::from_secs(5), || async {
         pm.peers().topology().eager.contains(&99u64)
     })
     .await
-    .expect("Peer should be promoted to eager after IHave triggers Graft");
+    .expect("Peer should be promoted to eager once the Graft timer fires");
 
     pm.shutdown();
 }

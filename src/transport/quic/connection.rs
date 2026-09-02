@@ -506,7 +506,12 @@ where
                 if let Some(ref callback) = &*self.reconnect_callback.lock() {
                     callback(peer.clone(), attempt);
                 }
-                futures_timer::Delay::new(self.config.connection.retry_delay).await;
+                futures_timer::Delay::new(Self::retry_backoff(
+                    self.config.connection.retry_delay,
+                    attempt,
+                    self.config.connection.retry_backoff,
+                ))
+                .await;
             }
 
             match self.try_connect(addr).await {
@@ -566,6 +571,38 @@ where
         }
     }
 
+    /// Compute the delay before retry attempt `attempt` (1-based).
+    ///
+    /// Exponential backoff with full jitter, capped at 30x the base delay.
+    /// A flat delay would have every node that wants a popular dead peer retry
+    /// in lockstep, so the peer is hit by a synchronized burst on each round
+    /// (a thundering herd) and recovers into an immediate overload. Jitter
+    /// spreads the retries out; the exponential growth stops the retries from
+    /// being a sustained load while the peer is down.
+    fn retry_backoff(base: Duration, attempt: u32, exponential: bool) -> Duration {
+        // With backoff enabled, attempt 1 waits `base` and each further attempt
+        // doubles it; the exponent is clamped so the shift cannot overflow and
+        // the delay stays bounded on a long retry chain.
+        let capped = if exponential {
+            let exponent = attempt.saturating_sub(1).min(4);
+            base.saturating_mul(1u32 << exponent)
+        } else {
+            base
+        };
+
+        // Decorrelated jitter: pick uniformly from [capped/2, capped]. A flat
+        // delay has every node wanting the same dead peer retry in lockstep,
+        // so it is hit by a synchronized burst each round; spreading the
+        // retries avoids that while keeping a floor so they never tight-loop.
+        let millis = capped.as_millis() as u64;
+        if millis == 0 {
+            return capped;
+        }
+        let half = millis / 2;
+        let jittered = half + rand::random::<u64>() % (millis - half).max(1);
+        Duration::from_millis(jittered)
+    }
+
     /// Try to establish a connection once.
     async fn try_connect(&self, addr: SocketAddr) -> Result<Connection, QuicError> {
         // Use configured server name for TLS SNI, defaulting to "localhost" for self-signed certs.
@@ -620,21 +657,17 @@ where
         // so any stream opened on the returned connection is 1-RTT. Report this
         // honestly in the metric rather than guessing from handshake_data().
         let used_0rtt = false;
-        let send_result = if self.config.zero_rtt.enabled {
-            match conn_result.connection.open_uni().await {
-                Ok(mut stream) => {
-                    stream.write_all(&data).await.map_err(QuicError::Write)?;
-                    stream
-                        .finish()
-                        .map_err(|_| QuicError::Write(quinn::WriteError::ClosedStream))?;
-                    Ok(())
-                }
-                Err(e) => Err(QuicError::Stream(e.to_string())),
-            }
-        } else {
-            // 0-RTT disabled, use regular stream
-            let mut stream = conn_result
-                .connection
+
+        // Bound the stream-write phase. Only the handshake was timed out
+        // before, so a peer that keeps answering keep-alives but stops reading
+        // its streams could park a sender here forever.
+        let send_timeout = self.config.connection.send_timeout;
+        // Clone the connection handle (cheap: internally reference-counted) so
+        // the future does not borrow `conn_result`, which is returned below.
+        let conn = conn_result.connection.clone();
+        let data_len = data.len() as u64;
+        let write_fut = async move {
+            let mut stream = conn
                 .open_uni()
                 .await
                 .map_err(|e| QuicError::Stream(e.to_string()))?;
@@ -642,16 +675,25 @@ where
             stream
                 .finish()
                 .map_err(|_| QuicError::Write(quinn::WriteError::ClosedStream))?;
-            Ok(())
+            Ok::<(), QuicError>(())
+        };
+
+        let timer = futures_timer::Delay::new(send_timeout).fuse();
+        let write_fut = write_fut.fuse();
+        futures::pin_mut!(timer, write_fut);
+
+        let send_result = futures::select! {
+            result = write_fut => result,
+            _ = timer => Err(QuicError::SendTimeout {
+                timeout_ms: send_timeout.as_millis() as u64,
+            }),
         };
 
         send_result?;
 
         // Update stats and touch connection
         self.stats.messages_sent.fetch_add(1, Ordering::Relaxed);
-        self.stats
-            .bytes_sent
-            .fetch_add(data.len() as u64, Ordering::Relaxed);
+        self.stats.bytes_sent.fetch_add(data_len, Ordering::Relaxed);
 
         let now = Instant::now();
         {
@@ -785,12 +827,26 @@ where
                 .collect()
         };
 
-        let count = stale.len();
-        if count > 0 {
+        let mut count = 0;
+        if !stale.is_empty() {
             let mut connections = self.connections.write().await;
             let mut lru = self.lru.write().await;
 
             for peer_id in &stale {
+                // Re-check under the write lock. The staleness decision above
+                // was made under a read lock that has since been released, so a
+                // connection may have been used in between; closing it on the
+                // strength of the earlier snapshot would tear down a live
+                // connection mid-send.
+                let still_stale = connections
+                    .get(peer_id)
+                    .map(|pooled| !pooled.is_usable() || pooled.idle_time() > idle_timeout)
+                    .unwrap_or(false);
+
+                if !still_stale {
+                    continue;
+                }
+
                 if let Some(pooled) = connections.remove(peer_id) {
                     if pooled.is_usable() {
                         pooled.connection.close(0u32.into(), b"idle");
@@ -799,6 +855,7 @@ where
                         .connections_closed
                         .fetch_add(1, Ordering::Relaxed);
                     lru.remove(peer_id);
+                    count += 1;
                 }
             }
         }

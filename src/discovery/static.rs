@@ -24,7 +24,11 @@ pub struct StaticDiscoveryConfig<I> {
     ///
     /// Default: 30s
     pub probe_interval: Duration,
-    /// Timeout for seed probes.
+    /// Timeout applied to each reachability probe.
+    ///
+    /// Only meaningful when a probe callback is installed via
+    /// [`StaticDiscovery::set_reachability_probe`]. With no probe installed,
+    /// seeds are assumed reachable and this value is unused.
     ///
     /// Default: 5s
     pub probe_timeout: Duration,
@@ -96,6 +100,24 @@ impl<I> StaticDiscoveryConfig<I> {
     }
 }
 
+/// Parameters for the background discovery loop.
+#[cfg(feature = "tokio")]
+struct DiscoveryLoopParams<I> {
+    seeds: Vec<(I, SocketAddr)>,
+    probe_interval: Duration,
+    probe_timeout: Duration,
+    initial_delay: Duration,
+    emit_on_start: bool,
+    probe: Option<ReachabilityProbe>,
+}
+
+/// Callback deciding whether a seed address is currently reachable.
+///
+/// Returns `true` if the seed responded within the configured
+/// [`StaticDiscoveryConfig::probe_timeout`]. See
+/// [`StaticDiscovery::set_reachability_probe`].
+pub type ReachabilityProbe = Arc<dyn Fn(SocketAddr, Duration) -> bool + Send + Sync>;
+
 /// Static seed-based peer discovery.
 ///
 /// Discovers peers from a configured list of seed addresses.
@@ -114,10 +136,26 @@ impl<I> StaticDiscoveryConfig<I> {
 ///
 /// let discovery = StaticDiscovery::new(config);
 /// ```
-#[derive(Debug, Clone)]
+///
+/// By default every configured seed is treated as permanently reachable, so
+/// only [`DiscoveryEvent::PeerDiscovered`] is ever emitted. Install a probe
+/// with [`StaticDiscovery::set_reachability_probe`] to detect seeds going away
+/// and get [`DiscoveryEvent::PeerLost`] events.
+#[derive(Clone)]
 pub struct StaticDiscovery<I> {
     config: StaticDiscoveryConfig<I>,
     local_addr: Option<SocketAddr>,
+    probe: Option<ReachabilityProbe>,
+}
+
+impl<I: Debug> Debug for StaticDiscovery<I> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StaticDiscovery")
+            .field("config", &self.config)
+            .field("local_addr", &self.local_addr)
+            .field("probe", &self.probe.as_ref().map(|_| "<installed>"))
+            .finish()
+    }
 }
 
 impl<I> StaticDiscovery<I> {
@@ -126,13 +164,52 @@ impl<I> StaticDiscovery<I> {
         Self {
             config,
             local_addr: None,
+            probe: None,
         }
+    }
+
+    /// Install a reachability probe, enabling `PeerLost` events.
+    ///
+    /// Without a probe, static discovery treats every configured seed as
+    /// permanently reachable: it emits [`DiscoveryEvent::PeerDiscovered`] once
+    /// and never emits [`DiscoveryEvent::PeerLost`], and
+    /// [`StaticDiscoveryConfig::probe_timeout`] goes unused. This crate does
+    /// not depend on `tokio`'s `net` feature, so it cannot open sockets
+    /// itself — supply the connectivity check from your application.
+    ///
+    /// The callback receives the seed's address and the configured
+    /// `probe_timeout`, and must return within roughly that duration. It is
+    /// called from a background task once per seed per `probe_interval`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use std::net::TcpStream;
+    /// use std::sync::Arc;
+    ///
+    /// discovery.set_reachability_probe(Arc::new(|addr, timeout| {
+    ///     TcpStream::connect_timeout(&addr, timeout).is_ok()
+    /// }));
+    /// ```
+    pub fn set_reachability_probe(&mut self, probe: ReachabilityProbe) {
+        self.probe = Some(probe);
+    }
+
+    /// Builder form of [`StaticDiscovery::set_reachability_probe`].
+    pub fn with_reachability_probe(mut self, probe: ReachabilityProbe) -> Self {
+        self.probe = Some(probe);
+        self
     }
 
     /// Create a new static discovery with the local address.
     pub fn with_local_addr(mut self, addr: SocketAddr) -> Self {
         self.local_addr = Some(addr);
         self
+    }
+
+    /// Whether a reachability probe is installed.
+    pub fn has_reachability_probe(&self) -> bool {
+        self.probe.is_some()
     }
 
     /// Create from a list of seeds with default settings.
@@ -160,15 +237,21 @@ where
         #[cfg(feature = "tokio")]
         {
             let probe_interval = self.config.probe_interval;
+            let probe_timeout = self.config.probe_timeout;
             let initial_delay = self.config.initial_delay;
+            let probe = self.probe.clone();
             tokio::spawn(async move {
                 Self::run_discovery_loop(
                     tx,
                     running,
-                    seeds,
-                    probe_interval,
-                    initial_delay,
-                    emit_on_start,
+                    DiscoveryLoopParams {
+                        seeds,
+                        probe_interval,
+                        probe_timeout,
+                        initial_delay,
+                        emit_on_start,
+                        probe,
+                    },
                 )
                 .await;
             });
@@ -207,11 +290,17 @@ where
     async fn run_discovery_loop(
         tx: async_channel::Sender<DiscoveryEvent<I>>,
         running: Arc<AtomicBool>,
-        seeds: Vec<(I, SocketAddr)>,
-        probe_interval: Duration,
-        initial_delay: Duration,
-        emit_on_start: bool,
+        params: DiscoveryLoopParams<I>,
     ) {
+        let DiscoveryLoopParams {
+            seeds,
+            probe_interval,
+            probe_timeout,
+            initial_delay,
+            emit_on_start,
+            probe,
+        } = params;
+
         // Initial delay
         if !initial_delay.is_zero() {
             tokio::time::sleep(initial_delay).await;
@@ -253,13 +342,30 @@ where
                 break;
             }
 
-            // For now, just emit all seeds as alive on each probe
-            // A real implementation would do actual connectivity probes
             for (id, addr) in &seeds {
                 let was_known = known.get(id).copied().unwrap_or(false);
 
-                // Simulate probe success (always reachable for static seeds)
-                let is_reachable = true;
+                // Probe reachability if the application supplied a check.
+                // Without one, a static seed is assumed permanently reachable
+                // (so `PeerLost` never fires) — see
+                // `StaticDiscovery::set_reachability_probe`.
+                let is_reachable = match probe.as_ref() {
+                    Some(probe) => {
+                        let probe = probe.clone();
+                        let addr = *addr;
+                        // The probe is a blocking callback; keep it off the
+                        // runtime worker.
+                        match tokio::task::spawn_blocking(move || probe(addr, probe_timeout)).await
+                        {
+                            Ok(reachable) => reachable,
+                            Err(e) => {
+                                tracing::warn!(?id, error = %e, "reachability probe panicked");
+                                false
+                            }
+                        }
+                    }
+                    None => true,
+                };
 
                 if is_reachable && !was_known {
                     known.insert(id.clone(), true);

@@ -829,6 +829,17 @@ impl PlumtreeConfig {
         if self.ihave_batch_size == 0 {
             return Err("ihave_batch_size must be > 0".into());
         }
+        // Upper bound is a wire-format limit, not a tuning preference: the
+        // encoder would emit more IDs than any receiver's decoder accepts, so
+        // every IHave flush would be silently discarded cluster-wide and all
+        // missed-message recovery would vanish without an error anywhere.
+        if self.ihave_batch_size > crate::message::MAX_IHAVE_BATCH {
+            return Err(format!(
+                "ihave_batch_size must be <= {} (the wire limit receivers enforce); \
+                 larger batches are rejected as malformed by every peer",
+                crate::message::MAX_IHAVE_BATCH
+            ));
+        }
         if self.max_message_size == 0 {
             return Err("max_message_size must be > 0".into());
         }

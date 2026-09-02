@@ -141,7 +141,7 @@ where
     /// Handle incoming sync message.
     ///
     /// Processes SyncRequest/SyncResponse/SyncPull/SyncPush messages.
-    /// Returns an optional response message to send back.
+    /// Returns the response messages to send back, in order.
     ///
     /// # Arguments
     ///
@@ -150,14 +150,21 @@ where
     ///
     /// # Returns
     ///
-    /// * `Ok(Some(msg))` - Response message to send back to peer
-    /// * `Ok(None)` - No response needed
+    /// * `Ok(msgs)` - Response messages to send back to the peer, in order.
+    ///   Empty means no response is needed. A single logical reply may span
+    ///   several messages: a `Pull` for up to [`MAX_SYNC_BATCH`] IDs is answered
+    ///   with as many `Push` messages as needed to stay within the
+    ///   [`MAX_SYNC_PUSH_MESSAGES`] wire limit per message, since a receiver
+    ///   rejects any oversized `Push` outright.
     /// * `Err(e)` - Error occurred during handling
+    ///
+    /// [`MAX_SYNC_BATCH`]: crate::message::MAX_SYNC_BATCH
+    /// [`MAX_SYNC_PUSH_MESSAGES`]: crate::message::MAX_SYNC_PUSH_MESSAGES
     fn handle_sync_message(
         &self,
         from: I,
         message: SyncMessage,
-    ) -> impl Future<Output = SyncResult<Option<SyncMessage>>> + Send;
+    ) -> impl Future<Output = SyncResult<Vec<SyncMessage>>> + Send;
 
     /// Check if sync is enabled.
     fn is_enabled(&self) -> bool;
@@ -174,4 +181,14 @@ where
     ///
     /// Should be called when a message is pruned from storage.
     fn remove_message(&self, id: &crate::MessageId);
+
+    /// Signal the strategy to stop.
+    ///
+    /// After this returns, [`SyncStrategy::run_background_sync`] must complete
+    /// promptly rather than looping or parking forever — otherwise the task
+    /// outlives shutdown and keeps the node's state alive indefinitely.
+    ///
+    /// The default implementation does nothing, which is correct only for
+    /// strategies with no background task of their own.
+    fn shutdown(&self) {}
 }

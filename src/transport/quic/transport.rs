@@ -875,6 +875,18 @@ pub struct IncomingConfig {
     pub max_concurrent_connections: usize,
     /// Maximum concurrent streams per connection (default: 100).
     pub max_streams_per_connection: usize,
+    /// How the envelope's `sender` field is bound to the TLS-verified peer
+    /// identity of the connection it arrived on (default: [`SenderAuth::Disabled`]).
+    ///
+    /// # Security
+    ///
+    /// With [`SenderAuth::Disabled`], the sender is taken from the wire envelope
+    /// and is therefore **unauthenticated**: any party that can reach the QUIC
+    /// port can inject `Graft`/`Prune`/`Gossip` claiming to be any node. Set
+    /// this to [`SenderAuth::Required`] (together with mTLS and peer-ID
+    /// certificates) for any deployment where cluster members are not fully
+    /// mutually trusted.
+    pub sender_auth: SenderAuth,
 }
 
 impl Default for IncomingConfig {
@@ -884,6 +896,84 @@ impl Default for IncomingConfig {
             channel_buffer: 1024,
             max_concurrent_connections: 1000,
             max_streams_per_connection: 100,
+            sender_auth: SenderAuth::Disabled,
+        }
+    }
+}
+
+impl IncomingConfig {
+    /// Set the sender authentication policy.
+    pub fn with_sender_auth(mut self, sender_auth: SenderAuth) -> Self {
+        self.sender_auth = sender_auth;
+        self
+    }
+}
+
+/// Policy binding the envelope `sender` field to the TLS-verified peer identity.
+///
+/// The QUIC handshake authenticates a *certificate*; the Plumtree envelope
+/// carries a *claimed* sender ID. Without binding the two, a peer holding any
+/// certificate the cluster accepts can impersonate any other member. This
+/// policy controls that binding, performed on every accepted stream.
+///
+/// The verified identity is the `peer:<id>` SAN entry of the connection's
+/// end-entity certificate (see [`extract_peer_id_from_der`]), compared against
+/// the envelope sender rendered through [`SenderAuth::Required`]'s mapping
+/// function.
+///
+/// [`extract_peer_id_from_der`]: super::tls::extract_peer_id_from_der
+#[derive(Clone)]
+pub enum SenderAuth {
+    /// Do not authenticate the sender; trust the envelope field.
+    ///
+    /// **Insecure against non-members.** Appropriate only for a fully trusted
+    /// mesh on a private network, or for development.
+    Disabled,
+
+    /// Require every envelope's sender to match the connection's certificate
+    /// peer ID.
+    ///
+    /// The closure renders a decoded `NodeId` into the string that is expected
+    /// in the certificate's `peer:<id>` SAN entry. Streams whose connection has
+    /// no peer-ID certificate, or whose envelope sender maps to a different
+    /// string, are dropped and counted in
+    /// [`IncomingStats::auth_failures`].
+    Required(Arc<dyn Fn(&[u8]) -> String + Send + Sync>),
+}
+
+impl SenderAuth {
+    /// Require sender authentication, rendering the encoded node ID as
+    /// lowercase hex.
+    ///
+    /// This matches certificates generated with a hex-encoded peer ID and is a
+    /// reasonable default for opaque binary node IDs.
+    pub fn required_hex() -> Self {
+        SenderAuth::Required(Arc::new(|encoded| {
+            encoded.iter().map(|b| format!("{:02x}", b)).collect()
+        }))
+    }
+
+    /// Require sender authentication, interpreting the encoded node ID as UTF-8.
+    ///
+    /// Use this when node IDs are strings (e.g. `String`/`SmolStr` node IDs)
+    /// and certificates carry that same string as the peer ID.
+    pub fn required_utf8() -> Self {
+        SenderAuth::Required(Arc::new(|encoded| {
+            String::from_utf8_lossy(encoded).into_owned()
+        }))
+    }
+
+    /// Whether this policy authenticates senders.
+    pub fn is_enabled(&self) -> bool {
+        matches!(self, SenderAuth::Required(_))
+    }
+}
+
+impl Debug for SenderAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SenderAuth::Disabled => f.write_str("SenderAuth::Disabled"),
+            SenderAuth::Required(_) => f.write_str("SenderAuth::Required(..)"),
         }
     }
 }
@@ -893,6 +983,8 @@ impl Default for IncomingConfig {
 /// When dropped, the acceptor task will be signaled to stop.
 pub struct IncomingHandle {
     running: Arc<std::sync::atomic::AtomicBool>,
+    /// Wakes the acceptor and every per-connection task on `stop()`.
+    shutdown: Arc<tokio::sync::Notify>,
     stats: Arc<IncomingStatsInner>,
     _handle: tokio::task::JoinHandle<()>,
 }
@@ -903,10 +995,15 @@ impl IncomingHandle {
         self.running.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Stop the acceptor.
+    /// Stop the acceptor and its per-connection tasks.
+    ///
+    /// Setting the flag alone is not enough: a per-connection task parked in
+    /// `accept_uni()` on a quiet connection would never look at it again, so
+    /// the tasks are also woken explicitly.
     pub fn stop(&self) {
         self.running
             .store(false, std::sync::atomic::Ordering::Release);
+        self.shutdown.notify_waiters();
     }
 
     /// Get current statistics for incoming connections.
@@ -932,6 +1029,10 @@ pub struct IncomingStats {
     pub bytes_received: u64,
     /// Messages that failed to decode.
     pub decode_errors: u64,
+    /// Messages dropped because the envelope sender did not match the
+    /// TLS-verified peer identity of the connection (spoofing attempts, or a
+    /// misconfigured [`SenderAuth`] mapping).
+    pub auth_failures: u64,
     /// Active connections.
     pub active_connections: usize,
 }
@@ -943,6 +1044,7 @@ struct IncomingStatsInner {
     messages_received: AtomicU64,
     bytes_received: AtomicU64,
     decode_errors: AtomicU64,
+    auth_failures: AtomicU64,
     active_connections: AtomicU64,
 }
 
@@ -953,6 +1055,7 @@ impl IncomingStatsInner {
             messages_received: self.messages_received.load(Ordering::Relaxed),
             bytes_received: self.bytes_received.load(Ordering::Relaxed),
             decode_errors: self.decode_errors.load(Ordering::Relaxed),
+            auth_failures: self.auth_failures.load(Ordering::Relaxed),
             active_connections: self.active_connections.load(Ordering::Relaxed) as usize,
         }
     }
@@ -1009,17 +1112,28 @@ where
         let endpoint = self.endpoint.clone();
         let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let running_clone = running.clone();
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let shutdown_clone = shutdown.clone();
         let stats = Arc::new(IncomingStatsInner::default());
         let stats_clone = stats.clone();
 
         let handle = tokio::spawn(async move {
-            Self::run_acceptor::<NodeId>(endpoint, tx, config, running_clone, stats_clone).await;
+            Self::run_acceptor::<NodeId>(
+                endpoint,
+                tx,
+                config,
+                running_clone,
+                shutdown_clone,
+                stats_clone,
+            )
+            .await;
         });
 
         (
             rx,
             IncomingHandle {
                 running,
+                shutdown,
                 stats,
                 _handle: handle,
             },
@@ -1032,6 +1146,7 @@ where
         tx: async_channel::Sender<(NodeId, crate::PlumtreeMessage)>,
         config: IncomingConfig,
         running: Arc<std::sync::atomic::AtomicBool>,
+        shutdown: Arc<tokio::sync::Notify>,
         stats: Arc<IncomingStatsInner>,
     ) where
         NodeId: crate::IdCodec + Clone + Send + Sync + 'static,
@@ -1064,13 +1179,14 @@ where
                             let tx = tx.clone();
                             let config = config.clone();
                             let running = running.clone();
+                            let shutdown = shutdown.clone();
                             let stats = stats.clone();
 
                             tokio::spawn(async move {
                                 match incoming_conn.await {
                                     Ok(conn) => {
                                         Self::handle_connection::<NodeId>(
-                                            conn, tx, &config, &running, &stats,
+                                            conn, tx, &config, &running, &shutdown, &stats,
                                         )
                                         .await;
                                     }
@@ -1089,16 +1205,38 @@ where
                         }
                     }
                 }
-                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
-                    // Periodic check for shutdown
-                    if !running.load(std::sync::atomic::Ordering::Acquire) {
-                        break;
-                    }
+                _ = shutdown.notified() => {
+                    // Signalled by `IncomingHandle::stop()`; exit at once
+                    // rather than after the next poll tick.
+                    tracing::debug!("QUIC acceptor received shutdown signal");
+                    break;
                 }
             }
         }
 
         tracing::info!("QUIC incoming acceptor stopped");
+    }
+
+    /// Internal: extract the TLS-verified peer ID from an accepted connection.
+    ///
+    /// Reads the peer's certificate chain via [`quinn::Connection::peer_identity`]
+    /// and pulls the `peer:<id>` SAN entry out of the end-entity certificate.
+    /// The certificate chain itself was already validated during the handshake
+    /// by rustls (see [`PeerIdVerifier`]); this only surfaces the identity that
+    /// validation established.
+    ///
+    /// Returns `None` when the peer presented no certificate (client auth
+    /// disabled) or its certificate carries no peer-ID SAN.
+    ///
+    /// [`PeerIdVerifier`]: super::tls::PeerIdVerifier
+    fn connection_peer_id(conn: &quinn::Connection) -> Option<String> {
+        let identity = conn.peer_identity()?;
+        let chain = identity
+            .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+            .ok()?;
+        // The end-entity certificate is first in the chain.
+        let end_entity = chain.first()?;
+        super::tls::extract_peer_id_from_der(end_entity)
     }
 
     /// Internal: Handle a single connection.
@@ -1107,6 +1245,7 @@ where
         tx: async_channel::Sender<(NodeId, crate::PlumtreeMessage)>,
         config: &IncomingConfig,
         running: &Arc<std::sync::atomic::AtomicBool>,
+        shutdown: &Arc<tokio::sync::Notify>,
         stats: &Arc<IncomingStatsInner>,
     ) where
         NodeId: crate::IdCodec + Clone + Send + Sync + 'static,
@@ -1114,10 +1253,48 @@ where
         let remote_addr = conn.remote_address();
         tracing::debug!(?remote_addr, "accepted connection");
 
+        // Bind the transport-layer identity once per connection: extract the
+        // peer ID from the end-entity certificate the peer authenticated with.
+        // Every stream on this connection is then checked against it, so the
+        // envelope's `sender` field can never be used to impersonate another
+        // node. `None` means the peer presented no peer-ID certificate (e.g.
+        // mTLS is off), which `SenderAuth::Required` treats as a failure.
+        let verified_peer_id = Self::connection_peer_id(&conn);
+        if config.sender_auth.is_enabled() && verified_peer_id.is_none() {
+            tracing::warn!(
+                ?remote_addr,
+                "rejecting connection: sender authentication is required but the peer \
+                 presented no certificate with a peer ID SAN"
+            );
+            conn.close(1u32.into(), b"peer identity required");
+            return;
+        }
+        if let Some(ref peer_id) = verified_peer_id {
+            tracing::debug!(?remote_addr, %peer_id, "connection peer identity verified");
+        }
+
         // Semaphore to limit streams per connection
         let stream_semaphore = Arc::new(tokio::sync::Semaphore::new(
             config.max_streams_per_connection,
         ));
+
+        // Close the connection when shutdown is signalled. `accept_uni()` is
+        // not cancel-safe, so it must not be raced in a `select!`; closing the
+        // connection instead makes the pending accept return
+        // `ApplicationClosed` and the loop below exits on its own. Without
+        // this, a task parked on a quiet connection never re-checks `running`
+        // and outlives `IncomingHandle::stop()`.
+        let closer = {
+            let conn = conn.clone();
+            let shutdown = shutdown.clone();
+            let running = running.clone();
+            tokio::spawn(async move {
+                shutdown.notified().await;
+                if !running.load(std::sync::atomic::Ordering::Acquire) {
+                    conn.close(0u32.into(), b"shutting down");
+                }
+            })
+        };
 
         loop {
             if !running.load(std::sync::atomic::Ordering::Acquire) {
@@ -1138,9 +1315,19 @@ where
                     let tx = tx.clone();
                     let max_size = config.max_message_size;
                     let stats = stats.clone();
+                    let sender_auth = config.sender_auth.clone();
+                    let verified_peer_id = verified_peer_id.clone();
 
                     tokio::spawn(async move {
-                        Self::handle_stream::<NodeId>(stream, tx, max_size, &stats).await;
+                        Self::handle_stream::<NodeId>(
+                            stream,
+                            tx,
+                            max_size,
+                            &stats,
+                            &sender_auth,
+                            verified_peer_id.as_deref(),
+                        )
+                        .await;
                         drop(permit);
                     });
                 }
@@ -1158,6 +1345,9 @@ where
                 }
             }
         }
+
+        // The loop is done, so the shutdown watcher has nothing left to close.
+        closer.abort();
     }
 
     /// Internal: Handle a single stream (one message).
@@ -1166,6 +1356,8 @@ where
         tx: async_channel::Sender<(NodeId, crate::PlumtreeMessage)>,
         max_size: usize,
         stats: &Arc<IncomingStatsInner>,
+        sender_auth: &SenderAuth,
+        verified_peer_id: Option<&str>,
     ) where
         NodeId: crate::IdCodec + Clone + Send + Sync + 'static,
     {
@@ -1176,8 +1368,44 @@ where
                     .fetch_add(data.len() as u64, Ordering::Relaxed);
 
                 // Decode the Plumtree envelope
-                match crate::decode_plumtree_envelope::<NodeId>(&data) {
+                // Cap decompression at the configured max message size: the
+                // stream itself was already length-limited to `max_size`, but a
+                // compressed envelope could otherwise inflate far past it.
+                match crate::integration::decode_plumtree_envelope_capped::<NodeId>(&data, max_size)
+                {
                     Some((sender, msg)) => {
+                        // Authenticate the claimed sender against the identity
+                        // the peer proved during the TLS handshake. Only the
+                        // verified identity may act as this sender.
+                        if let SenderAuth::Required(render) = sender_auth {
+                            let claimed = {
+                                let mut buf = bytes::BytesMut::new();
+                                sender.encode_id(&mut buf);
+                                render(&buf)
+                            };
+                            match verified_peer_id {
+                                Some(verified) if verified == claimed => {}
+                                Some(verified) => {
+                                    stats.auth_failures.fetch_add(1, Ordering::Relaxed);
+                                    tracing::warn!(
+                                        %verified,
+                                        %claimed,
+                                        "dropping message: envelope sender does not match the \
+                                         connection's verified peer identity"
+                                    );
+                                    return;
+                                }
+                                None => {
+                                    stats.auth_failures.fetch_add(1, Ordering::Relaxed);
+                                    tracing::warn!(
+                                        %claimed,
+                                        "dropping message: no verified peer identity for connection"
+                                    );
+                                    return;
+                                }
+                            }
+                        }
+
                         stats.messages_received.fetch_add(1, Ordering::Relaxed);
 
                         if tx.send((sender, msg)).await.is_err() {

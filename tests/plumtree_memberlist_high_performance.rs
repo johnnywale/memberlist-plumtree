@@ -619,12 +619,22 @@ async fn test_high_throughput_broadcast() {
         msg_ids.push(msg_id);
     }
 
+    // Build a wire-shaped payload: network payloads carry a compression header
+    // byte (0 = not compressed), and one lacking it is misread as a compressed
+    // frame and dropped.
+    let framed = |content: String| -> Bytes {
+        let mut buf = bytes::BytesMut::with_capacity(1 + content.len());
+        buf.put_u8(0); // compression flags: not compressed
+        buf.put_slice(content.as_bytes());
+        buf.freeze()
+    };
+
     // Simulate message propagation: 0 -> 1
     for msg_id in &msg_ids {
         let gossip = PlumtreeMessage::Gossip {
             id: *msg_id,
             round: 0,
-            payload: Bytes::from(format!("message-{}", msg_id.timestamp())),
+            payload: framed(format!("message-{}", msg_id.timestamp())),
         };
         nodes[1].handle_message(NodeId(0), gossip).await.unwrap();
     }
@@ -634,7 +644,7 @@ async fn test_high_throughput_broadcast() {
         let gossip = PlumtreeMessage::Gossip {
             id: *msg_id,
             round: 1,
-            payload: Bytes::from(format!("message-{}", msg_id.timestamp())),
+            payload: framed(format!("message-{}", msg_id.timestamp())),
         };
         nodes[2].handle_message(NodeId(1), gossip).await.unwrap();
     }

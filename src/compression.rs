@@ -187,14 +187,58 @@ pub fn compress(data: &[u8], algorithm: CompressionAlgorithm) -> Result<Bytes, C
     }
 }
 
-/// Decompress data using the specified algorithm.
+/// Decompress data using the specified algorithm, capping the output size.
+///
+/// # Security
+///
+/// `max_output` is a hard bound on the number of decompressed bytes produced.
+/// Decompression is streamed and aborted as soon as the bound is exceeded, so a
+/// small hostile frame cannot be inflated into a huge allocation
+/// (a "decompression bomb"). Callers handling network input must pass their
+/// configured maximum message size; see `decompress_payload`.
 #[cfg(feature = "compression")]
-pub fn decompress(data: &[u8], algorithm: CompressionAlgorithm) -> Result<Bytes, CompressionError> {
+pub fn decompress(
+    data: &[u8],
+    algorithm: CompressionAlgorithm,
+    max_output: usize,
+) -> Result<Bytes, CompressionError> {
     match algorithm {
-        CompressionAlgorithm::None => Ok(Bytes::copy_from_slice(data)),
-        CompressionAlgorithm::Gzip { .. } => decompress_gzip(data),
-        CompressionAlgorithm::Zstd { .. } => decompress_zstd(data),
+        CompressionAlgorithm::None => {
+            if data.len() > max_output {
+                return Err(CompressionError::OutputTooLarge(max_output));
+            }
+            Ok(Bytes::copy_from_slice(data))
+        }
+        CompressionAlgorithm::Gzip { .. } => decompress_gzip(data, max_output),
+        CompressionAlgorithm::Zstd { .. } => decompress_zstd(data, max_output),
     }
+}
+
+/// Read a decoder to end, refusing to produce more than `max_output` bytes.
+///
+/// Reads through a `take(max_output + 1)` limit: if the extra byte
+/// materializes, the stream wanted to expand beyond the cap and we bail out
+/// without ever having allocated more than `max_output + 1` bytes.
+#[cfg(feature = "compression")]
+fn read_to_end_capped<R: std::io::Read>(
+    reader: R,
+    max_output: usize,
+) -> Result<Vec<u8>, CompressionError> {
+    use std::io::Read;
+
+    // Cap the reader itself so a hostile stream cannot drive an unbounded
+    // allocation, and reserve modestly rather than trusting the header.
+    let mut limited = reader.take(max_output as u64 + 1);
+    let mut out = Vec::with_capacity(std::cmp::min(max_output, 64 * 1024).saturating_add(1));
+    limited
+        .read_to_end(&mut out)
+        .map_err(|e| CompressionError::DecompressFailed(e.to_string()))?;
+
+    if out.len() > max_output {
+        return Err(CompressionError::OutputTooLarge(max_output));
+    }
+
+    Ok(out)
 }
 
 #[cfg(feature = "compression")]
@@ -220,15 +264,10 @@ fn compress_gzip(data: &[u8], level: u32) -> Result<Bytes, CompressionError> {
 }
 
 #[cfg(feature = "compression")]
-fn decompress_gzip(data: &[u8]) -> Result<Bytes, CompressionError> {
+fn decompress_gzip(data: &[u8], max_output: usize) -> Result<Bytes, CompressionError> {
     use flate2::read::GzDecoder;
-    use std::io::Read;
 
-    let mut decoder = GzDecoder::new(data);
-    let mut decompressed = Vec::new();
-    decoder
-        .read_to_end(&mut decompressed)
-        .map_err(|e| CompressionError::DecompressFailed(e.to_string()))?;
+    let decompressed = read_to_end_capped(GzDecoder::new(data), max_output)?;
     Ok(Bytes::from(decompressed))
 }
 
@@ -246,9 +285,12 @@ fn compress_zstd(data: &[u8], level: i32) -> Result<Bytes, CompressionError> {
 }
 
 #[cfg(feature = "compression")]
-fn decompress_zstd(data: &[u8]) -> Result<Bytes, CompressionError> {
-    let decompressed =
-        zstd::decode_all(data).map_err(|e| CompressionError::DecompressFailed(e.to_string()))?;
+fn decompress_zstd(data: &[u8], max_output: usize) -> Result<Bytes, CompressionError> {
+    // `zstd::decode_all` allocates from the frame's declared content size and
+    // has no output bound, so stream through a capped reader instead.
+    let decoder = zstd::stream::read::Decoder::new(data)
+        .map_err(|e| CompressionError::DecompressFailed(e.to_string()))?;
+    let decompressed = read_to_end_capped(decoder, max_output)?;
     Ok(Bytes::from(decompressed))
 }
 
@@ -265,7 +307,11 @@ pub fn compress(data: &[u8], _algorithm: CompressionAlgorithm) -> Result<Bytes, 
 pub fn decompress(
     data: &[u8],
     _algorithm: CompressionAlgorithm,
+    max_output: usize,
 ) -> Result<Bytes, CompressionError> {
+    if data.len() > max_output {
+        return Err(CompressionError::OutputTooLarge(max_output));
+    }
     Ok(Bytes::copy_from_slice(data))
 }
 
@@ -278,6 +324,10 @@ pub enum CompressionError {
     DecompressFailed(String),
     /// Unknown algorithm
     UnknownAlgorithm(u8),
+    /// Decompressed output exceeded the allowed limit (decompression bomb).
+    ///
+    /// Carries the limit that was exceeded, in bytes.
+    OutputTooLarge(usize),
 }
 
 impl std::fmt::Display for CompressionError {
@@ -287,6 +337,13 @@ impl std::fmt::Display for CompressionError {
             CompressionError::DecompressFailed(e) => write!(f, "decompression failed: {}", e),
             CompressionError::UnknownAlgorithm(id) => {
                 write!(f, "unknown compression algorithm: {}", id)
+            }
+            CompressionError::OutputTooLarge(limit) => {
+                write!(
+                    f,
+                    "decompressed output exceeds limit of {} bytes; refusing to expand further",
+                    limit
+                )
             }
         }
     }
@@ -406,11 +463,20 @@ pub fn compress_payload(
 ///
 /// # Arguments
 /// - `payload`: The received payload with header byte
+/// - `max_output`: Hard cap on decompressed size, in bytes. Frames that would
+///   expand past this are rejected with [`CompressionError::OutputTooLarge`]
+///   rather than allocated.
 ///
 /// # Returns
 /// - `Ok(decompressed_data)` on success
-/// - `Err(CompressionError)` if decompression fails
-pub fn decompress_payload(payload: &[u8]) -> Result<Bytes, CompressionError> {
+/// - `Err(CompressionError)` if decompression fails or exceeds `max_output`
+///
+/// # Security
+///
+/// This is the receive path for untrusted network input; `max_output` is what
+/// stops a decompression bomb. Pass the transport's configured maximum message
+/// size, never `usize::MAX`.
+pub fn decompress_payload(payload: &[u8], max_output: usize) -> Result<Bytes, CompressionError> {
     if payload.is_empty() {
         return Ok(Bytes::new());
     }
@@ -422,6 +488,9 @@ pub fn decompress_payload(payload: &[u8]) -> Result<Bytes, CompressionError> {
 
     if !compressed {
         // Not compressed, return data as-is
+        if data.len() > max_output {
+            return Err(CompressionError::OutputTooLarge(max_output));
+        }
         return Ok(Bytes::copy_from_slice(data));
     }
 
@@ -429,7 +498,7 @@ pub fn decompress_payload(payload: &[u8]) -> Result<Bytes, CompressionError> {
     let algorithm = CompressionAlgorithm::from_wire_id(algorithm_id)
         .ok_or(CompressionError::UnknownAlgorithm(algorithm_id))?;
 
-    decompress(data, algorithm)
+    decompress(data, algorithm, max_output)
 }
 
 #[cfg(test)]
@@ -531,8 +600,12 @@ mod tests {
         // Should actually compress (smaller than original)
         assert!(compressed.len() < original.len(), "Data should compress");
 
-        let decompressed =
-            decompress(&compressed, CompressionAlgorithm::Gzip { level: 6 }).unwrap();
+        let decompressed = decompress(
+            &compressed,
+            CompressionAlgorithm::Gzip { level: 6 },
+            1 << 20,
+        )
+        .unwrap();
         assert_eq!(original.as_slice(), decompressed.as_ref());
     }
 
@@ -548,8 +621,12 @@ mod tests {
         // Should actually compress (smaller than original)
         assert!(compressed.len() < original.len(), "Data should compress");
 
-        let decompressed =
-            decompress(&compressed, CompressionAlgorithm::Zstd { level: 3 }).unwrap();
+        let decompressed = decompress(
+            &compressed,
+            CompressionAlgorithm::Zstd { level: 3 },
+            1 << 20,
+        )
+        .unwrap();
         assert_eq!(original.as_slice(), decompressed.as_ref());
     }
 
@@ -593,7 +670,7 @@ mod tests {
         let (compressed, stats) = compress_payload(original, &config);
         assert!(stats.is_none(), "No compression stats when disabled");
 
-        let decompressed = decompress_payload(&compressed).unwrap();
+        let decompressed = decompress_payload(&compressed, 1 << 20).unwrap();
         assert_eq!(decompressed.as_ref(), original);
     }
 
@@ -621,7 +698,7 @@ mod tests {
         );
 
         // Decompress and verify round-trip
-        let decompressed = decompress_payload(&compressed).unwrap();
+        let decompressed = decompress_payload(&compressed, 1 << 20).unwrap();
         assert_eq!(decompressed.as_ref(), original.as_slice());
     }
 
@@ -637,7 +714,7 @@ mod tests {
         let (compressed, stats) = compress_payload(&original, &config);
         assert!(stats.is_some(), "Should compress data above threshold");
 
-        let decompressed = decompress_payload(&compressed).unwrap();
+        let decompressed = decompress_payload(&compressed, 1 << 20).unwrap();
         assert_eq!(decompressed.as_ref(), original.as_slice());
     }
 
@@ -656,7 +733,7 @@ mod tests {
         );
 
         // Should still decompress correctly (passes through uncompressed)
-        let decompressed = decompress_payload(&compressed).unwrap();
+        let decompressed = decompress_payload(&compressed, 1 << 20).unwrap();
         assert_eq!(decompressed.as_ref(), original.as_slice());
     }
 }

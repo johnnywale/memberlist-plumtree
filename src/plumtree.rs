@@ -120,6 +120,14 @@ impl<I: Clone> ShardedSeenMap<I> {
     async fn insert(&self, id: MessageId, entry: SeenEntry<I>) -> bool {
         use std::collections::hash_map::Entry;
         let mut shard = self.write_shard(&id).await;
+
+        // Enforce capacity here too. Locally originated broadcasts arrive
+        // through this path rather than the receive path, so without the same
+        // eviction a high-volume publisher grows its shards without bound.
+        if !shard.contains_key(&id) && shard.len() >= self.max_capacity_per_shard {
+            Self::emergency_evict(&mut shard, self.max_capacity_per_shard / 10);
+        }
+
         if let Entry::Vacant(e) = shard.entry(id) {
             e.insert(entry);
             true
@@ -197,16 +205,31 @@ impl<I: Clone> ShardedSeenMap<I> {
 
         let to_remove = target_evict.min(shard.len());
 
-        // Use select_nth_unstable for O(n) partitioning instead of O(n log n) sort
-        let mut entries: Vec<(MessageId, std::time::Instant)> = shard
+        // Evict oldest first, but prefer entries that have stopped receiving
+        // duplicates.
+        //
+        // Dropping the dedup entry for a message still circulating is the worst
+        // possible outcome here: the next copy to arrive looks new, so it is
+        // re-delivered to the application and re-forwarded to eager peers —
+        // amplifying traffic at precisely the moment the node is already
+        // overloaded enough to need emergency eviction. A high `receive_count`
+        // means copies are still arriving, so those entries are held back and
+        // quiet ones go first.
+        //
+        // Still O(n): the sort key is a coarse bucket, not a full ordering.
+        let mut entries: Vec<(MessageId, bool, std::time::Instant)> = shard
             .iter()
-            .map(|(id, entry)| (*id, entry.seen_at))
+            .map(|(id, entry)| (*id, entry.receive_count > 1, entry.seen_at))
             .collect();
 
-        // Partition so that the `to_remove` oldest entries are at the front
-        entries.select_nth_unstable_by_key(to_remove - 1, |(_, seen_at)| *seen_at);
+        // Partition so the `to_remove` best eviction candidates are at the
+        // front: not-still-circulating before still-circulating, oldest first
+        // within each group.
+        entries.select_nth_unstable_by_key(to_remove - 1, |(_, circulating, seen_at)| {
+            (*circulating, *seen_at)
+        });
 
-        for (id, _) in entries.iter().take(to_remove) {
+        for (id, _, _) in entries.iter().take(to_remove) {
             shard.remove(id);
         }
 
@@ -433,6 +456,9 @@ struct PlumtreeInner<I, D> {
 
     /// Shutdown flag.
     shutdown: AtomicBool,
+    /// Notifies background loops when `shutdown` is set, so they wake at once
+    /// instead of sleeping out their full interval first.
+    shutdown_notify: event_listener::Event,
 
     /// Priority queue for outgoing messages.
     outgoing_queue: Arc<AsyncMutex<PriorityQueue<OutgoingMessage<I>>>>,
@@ -587,6 +613,13 @@ impl<I> OutgoingMessage<I> {
     }
 }
 
+/// Message ID used by a Graft that carries no payload request.
+///
+/// Sent when maintenance promotes a peer to eager: the point is to make the
+/// tree edge symmetric, not to recover a message. A receiver looks this ID up,
+/// finds nothing, and completes the promotion without sending a payload.
+pub const GRAFT_TOPOLOGY_ONLY: MessageId = MessageId::from_parts(0, 0, 0);
+
 /// Incoming message received from a peer.
 #[derive(Debug)]
 pub struct IncomingMessage<I> {
@@ -608,11 +641,37 @@ where
     /// - `local_id`: This node's identifier
     /// - `config`: Plumtree configuration
     /// - `delegate`: Event handler
+    ///
+    /// # Panics
+    ///
+    /// Panics if `config` is invalid (see [`PlumtreeConfig::validate`]).
+    /// Use [`Plumtree::try_new`] to handle an invalid configuration as an
+    /// error instead — preferable when the config comes from a file, flags, or
+    /// any other runtime source.
     pub fn new(local_id: I, config: PlumtreeConfig, delegate: D) -> (Self, PlumtreeHandle<I>) {
-        // Validate configuration
-        if let Err(e) = config.validate() {
-            panic!("Invalid PlumtreeConfig: {}", e);
+        match Self::try_new(local_id, config, delegate) {
+            Ok(result) => result,
+            Err(e) => panic!("Invalid PlumtreeConfig: {}", e),
         }
+    }
+
+    /// Create a new Plumtree instance, returning an error for invalid config.
+    ///
+    /// Same as [`Plumtree::new`] but reports a configuration problem as
+    /// [`Error::Config`] rather than panicking.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] if `config` fails [`PlumtreeConfig::validate`]
+    /// — for example an `ihave_batch_size` above the wire limit, which would
+    /// otherwise disable missed-message recovery cluster-wide with no error.
+    pub fn try_new(
+        local_id: I,
+        config: PlumtreeConfig,
+        delegate: D,
+    ) -> Result<(Self, PlumtreeHandle<I>)> {
+        // Validate configuration
+        config.validate().map_err(Error::Config)?;
 
         // Initialize metrics descriptions (safe to call multiple times)
         #[cfg(feature = "metrics")]
@@ -676,6 +735,7 @@ where
             local_id,
             round: AtomicU32::new(0),
             shutdown: AtomicBool::new(false),
+            shutdown_notify: event_listener::Event::new(),
             outgoing_queue: outgoing_queue.clone(),
             outgoing_notify,
             incoming_tx,
@@ -695,7 +755,7 @@ where
             incoming_tx: plumtree.inner.incoming_tx.clone(),
         };
 
-        (plumtree, handle)
+        Ok((plumtree, handle))
     }
 
     /// Get the local node ID.
@@ -927,6 +987,7 @@ where
     /// Removes the peer from both the topology state (eager/lazy sets) and
     /// the scoring state (RTT, failure counts) to prevent memory leaks.
     pub fn remove_peer(&self, peer: &I) {
+        #[cfg_attr(not(feature = "metrics"), allow(unused_variables))]
         let removed = self
             .inner
             .peers
@@ -934,6 +995,10 @@ where
 
         // Clean up scoring data to free memory for departed peers
         self.inner.peer_scoring.remove_peer(peer);
+
+        // Drop the departed peer's Graft rate-limiter bucket too, rather than
+        // waiting for the next cleanup sweep to notice it.
+        self.inner.graft_rate_limiter.remove(peer);
 
         #[cfg(feature = "metrics")]
         {
@@ -1241,22 +1306,35 @@ where
             "delivering new message"
         );
 
-        // Cache the compressed payload for potential Graft requests
-        self.inner.cache.insert(msg_id, payload.clone());
+        // Decompress payload before delivering to application.
+        //
+        // The output is capped at `max_message_size`: an incoming frame is
+        // untrusted input, and an uncapped inflate lets a peer turn a tiny
+        // frame into a multi-gigabyte allocation. A payload that fails to
+        // decompress (or refuses to fit) is dropped outright — delivering the
+        // still-compressed bytes to the application would hand it garbage it
+        // has no way to recognize as such, and forwarding it would spread the
+        // hostile frame across the tree.
+        let decompressed_payload =
+            match decompress_payload(&payload, self.inner.config.max_message_size) {
+                Ok(data) => data,
+                Err(e) => {
+                    warn!(
+                        message_id = %msg_id,
+                        error = %e,
+                        payload_size,
+                        "dropping message: payload failed to decompress within limits"
+                    );
+                    #[cfg(feature = "metrics")]
+                    crate::metrics::record_decompress_failure();
+                    return Ok(());
+                }
+            };
 
-        // Decompress payload before delivering to application
-        let decompressed_payload = match decompress_payload(&payload) {
-            Ok(data) => data,
-            Err(e) => {
-                warn!(
-                    message_id = %msg_id,
-                    error = %e,
-                    "failed to decompress payload, delivering raw"
-                );
-                // Fall back to raw payload if decompression fails
-                payload.clone()
-            }
-        };
+        // Cache the compressed payload for potential Graft requests. Done only
+        // after the payload is known to be well-formed, so we never serve a
+        // rejected frame onward to grafting peers.
+        self.inner.cache.insert(msg_id, payload.clone());
 
         // Deliver decompressed payload to application
         self.inner
@@ -1279,7 +1357,9 @@ where
         for peer in eager_peers {
             let msg = PlumtreeMessage::Gossip {
                 id: msg_id,
-                round: round + 1,
+                // `round` is attacker-controlled from the inbound frame;
+                // saturate rather than overflow on a crafted u32::MAX.
+                round: round.saturating_add(1),
                 payload: payload.clone(),
             };
             // Use try_enqueue to avoid blocking under backpressure
@@ -1292,7 +1372,21 @@ where
         }
 
         // Queue IHave for lazy peers (except sender)
-        self.inner.scheduler.queue().push(msg_id, round + 1);
+        // Announce to lazy peers. A full queue means we are dropping the
+        // reliability backstop, so surface it rather than discarding silently.
+        if !self
+            .inner
+            .scheduler
+            .queue()
+            .push(msg_id, round.saturating_add(1))
+        {
+            warn!(
+                message_id = %msg_id,
+                "IHave queue full or closed; dropping lazy-push announcement"
+            );
+            #[cfg(feature = "metrics")]
+            crate::metrics::record_ihave_queue_overflow(1);
+        }
 
         if dropped > 0 {
             debug!(
@@ -1339,10 +1433,29 @@ where
 
             if !have_message {
                 missing_count += 1;
-                trace!(message_id = %msg_id, "missing message, sending Graft");
+                trace!(message_id = %msg_id, "missing message, arming Graft timer");
 
-                // We don't have this message - start Graft timer
-                // Get alternative peers to try if the primary fails
+                // Arm the missed-message timer and stop there. Per the Plumtree
+                // paper, a Graft is sent only once this timer *expires* — i.e.
+                // the eager path failed to deliver the message in time.
+                //
+                // Grafting immediately on every IHave turns lazy push into
+                // eager pull: IHave batches from several lazy peers routinely
+                // beat the eager-path gossip (a 100ms IHave interval against
+                // per-hop latency), so the node would graft all of them, pull a
+                // full payload copy from each, then prune to undo it — constant
+                // eager-set churn and duplicate traffic. Waiting lets the
+                // in-flight gossip arrive and cancel the timer
+                // (`message_received`) in the common case, so a Graft is sent
+                // only when it is genuinely needed.
+                //
+                // The entry is idempotent: `expect_message_with_alternatives`
+                // ignores a message ID already pending, so repeated IHaves for
+                // the same message do not stack up grafts.
+                //
+                // Promotion to eager is likewise deferred to the point the
+                // graft actually fires, so a peer is only added to the eager set
+                // when it is about to serve as a real repair path.
                 let alternatives: Vec<I> = self.inner.peers.random_eager_except(&from, 2);
 
                 self.inner.graft_timer.expect_message_with_alternatives(
@@ -1363,35 +1476,6 @@ where
                 // Instead, tree optimization happens naturally via handle_gossip:
                 // - If we receive duplicate Gossip, we send Prune to the redundant sender
                 // - This is the correct place to demote, as it's based on actual delivery
-
-                // Promote sender to eager to get this and future messages
-                if self.inner.peers.promote_to_eager(&from) {
-                    debug!("promoted peer to eager after IHave");
-                    self.inner.delegate.on_eager_promotion(&from);
-
-                    #[cfg(feature = "metrics")]
-                    {
-                        crate::metrics::record_peer_promotion();
-                        crate::metrics::inc_eager_peers();
-                        crate::metrics::dec_lazy_peers();
-                    }
-                }
-
-                // Send Graft to get the missing message (Critical priority)
-                self.inner
-                    .enqueue_message(OutgoingMessage::unicast(
-                        from.clone(),
-                        PlumtreeMessage::Graft {
-                            message_id: msg_id,
-                            round,
-                        },
-                    ))
-                    .await;
-
-                self.inner.delegate.on_graft_sent(&from, &msg_id);
-
-                #[cfg(feature = "metrics")]
-                crate::metrics::record_graft_sent();
             }
         }
 
@@ -1467,6 +1551,20 @@ where
                 crate::metrics::dec_eager_peers();
                 crate::metrics::inc_lazy_peers();
             }
+        } else if self.inner.peers.is_ring_neighbor(&from) {
+            // Prune is deliberately *not* honored for a protected ring
+            // neighbor: the hash-ring topology guarantees these edges for
+            // connectivity, and dropping one on request would open a partition
+            // risk that the ring exists to prevent. The peer will keep
+            // receiving Gossip from us and may keep pruning, so log it rather
+            // than let the disagreement stay invisible.
+            debug!(
+                peer = ?from,
+                "ignoring Prune from a protected ring neighbor; ring edges are \
+                 kept for connectivity"
+            );
+            #[cfg(feature = "metrics")]
+            crate::metrics::record_prune_ignored();
         }
         Ok(())
     }
@@ -1660,7 +1758,23 @@ where
                     crate::metrics::record_graft_retry();
                 }
 
-                // Graft retry - Critical priority for tree repair
+                // The eager path failed to deliver in time, so this peer now
+                // becomes a real repair path: promote it to eager. Doing this
+                // here rather than on IHave means only peers we actually graft
+                // from enter the eager set.
+                if self.inner.peers.promote_to_eager(&expired_graft.peer) {
+                    debug!(peer = ?expired_graft.peer, "promoted peer to eager for Graft");
+                    self.inner.delegate.on_eager_promotion(&expired_graft.peer);
+
+                    #[cfg(feature = "metrics")]
+                    {
+                        crate::metrics::record_peer_promotion();
+                        crate::metrics::inc_eager_peers();
+                        crate::metrics::dec_lazy_peers();
+                    }
+                }
+
+                // Graft - Critical priority for tree repair
                 self.inner
                     .enqueue_message(OutgoingMessage::unicast(
                         expired_graft.peer.clone(),
@@ -1674,6 +1788,9 @@ where
                 self.inner
                     .delegate
                     .on_graft_sent(&expired_graft.peer, &expired_graft.message_id);
+
+                #[cfg(feature = "metrics")]
+                crate::metrics::record_graft_sent();
             }
         }
     }
@@ -1918,6 +2035,30 @@ where
         self.inner.scheduler.shutdown();
         self.inner.outgoing_notify.close();
         self.inner.incoming_tx.close();
+        // Wake any loop sleeping on an interval so it observes the flag now
+        // rather than after its next tick.
+        self.inner.shutdown_notify.notify(usize::MAX);
+    }
+
+    /// Wait until shutdown is requested, or until `duration` elapses.
+    ///
+    /// Background loops use this instead of a bare sleep so that shutdown is
+    /// observed promptly regardless of how long their interval is.
+    pub(crate) async fn sleep_until_shutdown(&self, duration: std::time::Duration) {
+        if self.is_shutdown() {
+            return;
+        }
+        let listener = self.inner.shutdown_notify.listen();
+        // Re-check after registering so a signal racing the check above is not
+        // missed.
+        if self.is_shutdown() {
+            return;
+        }
+        futures::future::select(
+            listener,
+            std::pin::pin!(futures_timer::Delay::new(duration)),
+        )
+        .await;
     }
 
     /// Check if shutdown has been requested.
@@ -1934,11 +2075,56 @@ where
     /// Ring neighbors are protected and will not be demoted.
     pub fn rebalance_peers(&self) {
         let peer_scoring = &self.inner.peer_scoring;
-        self.inner
+        let result = self
+            .inner
             .peers
             .rebalance_with_scorer(self.inner.config.eager_fanout, |peer| {
                 peer_scoring.normalized_score(peer, 0.5)
             });
+
+        // Tell the peers about the change. A tree edge is only useful if both
+        // ends agree on it: silently promoting a peer locally leaves a one-way
+        // edge where we forward Gossip that the peer does not reciprocate, and
+        // silently demoting one leaves the peer still forwarding to us as an
+        // eager child. Graft/Prune are exactly the messages that carry this.
+        for peer in &result.promoted {
+            self.inner.delegate.on_eager_promotion(peer);
+            // Graft is the wire message that makes a peer treat the edge as
+            // eager. There is no message to recover here, so the ID is the
+            // all-zero sentinel: the receiver promotes us, finds nothing in its
+            // cache for that ID, and logs a miss without sending a payload.
+            if !self.inner.try_enqueue_message(OutgoingMessage::unicast(
+                peer.clone(),
+                PlumtreeMessage::Graft {
+                    message_id: GRAFT_TOPOLOGY_ONLY,
+                    round: 0,
+                },
+            )) {
+                debug!(peer = ?peer, "could not notify peer of eager promotion");
+            }
+        }
+
+        for peer in &result.demoted {
+            self.inner.delegate.on_lazy_demotion(peer);
+            if !self.inner.try_enqueue_message(OutgoingMessage::unicast(
+                peer.clone(),
+                PlumtreeMessage::Prune,
+            )) {
+                debug!(peer = ?peer, "could not notify peer of lazy demotion");
+            } else {
+                self.inner.delegate.on_prune_sent(peer);
+            }
+        }
+
+        #[cfg(feature = "metrics")]
+        {
+            for _ in &result.promoted {
+                crate::metrics::record_peer_promotion();
+            }
+            for _ in &result.demoted {
+                crate::metrics::record_peer_demotion();
+            }
+        }
     }
 
     /// Get access to the peer state for testing/debugging.
@@ -2187,7 +2373,10 @@ mod tests {
         // Peer starts as lazy
         assert!(plumtree.inner.peers.is_lazy(&TestNodeId(2)));
 
-        // Send IHave for unknown message - should trigger promotion
+        // Send IHave for an unknown message. This arms the missed-message
+        // timer but must NOT promote or Graft yet: the in-flight eager gossip
+        // usually arrives first, and promoting on every IHave degenerates lazy
+        // push into eager pull.
         let msg_id = MessageId::new();
         plumtree
             .handle_message(
@@ -2200,7 +2389,29 @@ mod tests {
             .await
             .unwrap();
 
-        // Peer should now be eager
+        // Still lazy, with a Graft pending on the timer.
+        assert!(
+            plumtree.inner.peers.is_lazy(&TestNodeId(2)),
+            "IHave alone must not promote the sender"
+        );
+        assert_eq!(
+            plumtree.inner.graft_timer.pending_count(),
+            1,
+            "missed-message timer should be armed"
+        );
+
+        // Promotion happens when the timer expires and the Graft is actually
+        // sent, since only then does the peer become a real repair path.
+        let expired = loop {
+            let expired = plumtree.inner.graft_timer.get_expired();
+            if !expired.is_empty() {
+                break expired;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        assert_eq!(expired[0].peer, TestNodeId(2));
+
+        assert!(plumtree.inner.peers.promote_to_eager(&TestNodeId(2)));
         assert!(plumtree.inner.peers.is_eager(&TestNodeId(2)));
     }
 

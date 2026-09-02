@@ -77,7 +77,12 @@ fn test_compression_real_payloads() {
     );
 
     // Verify roundtrip
-    let decompressed = decompress(&compressed, CompressionAlgorithm::Zstd { level: 3 }).unwrap();
+    let decompressed = decompress(
+        &compressed,
+        CompressionAlgorithm::Zstd { level: 3 },
+        1 << 20,
+    )
+    .unwrap();
     assert_eq!(json_payload, decompressed.as_ref());
 }
 

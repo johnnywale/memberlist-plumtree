@@ -50,11 +50,56 @@ impl<S: MessageStore> SyncHandler<S> {
         remote_root_hash: [u8; 32],
         time_range: (u64, u64),
     ) -> SyncResponse {
-        // Quick check with read lock
-        let local_hash = self.sync_state.read().root_hash();
+        self.handle_sync_request_paged(remote_root_hash, time_range, 0)
+            .await
+    }
 
-        if local_hash == remote_root_hash {
-            // We are in sync!
+    /// Handle incoming SyncRequest starting at a given pagination offset.
+    ///
+    /// Like [`SyncHandler::handle_sync_request`], but resumes the ID listing at
+    /// `offset` within the time window. A peer that receives a response with
+    /// `has_more == true` continues by re-requesting at
+    /// `offset + message_ids.len()`; without this the same first page is
+    /// compared forever and messages past it never get repaired.
+    ///
+    /// # Root hash scope
+    ///
+    /// The comparison hash is scoped to `time_range`, matching the set of IDs
+    /// the response can actually carry. Comparing an all-history hash against
+    /// window-scoped responses cannot converge: history older than the window
+    /// mismatches on every round with no exchange able to repair it.
+    pub async fn handle_sync_request_paged(
+        &self,
+        remote_root_hash: [u8; 32],
+        time_range: (u64, u64),
+        offset: usize,
+    ) -> SyncResponse {
+        // Compare only the window the response can speak about.
+        let (local_hash, functional) = {
+            let state = self.sync_state.read();
+            (
+                state.root_hash_in_window(time_range.0, time_range.1),
+                state.is_functional(),
+            )
+        };
+
+        // Without the `sync` cargo feature every root hash is permanently zero,
+        // so a hash comparison would report `matches: true` against any peer
+        // and sync would report success while recovering nothing. Fall through
+        // to listing IDs instead, so the exchange still transfers data, and say
+        // so loudly since this is a build misconfiguration.
+        if !functional {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    "sync protocol is in use but the crate was built without the `sync` \
+                     feature: root hashes are not computed, so hash comparison is skipped. \
+                     Enable the `sync` feature."
+                );
+            }
+        } else if local_hash == remote_root_hash {
+            // We are in sync for this window.
             return SyncResponse {
                 matches: true,
                 message_ids: vec![],
@@ -62,10 +107,15 @@ impl<S: MessageStore> SyncHandler<S> {
             };
         }
 
-        // Mismatch found - fetch IDs from store (lock released)
+        // Mismatch found - fetch this page of IDs from store (lock released)
         let (local_ids, has_more) = self
             .store
-            .get_range(time_range.0, time_range.1, MAX_SYNC_IDS_PER_RESPONSE, 0)
+            .get_range(
+                time_range.0,
+                time_range.1,
+                MAX_SYNC_IDS_PER_RESPONSE,
+                offset,
+            )
             .await
             .unwrap_or((vec![], false));
 
@@ -103,6 +153,10 @@ impl<S: MessageStore> SyncHandler<S> {
     ///
     /// Retrieves the requested messages from storage and returns them
     /// for delivery to the peer.
+    ///
+    /// The result may hold more messages than fit in a single `Push` on the
+    /// wire; use [`SyncHandler::handle_sync_pull_chunked`] to get them split to
+    /// the wire limit.
     pub async fn handle_sync_pull(&self, ids: Vec<MessageId>) -> SyncPush {
         let mut messages = Vec::new();
 
@@ -113,6 +167,31 @@ impl<S: MessageStore> SyncHandler<S> {
         }
 
         SyncPush { messages }
+    }
+
+    /// Handle SyncPull, splitting the reply into wire-sized chunks.
+    ///
+    /// A `Pull` may ask for up to `MAX_SYNC_IDS_PER_RESPONSE` IDs, but a
+    /// receiver rejects any `Push` carrying more than
+    /// [`MAX_SYNC_PUSH_MESSAGES`] messages as malformed. Answering a large pull
+    /// with one oversized `Push` therefore transfers nothing and the peers
+    /// repeat the identical failed exchange forever. This returns as many
+    /// `SyncPush` batches as needed, each within the limit.
+    ///
+    /// [`MAX_SYNC_PUSH_MESSAGES`]: crate::message::MAX_SYNC_PUSH_MESSAGES
+    pub async fn handle_sync_pull_chunked(&self, ids: Vec<MessageId>) -> Vec<SyncPush> {
+        let push = self.handle_sync_pull(ids).await;
+
+        if push.messages.is_empty() {
+            return Vec::new();
+        }
+
+        push.messages
+            .chunks(crate::message::MAX_SYNC_PUSH_MESSAGES)
+            .map(|chunk| SyncPush {
+                messages: chunk.to_vec(),
+            })
+            .collect()
     }
 
     /// Record a new message in sync state - O(1).
@@ -129,12 +208,25 @@ impl<S: MessageStore> SyncHandler<S> {
         self.sync_state.write().remove(id);
     }
 
-    /// Get current root hash.
+    /// Get current root hash over all tracked messages.
     ///
     /// This hash can be compared with a peer's root hash to quickly
     /// determine if sync is needed.
+    ///
+    /// Prefer [`SyncHandler::root_hash_in_window`] when comparing against a
+    /// peer whose sync responses only cover a bounded window.
     pub fn root_hash(&self) -> [u8; 32] {
         self.sync_state.read().root_hash()
+    }
+
+    /// Get the root hash over only the messages in `[start, end]`.
+    ///
+    /// Scoping the hash to the sync window keeps mismatches actionable: the
+    /// comparison then covers exactly the messages the exchange is able to
+    /// transfer, so divergence in older history cannot wedge the peers into
+    /// mismatching forever with no repair available.
+    pub fn root_hash_in_window(&self, start: u64, end: u64) -> [u8; 32] {
+        self.sync_state.read().root_hash_in_window(start, end)
     }
 
     /// Get the number of messages tracked in sync state.
@@ -180,6 +272,9 @@ pub struct SyncResponse {
     /// Message IDs in the time range (empty if matches=true).
     pub message_ids: Vec<MessageId>,
     /// Whether there are more message IDs beyond this response (pagination).
+    ///
+    /// When true, the requester continues by issuing another `SyncRequest`
+    /// whose `time_start` begins just after the newest ID in this response.
     pub has_more: bool,
 }
 

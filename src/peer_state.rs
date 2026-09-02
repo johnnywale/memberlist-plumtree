@@ -661,6 +661,12 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
             .map(|(_, p)| p)
             .collect();
 
+        // Peers beyond both fanouts stay in `known_peers` only. That is
+        // intentional, not stranding: the fanouts bound per-round cost
+        // (Gossip to eager, IHave to lazy) independently of cluster size, and
+        // `known_peers` is the reserve that `rebalance_*` promotes from when an
+        // eager or lazy slot frees up.
+
         let eager_vec: Vec<I> = eager.iter().cloned().collect();
         let lazy_vec: Vec<I> = lazy.iter().cloned().collect();
 
@@ -872,13 +878,20 @@ impl<I: Clone + Eq + Hash + Ord> PeerState<I> {
         // Check max_peers limit
         if let Some(max) = max_peers {
             if total >= max {
-                // Find evictable lazy peers (not ring neighbors)
-                let evictable: Vec<I> = inner
+                // Find evictable lazy peers (not ring neighbors).
+                //
+                // Sorted, because the eviction index below is taken modulo this
+                // vector's length: collecting straight from `HashSet::iter()`
+                // yields a per-process order (RandomState seed), so the same
+                // hash would select a different peer on every node and defeat
+                // the deterministic eviction this is meant to provide.
+                let mut evictable: Vec<I> = inner
                     .lazy
                     .iter()
                     .filter(|p| !inner.ring_neighbors.contains(*p))
                     .cloned()
                     .collect();
+                evictable.sort();
 
                 if allow_eviction && !evictable.is_empty() {
                     // Deterministic eviction: hash sorted known_peers + new_peer

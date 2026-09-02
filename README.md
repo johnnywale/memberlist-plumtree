@@ -78,20 +78,25 @@ memberlist-plumtree = "0.1"
 | `tokio` | Yes | Tokio runtime support |
 | `quic` | Yes | QUIC transport via quinn |
 | `metrics` | Yes | Prometheus metrics |
+| `serde` | Yes | Serde derives on public types |
+| `memberlist` | Yes | Memberlist (SWIM) integration |
+| `testing` | Yes | Chaos-injection and test helpers (disable for release builds) |
 | `sync` | No | Anti-entropy synchronization |
+| `compression` | No | Payload compression (gzip, zstd) |
+| `storage` | No | Message storage (umbrella for backends) |
 | `storage-sled` | No | Persistent storage backend |
 
 ## Examples
 
 ```bash
-# Terminal chat with fault injection
-cargo run --example chat
+# QUIC pub/sub across several nodes
+cargo run --example pubsub
 
 # Web UI with peer visualization (http://localhost:3000)
-cargo run --example web-chat
+cargo run --example web-chat --features "sync,compression"
 
 # QUIC-based web chat (http://localhost:3001)
-cargo run --example web-chat-quic --features "quic,metrics,compression"
+cargo run --example web-chat-quic --features "compression"
 ```
 
 ## Documentation

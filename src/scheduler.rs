@@ -409,9 +409,11 @@ impl<I: Clone + Send + Sync + 'static> GraftTimer<I> {
 
     /// Record that we're expecting a message with alternative peers to try.
     ///
-    /// This is called after the initial Graft has been sent, so retry_count
-    /// starts at 1 to indicate a graft was already sent. If the message arrives
-    /// before the timeout, this counts as a successful graft.
+    /// Called on IHave for a message we don't have. No Graft has been sent yet:
+    /// `retry_count` starts at 0, and the first Graft goes out only when this
+    /// entry expires (the Plumtree missed-message timer). If the message
+    /// arrives first, [`GraftTimer::message_received`] cancels the entry and no
+    /// Graft is ever sent.
     pub fn expect_message_with_alternatives(
         &self,
         message_id: MessageId,
@@ -436,9 +438,9 @@ impl<I: Clone + Send + Sync + 'static> GraftTimer<I> {
                 from,
                 alternative_peers: alternatives,
                 round,
-                // Start at 1 because the initial Graft is sent immediately
-                // in handle_ihave before this method is called
-                retry_count: 1,
+                // Start at 0: no Graft has been sent yet. The first one is sent
+                // when this entry expires.
+                retry_count: 0,
             },
         );
         Self::add_to_timeout_index(&mut inner, next_retry, message_id);
@@ -539,16 +541,17 @@ impl<I: Clone + Send + Sync + 'static> GraftTimer<I> {
                     continue;
                 }
 
-                // Determine which peer to try (round-robin through alternatives)
-                // retry_count starts at 1 since initial Graft is sent before timer starts
-                let peer = {
-                    let alt_idx =
-                        (entry.retry_count - 1) as usize % entry.alternative_peers.len().max(1);
-                    if alt_idx < entry.alternative_peers.len() {
-                        entry.alternative_peers[alt_idx].clone()
-                    } else {
-                        entry.from.clone()
-                    }
+                // Determine which peer to try.
+                //
+                // `retry_count` is 0 for the first Graft, which goes to the
+                // peer whose IHave announced the message. Subsequent attempts
+                // walk the alternatives round-robin, falling back to the
+                // original peer when there are none.
+                let peer = if entry.retry_count == 0 || entry.alternative_peers.is_empty() {
+                    entry.from.clone()
+                } else {
+                    let alt_idx = (entry.retry_count - 1) as usize % entry.alternative_peers.len();
+                    entry.alternative_peers[alt_idx].clone()
                 };
 
                 expired.push(ExpiredGraft {
@@ -560,8 +563,9 @@ impl<I: Clone + Send + Sync + 'static> GraftTimer<I> {
 
                 entry.retry_count += 1;
 
-                // With retry_count starting at 1 (initial graft), we check > not >=
-                // so that max_retries=3 gives 3 timer retries after the initial graft
+                // `retry_count` now counts Grafts actually sent (it starts at 0
+                // and the first send happens here), so `>` gives exactly
+                // `max_retries` attempts before declaring failure.
                 if entry.retry_count > self.max_retries {
                     // Max retries exceeded, record failure for zombie detection
                     failed.push(FailedGraft {
@@ -768,28 +772,29 @@ mod tests {
         let alt2 = 3u64;
         timer.expect_message_with_alternatives(id, primary, vec![alt1, alt2], 0);
 
-        // Note: retry_count starts at 1 because initial Graft was already sent to primary
-        // in handle_ihave before calling expect_message_with_alternatives
+        // No Graft is sent when the IHave arrives: the first one goes out when
+        // this timer expires, addressed to the peer that announced the message.
 
-        // First retry: first alternative (initial graft to primary already sent)
+        // First attempt: the primary (the IHave sender).
         std::thread::sleep(Duration::from_millis(30));
         let expired = timer.get_expired();
-        assert_eq!(expired[0].peer, alt1);
+        assert_eq!(expired[0].peer, primary);
+        assert_eq!(expired[0].retry_count, 0, "first Graft, not a retry");
 
-        // Second retry: second alternative
+        // First retry: first alternative.
         std::thread::sleep(Duration::from_millis(50));
         let expired = timer.get_expired();
-        assert_eq!(expired[0].peer, alt2);
-
-        // Third retry: back to first alternative (round-robin)
-        std::thread::sleep(Duration::from_millis(90));
-        let expired = timer.get_expired();
         assert_eq!(expired[0].peer, alt1);
 
-        // Fourth retry: back to second alternative
-        std::thread::sleep(Duration::from_millis(170));
+        // Second retry: second alternative.
+        std::thread::sleep(Duration::from_millis(90));
         let expired = timer.get_expired();
         assert_eq!(expired[0].peer, alt2);
+
+        // Third retry: back to the first alternative (round-robin).
+        std::thread::sleep(Duration::from_millis(170));
+        let expired = timer.get_expired();
+        assert_eq!(expired[0].peer, alt1);
     }
 
     #[test]

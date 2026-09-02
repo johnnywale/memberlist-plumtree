@@ -177,8 +177,34 @@ async fn test_ihave_triggers_graft() {
 
     plumtree.handle_message(NodeId(2), ihave_msg).await.unwrap();
 
-    // Peer should now be eager (promoted due to missing message)
-    assert!(plumtree.peers().is_eager(&NodeId(2)));
+    // IHave alone must not graft or promote: the missed-message timer is armed
+    // and the in-flight eager gossip usually arrives before it expires.
+    assert!(
+        plumtree.peers().is_lazy(&NodeId(2)),
+        "IHave alone must not promote the sender"
+    );
+
+    // Drive the timer; the Graft and the promotion happen on expiry.
+    let timer = plumtree.clone();
+    let timer_task = tokio::spawn(async move {
+        timer.run_graft_timer().await;
+    });
+
+    let promoted = async {
+        loop {
+            if plumtree.peers().is_eager(&NodeId(2)) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), promoted)
+            .await
+            .unwrap_or(false),
+        "Peer should be promoted to eager once the Graft timer fires"
+    );
+    timer_task.abort();
 }
 
 /// Test that Graft requests return the cached message.
@@ -510,14 +536,24 @@ async fn test_tree_repair_demotes_old_parent() {
 
     plumtree.handle_message(NodeId(3), ihave).await.unwrap();
 
-    // Node 3 should now be eager (source of recovery)
-    assert!(plumtree.peers().is_eager(&NodeId(3)));
+    // The Graft (and Node 3's promotion) happen when the missed-message timer
+    // expires, not on the IHave itself.
+    let timer = plumtree.clone();
+    let timer_task = tokio::spawn(async move {
+        timer.run_graft_timer().await;
+    });
 
-    // A Graft request should have been sent
-    let outgoing = handle.next_outgoing().await;
+    // A Graft request should be sent once the timer fires.
+    let outgoing = tokio::time::timeout(Duration::from_secs(5), handle.next_outgoing())
+        .await
+        .expect("Graft should be sent after the timer expires");
     assert!(outgoing.is_some());
     let msg = outgoing.unwrap();
     assert!(matches!(msg.message, PlumtreeMessage::Graft { .. }));
+
+    // Node 3 should now be eager (source of recovery)
+    assert!(plumtree.peers().is_eager(&NodeId(3)));
+    timer_task.abort();
 }
 
 /// Test exponential backoff behavior.
