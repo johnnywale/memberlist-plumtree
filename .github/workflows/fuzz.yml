@@ -52,6 +52,12 @@ jobs:
       # -Zsanitizer=address). The cargo-fuzz binary itself builds on stable and
       # invokes `cargo +nightly` internally. So we install both, but cargo-fuzz
       # is fetched as a prebuilt binary to avoid source compilation churn.
+      #
+      # That prebuilt is a *musl* binary, and cargo-fuzz defaults --target to its
+      # own host triple. musl implies crt-static, which ASan cannot link against
+      # ("sanitizer is incompatible with statically linked libc"), and the musl
+      # std isn't installed anyway ("can't find crate for `core`"). Both runs
+      # below therefore pass --target x86_64-unknown-linux-gnu explicitly.
       - name: Install Rust nightly (for fuzz targets)
         uses: dtolnay/rust-toolchain@nightly
         with:
@@ -86,7 +92,7 @@ jobs:
         run: |
           DURATION="${{ github.event.inputs.fuzz_duration || '60' }}"
           echo "Fuzzing ${{ matrix.target }} for ${DURATION} seconds..."
-          cargo +nightly fuzz run ${{ matrix.target }} -- \
+          cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- \
             -max_total_time=${DURATION} \
             -print_final_stats=1
 
@@ -141,7 +147,7 @@ jobs:
       - name: Run extended fuzzer (5 minutes)
         run: |
           echo "Extended fuzzing ${{ matrix.target }} for 300 seconds..."
-          cargo +nightly fuzz run ${{ matrix.target }} -- \
+          cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- \
             -max_total_time=300 \
             -print_final_stats=1
 
