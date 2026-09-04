@@ -70,7 +70,7 @@ thiserror = { version = "2", optional = true }
 # Tokio is used directly for QUIC transport (spawn_blocking, background tasks, select)
 tokio = { version = "1", optional = true, default-features = false, features = ["rt", "time", "sync", "macros"] }
 # LRU cache for 0-RTT session ticket caching
-lru = { version = "0.12", optional = true }
+lru = { version = "0.18", optional = true }
 # X.509 certificate parsing for peer ID extraction
 x509-parser = { version = "0.17", optional = true }
 
