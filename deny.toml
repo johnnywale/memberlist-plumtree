@@ -19,11 +19,6 @@ unmaintained = "workspace"
 yanked = "warn"
 # Ignore specific advisories (add reason as comment)
 ignore = [
-    # lru: `IterMut` violates Stacked Borrows. Pulled transitively via
-    # quinn -> lru. Soundness issue triggerable only under Miri/`-Zsanitizer`;
-    # no runtime impact on stable. Will clear when quinn bumps its `lru` dep.
-    "RUSTSEC-2026-0002",
-
     # hickory-proto: O(n²) name compression CPU exhaustion during *message
     # encoding*. Pulled transitively via agnostic -> agnostic-dns -> hickory-proto.
     # We don't author DNS responses — agnostic-dns uses it for resolution only,
